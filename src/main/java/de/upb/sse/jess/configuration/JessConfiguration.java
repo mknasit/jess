@@ -14,6 +14,9 @@ public class JessConfiguration {
     private boolean keepAsteriskImports = true;
     private boolean failOnAmbiguity = true;
     private boolean disableStubbing = false;
+    public enum StubberKind { JESS, SPOON }
+
+    private StubberKind stubberKind = StubberKind.SPOON;
 
     private String targetVersion = null;
 
@@ -25,4 +28,8 @@ public class JessConfiguration {
         this.failOnAmbiguity = failOnAmbiguity;
         this.disableStubbing = disableStubbing;
     }
+
+    public StubberKind getStubberKind() { return stubberKind; }
+    public void setStubberKind(StubberKind kind) { this.stubberKind = kind; }
+
 }

@@ -1,12 +1,14 @@
 package de.upb.sse.jess.stubbing;
 
 import de.upb.sse.jess.Jess;
+import de.upb.sse.jess.configuration.JessConfiguration;
 import de.upb.sse.jess.exceptions.AmbiguityException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
+import java.util.Collections;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -17,7 +19,10 @@ public class FieldAccessTests {
 
     @BeforeEach
     void setupTests() {
-        jess = new Jess();
+        JessConfiguration cfg = new JessConfiguration();
+        cfg.setStubberKind(JessConfiguration.StubberKind.SPOON);
+        cfg.setFailOnAmbiguity(true);
+        jess = new Jess(cfg, Collections.emptyList(), Collections.emptyList());
     }
 
     @Test

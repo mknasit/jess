@@ -22,6 +22,9 @@ import de.upb.sse.jess.model.ImportContext;
 import de.upb.sse.jess.model.ResolutionInformation;
 import de.upb.sse.jess.model.stubs.ClassType;
 import de.upb.sse.jess.stats.StubbingStats;
+import de.upb.sse.jess.stubbing.JessStubberAdapter;
+import de.upb.sse.jess.stubbing.SpoonStubbingRunner;
+import de.upb.sse.jess.stubbing.Stubber;
 import de.upb.sse.jess.util.FileUtil;
 import de.upb.sse.jess.util.ImportUtil;
 import de.upb.sse.jess.visitors.*;
@@ -47,6 +50,8 @@ public class Jess {
     @Getter private final StubbingStats stubbingStats = new StubbingStats();
     private final List<String> packageRoots = new ArrayList<>();
     private final CombinedTypeSolver combinedTypeSolver;
+    private final List<Path> jarPaths = new ArrayList<>();
+    private final Stubber stubber;
 
     public Jess() {
         this(new JessConfiguration(), Collections.emptyList(), Collections.emptyList());
@@ -77,15 +82,29 @@ public class Jess {
             try {
                 JarTypeSolver jarSolver = new JarTypeSolver(Paths.get(jar));
                 combinedTypeSolver.add(jarSolver);
+                jarPaths.add(Paths.get(jar));
             } catch (IOException e) {
                 System.err.println("Could not load JarTypeSolver for " + jar);
             }
         }
 
         symbolSolver = new JavaSymbolSolver(combinedTypeSolver);
+
+        // prefer config, let system property override if provided
+        boolean useSpoon =
+                config.getStubberKind() == JessConfiguration.StubberKind.SPOON
+                        || "spoon".equalsIgnoreCase(System.getProperty("jess.stubber", ""));
+
+        this.stubber = useSpoon
+                ? new SpoonStubbingRunner(this.config)
+                : new JessStubberAdapter(this);
+
+
     }
 
     public int parse(String targetClass) {
+
+
         return this.parse(targetClass, CLASS_OUTPUT);
     }
 
@@ -116,6 +135,15 @@ public class Jess {
             Slicer slicer = new Slicer(config, getFullyQualifiedRootName(this.cleanRoot), symbolSolver, annotatedUnits);
             Map<String, CompilationUnit> types = slicer.slice();
 
+            System.out.println("\n== SLICED TYPES (before stubbing) ==");
+            types.forEach((fqn, cu) -> {
+                System.out.println("// " + fqn);
+                String code = cu.toString();
+                System.out.println(code.length() > 2000 ? code.substring(0, 2000) + "\n...[truncated]..." : code);
+                System.out.println();
+            });
+
+
             // Remove artificial marker annotations
             MarkerAnnotationRemovalVisitor marv = new MarkerAnnotationRemovalVisitor();
             types.forEach((fqn, cu) -> marv.visit(cu, null));
@@ -142,7 +170,19 @@ public class Jess {
                 boolean successfulPreCompilation = compile(targetClass, classOutput, true);
                 if (successfulPreCompilation) return 0;
 
-                stub(SRC_OUTPUT);
+                System.out.println("\n>> Using stubber: " + this.stubber.getClass().getSimpleName());
+
+                int created = this.stubber.run(Paths.get(SRC_OUTPUT), this.jarPaths);
+                System.out.println("\n== SLICED TYPES (after stubbing) ==");
+                List<String> javaFiles = de.upb.sse.jess.util.FileUtil.getAllJavaFiles(SRC_OUTPUT);
+                for (String path : javaFiles) {
+                    // Skip the original target file if you want, or print all
+                    String code = java.nio.file.Files.readString(java.nio.file.Path.of(path));
+                    System.out.println("// " + path.replace(SRC_OUTPUT + "/", ""));
+                    System.out.println(code.length() > 2000 ? code.substring(0, 2000) + "\n...[truncated]..." : code);
+                    System.out.println();
+                }
+
             }
 
             // Compile sliced files
@@ -277,5 +317,66 @@ public class Jess {
 
         symbolSolver.inject(compilationUnitOpt.get());
     }
+
+    public int runJessStubbing(String srcOutput) throws IOException, AmbiguityException {
+        Map<String, de.upb.sse.jess.model.stubs.ClassType> stubClasses = new HashMap<>();
+        List<de.upb.sse.jess.model.ImportContext> asteriskImports = new ArrayList<>();
+
+        de.upb.sse.jess.inference.InferenceEngine inferenceEngine =
+                new de.upb.sse.jess.inference.InferenceEngine(config.isFailOnAmbiguity());
+        de.upb.sse.jess.visitors.UnresolvableTypeVisitor utv =
+                new de.upb.sse.jess.visitors.UnresolvableTypeVisitor(
+                        combinedTypeSolver, inferenceEngine, packageRoots, config.isFailOnAmbiguity());
+
+        List<String> generatedSrcFiles = de.upb.sse.jess.util.FileUtil.getAllJavaFiles(srcOutput);
+        for (String srcFile : generatedSrcFiles) {
+            if (srcFile.endsWith(de.upb.sse.jess.annotation.Annotator.KEEP_ALL_ANNOTATION + ".java")) continue;
+            if (srcFile.endsWith(de.upb.sse.jess.annotation.Annotator.TARGET_METHOD_ANNOTATION + ".java")) continue;
+
+            com.github.javaparser.ast.CompilationUnit cu = getCompilationUnit(srcFile);
+            symbolSolver.inject(cu);
+            utv.visit(cu, stubClasses);
+
+            asteriskImports.addAll(de.upb.sse.jess.util.ImportUtil.getAsteriskImportNames(cu));
+        }
+
+        de.upb.sse.jess.generation.StubGenerator stubGen = new de.upb.sse.jess.generation.StubGenerator(srcOutput, stubbingStats);
+        stubGen.generate(stubClasses.values());
+        stubGen.generatePackages(asteriskImports);
+
+        System.out.println("\n== JESS STUBS to be generated ==");
+        for (de.upb.sse.jess.model.stubs.ClassType ct : stubClasses.values()) {
+            System.out.println(" +type  " + ct.getFQN());
+
+            // optional context (only prints when non-empty)
+            if (!ct.getExtendedTypes().isEmpty()) {
+                System.out.println("   extends " + String.join(", ", ct.getExtendedTypes().toString()));
+            }
+            if (!ct.getInterfaceImplementations().isEmpty()) {
+                System.out.println("   implements " + String.join(", ", ct.getInterfaceImplementations().toString()));
+            }
+            if (!(ct.getTypeParameters() ==0)) {
+                System.out.println("   <" +  ct.getTypeParameters() + ">");
+            }
+
+            // fields & methods (fall back to toString(); most models override it nicely)
+            if (!ct.getFieldTypes().isEmpty()) {
+                System.out.println("   fields:");
+                ct.getFieldTypes().forEach(ft -> System.out.println("     - " + ft));
+            }
+            if (!ct.getMethodTypes().isEmpty()) {
+                System.out.println("   methods:");
+                ct.getMethodTypes().forEach(mt -> System.out.println("     - " + mt));
+            }
+
+            if (!ct.getImports().isEmpty()) {
+                System.out.println("   imports " + String.join(", ", ct.getImports()));
+            }
+        }
+
+
+        return stubClasses.size();
+    }
+
 
 }
