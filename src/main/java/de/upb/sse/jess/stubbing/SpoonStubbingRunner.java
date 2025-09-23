@@ -47,6 +47,8 @@ public final class SpoonStubbingRunner implements Stubber {
         SpoonCollector collector = new SpoonCollector(f, cfg);
         CollectResult plans = collector.collect(model);
 
+
+
         // 3) Generate stubs (separate handlers per kind)
         SpoonStubber stubber = new SpoonStubber(f);
         int created = 0;

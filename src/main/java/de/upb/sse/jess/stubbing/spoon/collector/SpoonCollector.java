@@ -5,12 +5,16 @@ import de.upb.sse.jess.exceptions.AmbiguityException;
 import de.upb.sse.jess.stubbing.spoon.plan.*;
 import spoon.reflect.CtModel;
 import spoon.reflect.code.*;
+import spoon.reflect.cu.CompilationUnit;
+import spoon.reflect.cu.SourcePosition;
 import spoon.reflect.declaration.*;
 import spoon.reflect.factory.Factory;
 import spoon.reflect.path.CtRole;
 import spoon.reflect.reference.CtArrayTypeReference;
 import spoon.reflect.reference.CtExecutableReference;
 import spoon.reflect.reference.CtTypeReference;
+import spoon.reflect.visitor.filter.TypeFilter;
+
 import java.util.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -45,10 +49,14 @@ public final class SpoonCollector {
         collectUnresolvedMethodCalls(model, result);
         collectExceptionTypes(model, result);
         collectSupertypes(model, result);
+        collectFromInstanceofCastsClassLiteralsAndForEach(model, result);
         collectUnresolvedDeclaredTypes(model, result);
         collectOverloadGaps(model, result);
 
         seedOnDemandImportAnchors(model, result);
+        seedExplicitTypeImports(model, result);
+
+
 
 
         result.typePlans.addAll(ownersNeedingTypes(result));
@@ -65,6 +73,12 @@ public final class SpoonCollector {
         });
 
         for (CtFieldAccess<?> fa : unresolved) {
+            // Skip class-literals like Foo.class (modeled as a field 'class' on a CtTypeAccess)
+            String vname = (fa.getVariable() != null ? fa.getVariable().getSimpleName() : null);
+            if ("class".equals(vname) && fa.getTarget() instanceof CtTypeAccess) {
+                continue; // handled by the type-access / class-literal pass
+            }
+
             if (fa.getParent(CtAnnotation.class) != null) continue; // enum const in annotation
 
             if (isStandaloneFieldStatement(fa)) {
@@ -1163,6 +1177,153 @@ public final class SpoonCollector {
 
     @SuppressWarnings("unchecked")
     private <T> Collection<T> safe(Collection<T> c) { return (c == null ? Collections.emptyList() : c); }
+
+// Put this anywhere in SpoonCollector (e.g., near other collectors)
+
+    private void collectFromInstanceofCastsClassLiteralsAndForEach(CtModel model, CollectResult out) {
+        // --- instanceof: BinaryOperatorKind.INSTANCEOF ---
+        for (CtBinaryOperator<?> bo : model.getElements(new TypeFilter<>(CtBinaryOperator.class))) {
+            if (bo.getKind() == BinaryOperatorKind.INSTANCEOF) {
+                if (bo.getRightHandOperand() instanceof CtTypeAccess) {
+                    CtTypeReference<?> t = ((CtTypeAccess<?>) bo.getRightHandOperand()).getAccessedType();
+                    if (t != null) maybePlanDeclaredType(bo, t, out);
+                }
+            }
+        }
+
+        // --- Foo.class: CtTypeAccess ---
+        for (CtTypeAccess<?> ta : model.getElements(new TypeFilter<>(CtTypeAccess.class))) {
+            CtTypeReference<?> t = ta.getAccessedType();
+            if (t != null) maybePlanDeclaredType(ta, t, out);
+        }
+
+
+        // --- for-each: variable type and iterable element type ---
+        for (CtForEach fe : model.getElements(new TypeFilter<>(CtForEach.class))) {
+            CtExpression<?> expr = fe.getExpression();
+            CtTypeReference<?> iterType = (expr != null ? expr.getType() : null);
+
+            // Prefer the variable's declared type as the element type
+            CtTypeReference<?> elem = null;
+            if (fe.getVariable() != null) {
+                elem = fe.getVariable().getType();
+            }
+            if (elem == null) {
+                elem = inferIterableElementType(iterType); // your existing helper
+            }
+
+            if (elem != null) {
+                maybePlanDeclaredType(fe, elem, out);
+            }
+
+            // Plan iterator() and mark as Iterable<E> on the owner
+            if (iterType != null) {
+                CtTypeReference<?> owner = chooseOwnerPackage(iterType, fe);
+                if (owner != null && !isJdkType(owner)) {
+                    CtTypeReference<?> iterRef = f.Type().createReference("java.util.Iterator");
+                    if (elem != null) iterRef.addActualTypeArgument(elem);
+
+                    out.methodPlans.add(
+                            new MethodStubPlan(
+                                    owner,
+                                    "iterator",
+                                    iterRef,
+                                    java.util.Collections.emptyList(),
+                                    false,
+                                    MethodStubPlan.Visibility.PUBLIC,
+                                    java.util.Collections.emptyList()
+                            )
+                    );
+                }
+            }
+        }
+
+
+
+        // --- casts: use reflection so we don't need CtTypeCast at compile time ---
+        try {
+            Class<?> CT_TYPE_CAST = Class.forName("spoon.reflect.code.CtTypeCast");
+
+            for (CtElement el : model.getElements(new TypeFilter<>(CtElement.class))) {
+                if (CT_TYPE_CAST.isInstance(el)) {
+                    // Prefer getTypeCasted(), fallback to getType() if absent (older Spoon)
+                    CtTypeReference<?> t = null;
+                    try {
+                        Object typeRef = CT_TYPE_CAST.getMethod("getTypeCasted").invoke(el);
+                        if (typeRef instanceof CtTypeReference) t = (CtTypeReference<?>) typeRef;
+                    } catch (NoSuchMethodException nf) {
+                        Object typeRef = CT_TYPE_CAST.getMethod("getType").invoke(el);
+                        if (typeRef instanceof CtTypeReference) t = (CtTypeReference<?>) typeRef;
+                    }
+                    if (t != null) {
+                        maybePlanDeclaredType(el, t, out);
+                    }
+                }
+            }
+        } catch (ClassNotFoundException ignore) {
+            // OK: older/variant Spoon; other passes still work.
+        } catch (Throwable ignore) { /* best-effort */ }
+
+    }
+
+    private CtTypeReference<?> inferIterableElementType(CtTypeReference<?> itT) {
+        if (itT == null) return null;
+        try {
+            if (itT instanceof CtArrayTypeReference) {
+                return ((CtArrayTypeReference<?>) itT).getComponentType();
+            }
+            var args = itT.getActualTypeArguments();
+            if (args != null && !args.isEmpty()) return args.get(0); // e.g., List<Foo> -> Foo
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    /** Seed types that appear only as explicit single-type imports. */
+    private void seedExplicitTypeImports(CtModel model, CollectResult out) {
+        // matches: import some.pkg.Type;  (filters out star imports later)
+        final java.util.regex.Pattern SINGLE_IMPORT =
+                java.util.regex.Pattern.compile("\\bimport\\s+([a-zA-Z_][\\w\\.]*)\\s*;");
+
+        model.getAllTypes().forEach(t -> {
+            SourcePosition pos = t.getPosition();
+            CompilationUnit cu = (pos != null ? pos.getCompilationUnit() : null);
+            if (cu == null) return;
+
+            // 1) take what Spoon knows
+            java.util.Set<String> fqns = new java.util.LinkedHashSet<>();
+            for (CtImport imp : cu.getImports()) {
+                if (imp.getImportKind() == CtImportKind.TYPE) {
+                    try {
+                        var r = imp.getReference();
+                        if (r instanceof CtTypeReference) {
+                            String qn = ((CtTypeReference<?>) r).getQualifiedName();
+                            if (qn != null && !qn.isEmpty()) fqns.add(qn);
+                        }
+                    } catch (Throwable ignored) {}
+                }
+            }
+
+            // 2) also fall back to original source (works even when Spoon didn’t resolve it)
+            try {
+                String src = cu.getOriginalSourceCode();
+                if (src != null) {
+                    var m = SINGLE_IMPORT.matcher(src);
+                    while (m.find()) {
+                        String fqn = m.group(1);
+                        if (fqn.endsWith(".*")) continue; // not single-type
+                        fqns.add(fqn);
+                    }
+                }
+            } catch (Throwable ignored) {}
+
+            // 3) plan those non-JDK types
+            for (String fqn : fqns) {
+                if (isJdkPkg(fqn)) continue;
+                out.typePlans.add(new TypeStubPlan(fqn, TypeStubPlan.Kind.CLASS));
+            }
+        });
+    }
+
 
 
 }

@@ -187,8 +187,36 @@ public final class SpoonStubber {
             }
 
             CtMethod<?> m = f.Method().create(owner, mods, rt, p.name, params, thrown);
-            System.out.println("[DEBUG] creating method " + owner.getQualifiedName() + "#" + p.name);
-            System.out.println("        return: " + readable(rt0));
+
+            // If we're stubbing an iterator() compatible with foreach, make the class implement Iterable<E>
+            if ("iterator".equals(p.name) && p.paramTypes.isEmpty()) {
+                CtTypeReference<?> rtForIterable = rt0; // method return type
+                String rtQN = safeQN(rtForIterable);
+                if (rtQN.startsWith("java.util.Iterator")) {
+                    CtTypeReference<?> iterableRef = f.Type().createReference("java.lang.Iterable");
+
+                    try {
+                        List<CtTypeReference<?>> args = rtForIterable.getActualTypeArguments();
+                        if (args != null && !args.isEmpty() && args.get(0) != null) {
+                            iterableRef.addActualTypeArgument(args.get(0));  // <E>
+                        }
+                    } catch (Throwable ignored) {}
+
+                    boolean already = false;
+                    try {
+                        for (CtTypeReference<?> si : owner.getSuperInterfaces()) {
+                            if (safeQN(si).startsWith("java.lang.Iterable")) { already = true; break; }
+                        }
+                    } catch (Throwable ignored) {}
+
+                    if (!already) owner.addSuperInterface(iterableRef);
+
+                    ensureImport(owner, iterableRef);
+                    ensureImport(owner, rt0);
+                }
+            }
+
+
             for (int i = 0; i < params.size(); i++) {
                 System.out.println("        param" + i + ": " + readable(params.get(i).getType()));
             }
