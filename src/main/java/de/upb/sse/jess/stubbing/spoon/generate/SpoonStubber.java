@@ -8,7 +8,6 @@ import spoon.reflect.code.CtCodeSnippetExpression;
 import spoon.reflect.code.CtReturn;
 import spoon.reflect.declaration.*;
 import spoon.reflect.factory.Factory;
-import spoon.reflect.reference.CtPackageReference;
 import spoon.reflect.reference.CtTypeReference;
 
 import spoon.reflect.declaration.CtType;
@@ -64,6 +63,10 @@ public final class SpoonStubber {
                 created = f.Class().create(packageObj, name);
         }
         created.addModifier(ModifierKind.PUBLIC);
+        int arity = inferGenericArityFromUsages(qn);
+
+        if (arity > 0) addTypeParameters(created, arity);
+
 
         // ---- NEW: make exception-like classes throwable (handles SomeOtherException1, etc.)
         if (created instanceof CtClass) {
@@ -352,7 +355,7 @@ public final class SpoonStubber {
     }
 
 
-    // SpoonStubber.dequalifyCurrentPackageUnresolvedRefs()
+    // SpoonStubber.dequalifyCurredequalifyCurrentPackageUnresolvedRefsntPackageUnresolvedRefs()
     public void dequalifyCurrentPackageUnresolvedRefs() {
         CtModel model = f.getModel();
         model.getAllTypes().forEach(t -> {
@@ -466,6 +469,105 @@ public final class SpoonStubber {
 
         if (!present) {
             cu.getImports().add(f.createImport(f.Type().createReference(FQN)));
+        }
+    }
+
+    // SpoonStubber.java
+    private Map<String, Set<String>> simpleNameToPkgs() {
+        Map<String, Set<String>> m = new LinkedHashMap<>();
+        f.getModel().getAllTypes().forEach(t -> {
+            String pkg = Optional.ofNullable(t.getPackage())
+                    .map(CtPackage::getQualifiedName).orElse("");
+            String simple = t.getSimpleName();
+            if (simple == null || simple.isEmpty()) return;
+            // skip JDK-ish
+            if (pkg.startsWith("java.") || pkg.startsWith("javax.") ||
+                    pkg.startsWith("jakarta.") || pkg.startsWith("sun.") || pkg.startsWith("jdk.")) return;
+
+            m.computeIfAbsent(simple, k -> new LinkedHashSet<>()).add(pkg);
+        });
+        return m;
+    }
+
+    // SpoonStubber.java
+    public void qualifyAmbiguousSimpleTypes() {
+        Map<String, Set<String>> map = simpleNameToPkgs();
+        // only keep ambiguous entries
+        map.entrySet().removeIf(e -> e.getValue().size() < 2);
+        if (map.isEmpty()) return;
+
+        // choose a package per simple name (prefer 'unknown' if present)
+        Map<String, String> chosen = new HashMap<>();
+        for (var e : map.entrySet()) {
+            Set<String> pkgs = e.getValue();
+            String pick = pkgs.contains("unknown") ? "unknown" : pkgs.iterator().next(); // deterministic
+            chosen.put(e.getKey(), pick);
+        }
+
+        // walk all type refs and qualify simple ones that are ambiguous
+        f.getModel().getAllTypes().forEach(owner -> {
+            owner.getElements(el -> el instanceof CtTypeReference<?>).forEach(refEl -> {
+                CtTypeReference<?> ref = (CtTypeReference<?>) refEl;
+                String simple = ref.getSimpleName();
+                if (simple == null || simple.isEmpty()) return;
+
+                // already qualified? skip
+                String qn = safeQN(ref);
+                if (qn.contains(".")) return;
+
+                String pkg = chosen.get(simple);
+                if (pkg == null) return; // not ambiguous
+
+                // qualify to the chosen pkg
+                if (!pkg.isEmpty()) {
+                    ref.setPackage(f.Package().createReference(pkg));
+                } else {
+                    ref.setPackage(null);
+                }
+
+                // make sure it prints as FQN (avoids import games)
+                ref.setImplicit(false);
+                ref.setSimplyQualified(true);
+            });
+        });
+    }
+
+
+    // SpoonStubber.java
+
+    private int inferGenericArityFromUsages(String fqn) {
+        String simple = fqn.substring(fqn.lastIndexOf('.') + 1);
+        int max = 0;
+        for (var el : f.getModel().getElements(e -> e instanceof CtTypeReference<?>)) {
+            CtTypeReference<?> ref = (CtTypeReference<?>) el;
+            String qn = safeQN(ref);              // empty if unknown
+            String sn = ref.getSimpleName();      // never null for normal refs
+
+            boolean sameType =
+                    fqn.equals(qn)                    // exact FQN match
+                            || (qn.isEmpty() && simple.equals(sn)); // unresolved simple-name match
+
+            if (!sameType) continue;
+
+            int n = 0;
+            try { n = ref.getActualTypeArguments().size(); } catch (Throwable ignored) {}
+            if (n > max) max = n;
+        }
+        return max;
+    }
+
+
+    private void addTypeParameters(CtType<?> created, int arity) {
+        if (!(created instanceof CtFormalTypeDeclarer) || arity <= 0) return;
+        CtFormalTypeDeclarer decl = (CtFormalTypeDeclarer) created;
+
+        // don’t duplicate if already has params
+        if (decl.getFormalCtTypeParameters() != null && !decl.getFormalCtTypeParameters().isEmpty()) return;
+
+        for (int i = 0; i < arity; i++) {
+            CtTypeParameter tp = f.Core().createTypeParameter();
+            tp.setSimpleName("T" + i);
+            decl.addFormalCtTypeParameter(tp);
         }
     }
 

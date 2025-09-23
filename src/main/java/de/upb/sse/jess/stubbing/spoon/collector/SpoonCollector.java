@@ -11,7 +11,6 @@ import spoon.reflect.path.CtRole;
 import spoon.reflect.reference.CtArrayTypeReference;
 import spoon.reflect.reference.CtExecutableReference;
 import spoon.reflect.reference.CtTypeReference;
-import spoon.reflect.cu.CompilationUnit;
 import java.util.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -45,6 +44,8 @@ public final class SpoonCollector {
         collectUnresolvedCtorCalls(model, result);
         collectUnresolvedMethodCalls(model, result);
         collectExceptionTypes(model, result);
+        collectUnresolvedDeclaredTypes(model, result);
+        collectOverloadGaps(model, result);
 
         seedOnDemandImportAnchors(model, result);
 
@@ -284,8 +285,9 @@ public final class SpoonCollector {
 
     /* -------------------- CONSTRUCTORS -------------------- */
 
+
     private void collectUnresolvedCtorCalls(CtModel model, CollectResult out) {
-        List<CtConstructorCall<?>> unresolved = model.getElements((CtConstructorCall<?> cc) -> {
+        var unresolved = model.getElements((CtConstructorCall<?> cc) -> {
             var ex = cc.getExecutable();
             return ex == null || ex.getDeclaration() == null;
         });
@@ -295,15 +297,11 @@ public final class SpoonCollector {
             CtTypeReference<?> owner    = chooseOwnerPackage(rawOwner, cc);
             if (isJdkType(owner)) continue;
 
-            // 2a) Always normalize truly unknown simple names to 'unknown.SimpleName'
-            //CtTypeReference<?> normalizedOwner = normalizeUnknownSimple(owner, cc);
-            // Use the normalized owner for the actual stub (this is the class the test checks for)
-            List<CtTypeReference<?>> paramTypes = inferParamTypesFromCall(cc.getExecutable(), cc.getArguments());
-            out.ctorPlans.add(new ConstructorStubPlan(owner, paramTypes));
+            // also walk its type args to stub nested generic types
+            collectTypeRefDeep(cc, rawOwner, out);
 
-            // 2b) ALSO create a same-package class if Spoon/printer qualified it to the local package.
-            // If owner looks like it belongs to the current package, mirror it so the rewritten file compiles.
-
+            List<CtTypeReference<?>> ps = inferParamTypesFromCall(cc.getExecutable(), cc.getArguments());
+            out.ctorPlans.add(new ConstructorStubPlan(owner, ps));
         }
     }
 
@@ -571,6 +569,98 @@ public final class SpoonCollector {
     }
 
 
+/*-----------------------Fixed Imports-----------*/
+
+    private void collectUnresolvedDeclaredTypes(CtModel model, CollectResult out) {
+        for (CtField<?> fd : model.getElements((CtField<?> f) -> true)) {
+            collectTypeRefDeep(fd, fd.getType(), out);
+        }
+        for (CtLocalVariable<?> lv : model.getElements((CtLocalVariable<?> v) -> true)) {
+            collectTypeRefDeep(lv, lv.getType(), out);
+        }
+        for (CtParameter<?> p : model.getElements((CtParameter<?> pp) -> true)) {
+            collectTypeRefDeep(p, p.getType(), out);
+        }
+        for (CtMethod<?> m : model.getElements((CtMethod<?> mm) -> true)) {
+            for (CtTypeReference<? extends Throwable> thr : m.getThrownTypes())
+                collectTypeRefDeep(m, thr, out);
+        }
+        for (CtConstructor<?> c : model.getElements((CtConstructor<?> cc) -> true)) {
+            for (CtTypeReference<? extends Throwable> thr : c.getThrownTypes())
+                collectTypeRefDeep(c, thr, out);
+        }
+    }
+
+
+    @SuppressWarnings("unchecked")
+    private void maybePlanDeclaredType(CtElement ctx, CtTypeReference<?> t, CollectResult out) {
+        if (t == null) return;
+
+        // primitives / void / arrays => skip
+        try {
+            if (t.isPrimitive()) return;
+            if (t.equals(f.Type().VOID_PRIMITIVE)) return;
+            if (t.isArray()) return;
+        } catch (Throwable ignored) { }
+
+        // already resolvable (has declaration) => skip
+        try {
+            if (t.getDeclaration() != null) return;
+        } catch (Throwable ignored) { }
+
+        String qn = safeQN(t);
+        String simple = t.getSimpleName();
+        if (simple == null || simple.isEmpty()) return;
+
+        // JDK types => skip
+        if (qn.startsWith("java.") || qn.startsWith("javax.") ||
+                qn.startsWith("jakarta.") || qn.startsWith("sun.") || qn.startsWith("jdk.")) return;
+
+        // If Spoon already gave a package (qn has a dot), respect it;
+        // otherwise we must choose a package using star imports.
+        // If Spoon already gave a package (qn has a dot), respect it;
+// otherwise we must choose a package using star imports.
+
+        if (!qn.contains(".")) {
+            List<String> starPkgs = starImportsInOrder(ctx);
+            boolean hasUnknown = starPkgs.contains("unknown");
+
+            // keep only non-unknown candidates in source order
+            List<String> nonUnknown = new ArrayList<>();
+            for (String p : starPkgs) if (!"unknown".equals(p)) nonUnknown.add(p);
+
+            if (nonUnknown.size() > 1) {
+                if (cfg.isFailOnAmbiguity()) {
+                    throw new AmbiguityException(
+                            "Ambiguous simple type '" + simple + "' from on-demand imports: " + nonUnknown
+                    );
+                } else {
+                    // lenient: choose the first non-unknown by source order
+                    out.typePlans.add(new TypeStubPlan(nonUnknown.get(0) + "." + simple, TypeStubPlan.Kind.CLASS));
+                    return;
+                }
+            }
+
+            if (nonUnknown.size() == 1) {
+                if (hasUnknown) {
+                    // quarantine to unknown to avoid future collisions with “real” pkg
+                    out.typePlans.add(new TypeStubPlan("unknown." + simple, TypeStubPlan.Kind.CLASS));
+                } else {
+                    out.typePlans.add(new TypeStubPlan(nonUnknown.get(0) + "." + simple, TypeStubPlan.Kind.CLASS));
+                }
+                return;
+            }
+
+            // no non-unknown star imports
+            out.typePlans.add(new TypeStubPlan("unknown." + simple, TypeStubPlan.Kind.CLASS));
+            return;
+        }
+
+
+
+        // Already qualified (but unresolved) → create where Spoon says
+        out.typePlans.add(new TypeStubPlan(qn, TypeStubPlan.Kind.CLASS));
+    }
 
 
     /* -------------------- HELPERS -------------------- */
@@ -745,8 +835,7 @@ public final class SpoonCollector {
 
 
 
-
-    // ---- Star imports in order (source text first, Spoon fallback) ----
+    // replace starImportsInOrder(ctx) with this *source-only* version
     private List<String> starImportsInOrder(CtElement ctx) {
         var type = ctx.getParent(CtType.class);
         var pos  = (type != null ? type.getPosition() : null);
@@ -754,8 +843,6 @@ public final class SpoonCollector {
         if (cu == null) return Collections.emptyList();
 
         List<String> out = new ArrayList<>();
-
-        // 1) Try original source order (best-effort)
         try {
             String src = cu.getOriginalSourceCode();
             if (src != null) {
@@ -768,15 +855,6 @@ public final class SpoonCollector {
                 }
             }
         } catch (Throwable ignored) {}
-
-        // 2) Spoon view (if any were missed)
-        for (CtImport imp : cu.getImports()) {
-            if (imp.getImportKind() == CtImportKind.ALL_TYPES) {
-                String pkg = String.valueOf(imp.getReference());
-                if (pkg.endsWith(".*")) pkg = pkg.substring(0, pkg.length() - 2);
-                if (!isJdkPkg(pkg) && !out.contains(pkg)) out.add(pkg);
-            }
-        }
         return out;
     }
 
@@ -786,30 +864,37 @@ public final class SpoonCollector {
 
         String qn = safeQN(ownerRef);
 
-        // If Spoon assumed current package (no declaration), treat as simple so we can re-qualify.
+        // Treat assumed-local as simple so we can re-qualify from star imports
         if (qn.contains(".") && isLocallyAssumedOrSimple(ownerRef, ctx)) {
             ownerRef = f.Type().createReference(ownerRef.getSimpleName());
             qn = ownerRef.getQualifiedName();
         }
 
-        // Already explicit → respect it.
-        if (qn.contains(".")) return ownerRef;
+        if (qn.contains(".")) return ownerRef; // explicit → keep
 
         String simple = Optional.ofNullable(ownerRef.getSimpleName()).orElse("Missing");
-
-        // NEW: prefer explicit single-type imports (import org.example.SomeObject;)
-        CtTypeReference<?> viaExplicit = resolveFromExplicitTypeImports(ctx, simple);
-        if (viaExplicit != null) return viaExplicit;
-
-        // Existing logic: star-import order
-        List<String> starPkgs = starImportsInOrder(ctx);
+        List<String> starPkgs = starImportsInOrder(ctx); // non-JDK, source order
 
         if (starPkgs.contains("unknown")) {
             return f.Type().createReference("unknown." + simple);
         }
+
         if (starPkgs.size() == 1) {
             return f.Type().createReference(starPkgs.get(0) + "." + simple);
         }
+
+        // NEW: multiple candidates
+        if (starPkgs.size() > 1) {
+            if (cfg.isFailOnAmbiguity()) {
+                // leave it to callers that may throw; or pick 'unknown' if you prefer
+                return f.Type().createReference("unknown." + simple);
+            } else {
+                // lenient: pick FIRST in source order
+                return f.Type().createReference(starPkgs.get(0) + "." + simple);
+            }
+        }
+
+        // fallback
         return f.Type().createReference("unknown." + simple);
     }
 
@@ -836,5 +921,159 @@ public final class SpoonCollector {
         return null;
     }
 
+
+    // SpoonCollector.java
+    private void collectOverloadGaps(CtModel model, CollectResult out) {
+        // Find invocations whose owner/type exists and method name exists,
+        // but there is NO applicable overload for the provided arguments.
+        List<CtInvocation<?>> invocations = model.getElements((CtInvocation<?> inv) -> {
+            // Ignore constructor calls
+            CtExecutableReference<?> ex = inv.getExecutable();
+            String name = (ex != null ? ex.getSimpleName() : null);
+            if (name == null || "<init>".equals(name)) return false;
+
+            // owner must be resolvable type (the class exists)
+            CtTypeReference<?> rawOwner = resolveOwnerTypeFromInvocation(inv);
+            if (rawOwner == null) return false;
+            CtTypeReference<?> owner = chooseOwnerPackage(rawOwner, inv);
+            if (owner == null || isJdkType(owner)) return false;
+
+            CtType<?> ownerDecl = null;
+            try { ownerDecl = owner.getTypeDeclaration(); } catch (Throwable ignored) {}
+            if (!(ownerDecl instanceof CtClass)) return false; // enhance only classes
+
+            // Same-name methods present?
+            List<CtMethod<?>> sameName = ((CtClass<?>) ownerDecl).getMethods().stream()
+                    .filter(m -> name.equals(m.getSimpleName()))
+                    .collect(java.util.stream.Collectors.toList());
+            if (sameName.isEmpty()) return false; // then it's not an "overload gap", it's simply unresolved
+
+            // If any existing overload is applicable, it's NOT a gap
+            if (hasApplicableOverload(sameName, inv.getArguments())) return false;
+
+            return true; // gap detected
+        });
+
+        for (CtInvocation<?> inv : invocations) {
+            CtTypeReference<?> rawOwner = resolveOwnerTypeFromInvocation(inv);
+            CtTypeReference<?> owner    = chooseOwnerPackage(rawOwner, inv);
+            if (owner == null || isJdkType(owner)) continue;
+
+            CtExecutableReference<?> ex = inv.getExecutable();
+            String name = (ex != null ? ex.getSimpleName() : "m");
+
+            boolean isStatic    = inv.getTarget() instanceof CtTypeAccess<?>;
+            boolean isSuperCall = inv.getTarget() instanceof CtSuperAccess<?>;
+
+            CtTypeReference<?> returnType = inferReturnTypeFromContext(inv);
+            if (returnType == null) returnType = f.Type().VOID_PRIMITIVE;
+
+            // infer parameter types from the *arguments* directly (not from ex.getParameters(), which
+            // would reflect an existing but incompatible overload, e.g., String when we need int)
+            List<CtTypeReference<?>> paramTypes = inv.getArguments().stream()
+                    .map(this::paramTypeOrObject)
+                    .collect(Collectors.toList());
+
+            // visibility: mirror the most common (or first) visibility from existing same-name methods
+            MethodStubPlan.Visibility vis = MethodStubPlan.Visibility.PACKAGE;
+            try {
+                CtType<?> ownerDecl = owner.getTypeDeclaration();
+                if (ownerDecl instanceof CtClass) {
+                    @SuppressWarnings("unchecked")
+                    List<CtMethod<?>> sameName = ((CtClass<?>) ownerDecl).getMethods().stream()
+                            .filter(m -> name.equals(m.getSimpleName()))
+                            .collect(Collectors.toList());
+                    if (!sameName.isEmpty()) {
+                        // pick first's visibility
+                        Set<ModifierKind> mods = sameName.get(0).getModifiers();
+                        if (mods.contains(ModifierKind.PUBLIC))    vis = MethodStubPlan.Visibility.PUBLIC;
+                        else if (mods.contains(ModifierKind.PROTECTED)) vis = MethodStubPlan.Visibility.PROTECTED;
+                        else if (mods.contains(ModifierKind.PRIVATE))   vis = MethodStubPlan.Visibility.PRIVATE;
+                        else vis = MethodStubPlan.Visibility.PACKAGE;
+                    }
+                }
+            } catch (Throwable ignored) {}
+
+            List<CtTypeReference<?>> thrown = java.util.Collections.emptyList();
+            if (isSuperCall) {
+                thrown = new ArrayList<>(
+                        Optional.ofNullable(inv.getParent(CtMethod.class))
+                                .map(CtMethod::getThrownTypes)
+                                .orElse(Collections.emptySet())
+                );
+            }
+
+            out.methodPlans.add(new MethodStubPlan(owner, name, returnType, paramTypes, isStatic, vis, thrown));
+        }
+    }
+
+    private boolean hasApplicableOverload(List<CtMethod<?>> methods, List<CtExpression<?>> args) {
+        // very lightweight applicability: arity must match and every arg “fits” the parameter
+        for (CtMethod<?> m : methods) {
+            List<CtParameter<?>> ps = m.getParameters();
+            if (ps.size() != args.size()) continue;
+
+            boolean allOk = true;
+            for (int i = 0; i < ps.size(); i++) {
+                CtTypeReference<?> pt = null;
+                try { pt = ps.get(i).getType(); } catch (Throwable ignored) {}
+                CtTypeReference<?> at = paramTypeOrObject(args.get(i)); // your existing helper
+
+                // If either type is missing/null-ish, be conservative: treat as non-applicable
+                if (!isSaneType(pt) || !isSaneType(at)) { allOk = false; break; }
+
+                // Primitive int vs java.lang.Integer: consider a basic equality/boxed match
+                String pqn = safeQN(pt), aqn = safeQN(at);
+                if (pqn.equals(aqn)) continue;
+
+                // allow boxed vs primitive basic matches
+                if (isPrimitiveBoxPair(pqn, aqn)) continue;
+
+                allOk = false; break;
+            }
+            if (allOk) return true;
+        }
+        return false;
+    }
+
+    private boolean isPrimitiveBoxPair(String a, String b) {
+        // crude but effective
+        return (a.equals("int") && b.equals("java.lang.Integer")) || (b.equals("int") && a.equals("java.lang.Integer")) ||
+                (a.equals("long") && b.equals("java.lang.Long"))     || (b.equals("long") && a.equals("java.lang.Long")) ||
+                (a.equals("double") && b.equals("java.lang.Double")) || (b.equals("double") && a.equals("java.lang.Double")) ||
+                (a.equals("float") && b.equals("java.lang.Float"))   || (b.equals("float") && a.equals("java.lang.Float")) ||
+                (a.equals("short") && b.equals("java.lang.Short"))   || (b.equals("short") && a.equals("java.lang.Short")) ||
+                (a.equals("byte") && b.equals("java.lang.Byte"))     || (b.equals("byte") && a.equals("java.lang.Byte")) ||
+                (a.equals("char") && b.equals("java.lang.Character"))|| (b.equals("char") && a.equals("java.lang.Character")) ||
+                (a.equals("boolean") && b.equals("java.lang.Boolean"))|| (b.equals("boolean") && a.equals("java.lang.Boolean"));
+    }
+
+
+    // SpoonCollector.java
+
+    // walk a type reference + its actual type args (handles wildcards with bounds)
+    private void collectTypeRefDeep(CtElement ctx, CtTypeReference<?> t, CollectResult out) {
+        if (t == null) return;
+
+        // 1) plan the outer type as you do today
+        maybePlanDeclaredType(ctx, t, out);
+
+        // 2) recurse into actual type arguments
+        try {
+            for (CtTypeReference<?> arg : t.getActualTypeArguments()) {
+                if (arg == null) continue;
+
+                // wildcard? use its bounding type if present
+                if (arg instanceof spoon.reflect.reference.CtWildcardReference) {
+                    var w = (spoon.reflect.reference.CtWildcardReference) arg;
+                    CtTypeReference<?> bound = w.getBoundingType();
+                    if (bound != null) collectTypeRefDeep(ctx, bound, out);
+                    // (unbounded ?: nothing to stub)
+                } else {
+                    collectTypeRefDeep(ctx, arg, out);
+                }
+            }
+        } catch (Throwable ignored) {}
+    }
 
 }

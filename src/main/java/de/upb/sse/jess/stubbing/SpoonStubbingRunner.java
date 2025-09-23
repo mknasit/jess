@@ -53,6 +53,10 @@ public final class SpoonStubbingRunner implements Stubber {
         created += stubber.applyConstructorPlans(plans.ctorPlans);    // constructors
         created += stubber.applyMethodPlans(plans.methodPlans);       // methods
         stubber.dequalifyCurrentPackageUnresolvedRefs();
+
+        stubber.dequalifyCurrentPackageUnresolvedRefs(); // your existing pass
+        stubber.qualifyAmbiguousSimpleTypes();           // NEW pass
+
         stubber.report();                                             // nice summary
 
         // 4) Pretty-print (use default printer; safer with JDK11 snippets)
