@@ -46,11 +46,7 @@ public final class SpoonStubber {
         String name = "Missing";
         int i = qn.lastIndexOf('.');
         if (i >= 0) { pkg = qn.substring(0, i); name = qn.substring(i + 1); }
-        else {
-            // simple name? put it under 'unknown'
-            pkg = "unknown";
-            name = qn;
-        }
+        else { pkg = "unknown"; name = qn; }
 
         CtPackage packageObj = f.Package().getOrCreate(pkg);
         CtType<?> existing = packageObj.getType(name);
@@ -68,9 +64,29 @@ public final class SpoonStubber {
                 created = f.Class().create(packageObj, name);
         }
         created.addModifier(ModifierKind.PUBLIC);
+
+        // ---- NEW: make exception-like classes throwable (handles SomeOtherException1, etc.)
+        if (created instanceof CtClass) {
+            CtClass<?> cls = (CtClass<?>) created;
+            String simple = name;
+
+            // looks like an exception/error if it contains the token, even with numeric suffixes
+            boolean looksException = simple.matches(".*Exception(\\d+)?$") || simple.contains("Exception");
+            boolean looksError     = simple.matches(".*Error(\\d+)?$")     || simple.endsWith("Error");
+
+            if (looksError) {
+                cls.setSuperclass(f.Type().createReference("java.lang.Error"));
+            } else if (looksException) {
+                // unchecked so we don't have to rewrite method signatures
+                cls.setSuperclass(f.Type().createReference("java.lang.RuntimeException"));
+            }
+        }
+        // -----------------------------------------------
+
         createdTypes.add(qn);
         return true;
     }
+
 
     /* ---------- FIELDS ---------- */
 
