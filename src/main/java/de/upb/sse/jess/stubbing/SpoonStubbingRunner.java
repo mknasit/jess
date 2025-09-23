@@ -7,8 +7,10 @@ import de.upb.sse.jess.stubbing.spoon.collector.SpoonCollector.CollectResult;
 import de.upb.sse.jess.stubbing.spoon.generate.SpoonStubber;
 import spoon.Launcher;
 import spoon.reflect.CtModel;
+import spoon.reflect.code.CtInvocation;
 import spoon.reflect.factory.Factory;
 import spoon.reflect.visitor.DefaultJavaPrettyPrinter;
+import spoon.reflect.visitor.filter.TypeFilter;
 
 import java.nio.file.Path;
 import java.util.List;
@@ -51,10 +53,9 @@ public final class SpoonStubbingRunner implements Stubber {
         created += stubber.applyTypePlans(plans.typePlans);           // types (classes/interfaces/annotations)
         created += stubber.applyFieldPlans(plans.fieldPlans);         // fields
         created += stubber.applyConstructorPlans(plans.ctorPlans);    // constructors
-        created += stubber.applyMethodPlans(plans.methodPlans);       // methods
-        stubber.dequalifyCurrentPackageUnresolvedRefs();
+        created += stubber.applyMethodPlans(plans.methodPlans);
 
-        stubber.dequalifyCurrentPackageUnresolvedRefs(); // your existing pass
+        stubber.dequalifyCurrentPackageUnresolvedRefs();
         stubber.qualifyAmbiguousSimpleTypes();           // NEW pass
 
         stubber.report();                                             // nice summary

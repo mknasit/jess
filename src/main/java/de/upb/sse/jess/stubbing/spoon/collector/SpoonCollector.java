@@ -44,6 +44,7 @@ public final class SpoonCollector {
         collectUnresolvedCtorCalls(model, result);
         collectUnresolvedMethodCalls(model, result);
         collectExceptionTypes(model, result);
+        collectSupertypes(model, result);
         collectUnresolvedDeclaredTypes(model, result);
         collectOverloadGaps(model, result);
 
@@ -138,10 +139,8 @@ public final class SpoonCollector {
     }
 
 
-
-
     private CtTypeReference<?> resolveOwnerTypeFromFieldAccess(CtFieldAccess<?> fa) {
-        // Static access: TypeName.f
+        // Static: TypeName.f
         if (fa.getTarget() instanceof CtTypeAccess) {
             return ((CtTypeAccess<?>) fa.getTarget()).getAccessedType();
         }
@@ -150,17 +149,16 @@ public final class SpoonCollector {
         if (fa.getTarget() instanceof CtArrayAccess) {
             CtArrayAccess<?, ?> aa = (CtArrayAccess<?, ?>) fa.getTarget();
 
-            // Best: take the TYPE of the array *reference* (SomeObject[]), then its component (SomeObject)
+            // 1) array variable type -> component
             CtTypeReference<?> arrType = null;
             try { arrType = ((CtExpression<?>) aa.getTarget()).getType(); } catch (Throwable ignored) {}
             CtTypeReference<?> elem = componentOf(arrType);
             if (elem != null) {
-                // Choose package for the simple element name, honoring explicit single-type imports
                 CtTypeReference<?> owner = chooseOwnerPackage(elem, fa);
                 if (owner != null) return owner;
             }
 
-            // Fallback: try the type Spoon gives the array access itself
+            // 2) type Spoon gives to the array access expression itself (often the element type)
             try {
                 CtTypeReference<?> t = ((CtExpression<?>) aa).getType();
                 if (t != null) {
@@ -170,17 +168,20 @@ public final class SpoonCollector {
             } catch (Throwable ignored) {}
         }
 
-        // General: instance access → use target type (unwrap arrays defensively)
+        // General instance access
         if (fa.getTarget() != null) {
             try {
                 CtTypeReference<?> t = fa.getTarget().getType();
-                CtTypeReference<?> base = componentOf(t);
+                CtTypeReference<?> base = componentOf(t); // defensive unwrap in case Spoon gave an array ref
                 return (base != null ? chooseOwnerPackage(base, fa) : chooseOwnerPackage(t, fa));
             } catch (Throwable ignored) {}
         }
 
-        return f.Type().createReference("unknown.Missing");
+        // FINAL fallback: use a *named* unknown to avoid creating a bogus "Missing" owner
+        String simple = (fa.getVariable() != null ? fa.getVariable().getSimpleName() : "Owner");
+        return f.Type().createReference("unknown." + simple);
     }
+
 
     private CtTypeReference<?> componentOf(CtTypeReference<?> t) {
         if (t == null) return null;
@@ -381,7 +382,7 @@ public final class SpoonCollector {
 
 
 
-    private CtTypeReference<?> resolveOwnerTypeFromInvocation(CtInvocation<?> inv) {
+    private CtTypeReference<?> resolveOwnerTypeFromInvocationOLD(CtInvocation<?> inv) {
         if (inv.getTarget() instanceof CtTypeAccess) {
             return ((CtTypeAccess<?>) inv.getTarget()).getAccessedType();
         }
@@ -394,6 +395,38 @@ public final class SpoonCollector {
         }
         return f.Type().createReference("unknown.Missing");
     }
+    // SpoonCollector.java
+    private CtTypeReference<?> resolveOwnerTypeFromInvocation(CtInvocation<?> inv) {
+        // 1) Static call: TypeName.m(...)
+        if (inv.getTarget() instanceof CtTypeAccess) {
+            return ((CtTypeAccess<?>) inv.getTarget()).getAccessedType();
+        }
+
+        // 2) If the target is a field access, prefer the field's declared type
+        if (inv.getTarget() instanceof CtFieldAccess) {
+            CtFieldAccess<?> fa = (CtFieldAccess<?>) inv.getTarget();
+            try {
+                if (fa.getVariable() != null && fa.getVariable().getType() != null) {
+                    return fa.getVariable().getType(); // e.g., org.example.Log
+                }
+            } catch (Throwable ignored) { }
+            // fall through to generic expression type
+        }
+
+        // 3) Generic: use target expression type
+        if (inv.getTarget() != null) {
+            try { return inv.getTarget().getType(); } catch (Throwable ignored) {}
+        }
+
+        // 4) Static-import or unresolved — use declaring type if present
+        if (inv.getExecutable() != null && inv.getExecutable().getDeclaringType() != null) {
+            return inv.getExecutable().getDeclaringType();
+        }
+
+        // 5) Fallback
+        return f.Type().createReference("unknown.Missing");
+    }
+
 
     private CtTypeReference<?> inferReturnTypeFromContext(CtInvocation<?> inv) {
         CtElement p = inv.getParent();
@@ -591,76 +624,63 @@ public final class SpoonCollector {
         }
     }
 
-
     @SuppressWarnings("unchecked")
     private void maybePlanDeclaredType(CtElement ctx, CtTypeReference<?> t, CollectResult out) {
         if (t == null) return;
 
-        // primitives / void / arrays => skip
+        // NEW: if it's an array, handle its component type instead of skipping
+        try {
+            if (t.isArray() || t instanceof CtArrayTypeReference) {
+                CtTypeReference<?> comp = componentOf(t);
+                if (comp != null) {
+                    // treat the component as the declared type for planning
+                    maybePlanDeclaredType(ctx, comp, out);
+                }
+                return; // nothing more to do for the array wrapper itself
+            }
+        } catch (Throwable ignored) {}
+
+        // primitives / void => skip
         try {
             if (t.isPrimitive()) return;
             if (t.equals(f.Type().VOID_PRIMITIVE)) return;
-            if (t.isArray()) return;
         } catch (Throwable ignored) { }
 
-        // already resolvable (has declaration) => skip
-        try {
-            if (t.getDeclaration() != null) return;
-        } catch (Throwable ignored) { }
+        // already resolvable => skip
+        try { if (t.getDeclaration() != null) return; } catch (Throwable ignored) {}
 
         String qn = safeQN(t);
         String simple = t.getSimpleName();
         if (simple == null || simple.isEmpty()) return;
 
-        // JDK types => skip
-        if (qn.startsWith("java.") || qn.startsWith("javax.") ||
-                qn.startsWith("jakarta.") || qn.startsWith("sun.") || qn.startsWith("jdk.")) return;
-
-        // If Spoon already gave a package (qn has a dot), respect it;
-        // otherwise we must choose a package using star imports.
-        // If Spoon already gave a package (qn has a dot), respect it;
-// otherwise we must choose a package using star imports.
+        if (isJdkType(t)) return;
 
         if (!qn.contains(".")) {
-            List<String> starPkgs = starImportsInOrder(ctx);
-            boolean hasUnknown = starPkgs.contains("unknown");
-
-            // keep only non-unknown candidates in source order
-            List<String> nonUnknown = new ArrayList<>();
-            for (String p : starPkgs) if (!"unknown".equals(p)) nonUnknown.add(p);
-
-            if (nonUnknown.size() > 1) {
-                if (cfg.isFailOnAmbiguity()) {
-                    throw new AmbiguityException(
-                            "Ambiguous simple type '" + simple + "' from on-demand imports: " + nonUnknown
-                    );
-                } else {
-                    // lenient: choose the first non-unknown by source order
-                    out.typePlans.add(new TypeStubPlan(nonUnknown.get(0) + "." + simple, TypeStubPlan.Kind.CLASS));
-                    return;
-                }
-            }
-
-            if (nonUnknown.size() == 1) {
-                if (hasUnknown) {
-                    // quarantine to unknown to avoid future collisions with “real” pkg
-                    out.typePlans.add(new TypeStubPlan("unknown." + simple, TypeStubPlan.Kind.CLASS));
-                } else {
-                    out.typePlans.add(new TypeStubPlan(nonUnknown.get(0) + "." + simple, TypeStubPlan.Kind.CLASS));
-                }
+            // try explicit single-type imports first
+            CtTypeReference<?> explicit = resolveFromExplicitTypeImports(ctx, simple);
+            if (explicit != null) {
+                out.typePlans.add(new TypeStubPlan(explicit.getQualifiedName(), TypeStubPlan.Kind.CLASS));
                 return;
             }
 
-            // no non-unknown star imports
-            out.typePlans.add(new TypeStubPlan("unknown." + simple, TypeStubPlan.Kind.CLASS));
+            List<String> starPkgs = starImportsInOrder(ctx);
+            List<String> nonUnknown = starPkgs.stream().filter(p -> !"unknown".equals(p)).collect(java.util.stream.Collectors.toList());
+
+            if (nonUnknown.size() > 1 && cfg.isFailOnAmbiguity()) {
+                throw new AmbiguityException("Ambiguous simple type '" + simple + "' from on-demand imports: " + nonUnknown);
+            }
+            if (!nonUnknown.isEmpty()) {
+                out.typePlans.add(new TypeStubPlan(nonUnknown.get(0) + "." + simple, TypeStubPlan.Kind.CLASS));
+            } else {
+                out.typePlans.add(new TypeStubPlan("unknown." + simple, TypeStubPlan.Kind.CLASS));
+            }
             return;
         }
 
-
-
-        // Already qualified (but unresolved) → create where Spoon says
+        // already qualified (but unresolved) -> create where Spoon says
         out.typePlans.add(new TypeStubPlan(qn, TypeStubPlan.Kind.CLASS));
     }
+
 
 
     /* -------------------- HELPERS -------------------- */
@@ -1075,5 +1095,74 @@ public final class SpoonCollector {
             }
         } catch (Throwable ignored) {}
     }
+
+
+
+    // SpoonCollector.java
+    private void collectSupertypes(CtModel model, CollectResult out) {
+        // classes: superclass + superinterfaces
+        for (CtClass<?> c : model.getElements((CtClass<?> cc) -> true)) {
+            CtTypeReference<?> sup = null;
+            try { sup = c.getSuperclass(); } catch (Throwable ignored) {}
+            if (sup != null) {
+                CtTypeReference<?> owner = chooseOwnerPackage(sup, c);
+                if (owner != null && !isJdkType(owner)) {
+                    out.typePlans.add(new TypeStubPlan(owner.getQualifiedName(), TypeStubPlan.Kind.CLASS));
+                }
+            }
+            for (CtTypeReference<?> si : safe(c.getSuperInterfaces())) {
+                if (si == null) continue;
+                CtTypeReference<?> owner = chooseOwnerPackage(si, c);
+                if (owner != null && !isJdkType(owner)) {
+                    out.typePlans.add(new TypeStubPlan(owner.getQualifiedName(), TypeStubPlan.Kind.INTERFACE));
+                }
+            }
+        }
+
+        // interfaces: superinterfaces
+        for (CtInterface<?> i : model.getElements((CtInterface<?> ii) -> true)) {
+            for (CtTypeReference<?> si : safe(i.getSuperInterfaces())) {
+                if (si == null) continue;
+                CtTypeReference<?> owner = chooseOwnerPackage(si, i);
+                if (owner != null && !isJdkType(owner)) {
+                    out.typePlans.add(new TypeStubPlan(owner.getQualifiedName(), TypeStubPlan.Kind.INTERFACE));
+                }
+            }
+        }
+
+        // Also pick up generic type arguments used *in* extends/implements
+        for (CtType<?> t : model.getAllTypes()) {
+            // superclass type args
+            CtTypeReference<?> sup = null;
+            try { sup = (t instanceof CtClass) ? ((CtClass<?>) t).getSuperclass() : null; } catch (Throwable ignored) {}
+            if (sup != null) {
+                for (CtTypeReference<?> ta : safe(sup.getActualTypeArguments())) {
+                    if (ta == null) continue;
+                    CtTypeReference<?> owner = chooseOwnerPackage(ta, t);
+                    if (owner != null && !isJdkType(owner) && owner.getDeclaration() == null) {
+                        out.typePlans.add(new TypeStubPlan(owner.getQualifiedName(), TypeStubPlan.Kind.CLASS));
+                    }
+                }
+            }
+            // superinterfaces type args
+            Collection<CtTypeReference<?>> sis = (t instanceof CtClass)
+                    ? ((CtClass<?>) t).getSuperInterfaces()
+                    : (t instanceof CtInterface) ? ((CtInterface<?>) t).getSuperInterfaces()
+                    : Collections.emptyList();
+            for (CtTypeReference<?> si : safe(sis)) {
+                for (CtTypeReference<?> ta : safe(si.getActualTypeArguments())) {
+                    if (ta == null) continue;
+                    CtTypeReference<?> owner = chooseOwnerPackage(ta, t);
+                    if (owner != null && !isJdkType(owner) && owner.getDeclaration() == null) {
+                        out.typePlans.add(new TypeStubPlan(owner.getQualifiedName(), TypeStubPlan.Kind.CLASS));
+                    }
+                }
+            }
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private <T> Collection<T> safe(Collection<T> c) { return (c == null ? Collections.emptyList() : c); }
+
 
 }
