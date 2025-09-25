@@ -11,10 +11,13 @@ import spoon.reflect.reference.CtTypeReference;
 import spoon.reflect.declaration.CtType;
 import spoon.reflect.declaration.CtPackage;
 
-
 import java.util.*;
 
 public final class SpoonStubber {
+
+    /* ======================================================================
+     *                                 FIELDS
+     * ====================================================================== */
 
     private final Factory f;
 
@@ -23,10 +26,21 @@ public final class SpoonStubber {
     private final List<String> createdCtors  = new ArrayList<>();
     private final List<String> createdMethods= new ArrayList<>();
 
+    /* ======================================================================
+     *                              CONSTRUCTION
+     * ====================================================================== */
+
+    /** Create a stubber bound to a Spoon Factory. */
     public SpoonStubber(Factory f) { this.f = f; }
 
-    /* ---------- TYPES ---------- */
+    /* ======================================================================
+     *                                TYPES
+     * ====================================================================== */
 
+    /**
+     * Apply all TypeStubPlans; creates missing classes/interfaces/annotations.
+     * @return number of newly created types
+     */
     public int applyTypePlans(Collection<TypeStubPlan> plans) {
         int created = 0;
         for (TypeStubPlan p : plans) {
@@ -35,6 +49,11 @@ public final class SpoonStubber {
         return created;
     }
 
+    /**
+     * Ensure a type exists for the given plan (class/interface/annotation).
+     * Handles generic arity inference and exception/error superclasses.
+     * @return true if a new type was created
+     */
     private boolean ensureTypeExists(TypeStubPlan p) {
         String qn = p.qualifiedName;
         String pkg = "";
@@ -59,36 +78,39 @@ public final class SpoonStubber {
                 created = f.Class().create(packageObj, name);
         }
         created.addModifier(ModifierKind.PUBLIC);
-        int arity = inferGenericArityFromUsages(qn);
 
+        // Add generic parameters if usages imply arity.
+        int arity = inferGenericArityFromUsages(qn);
         if (arity > 0) addTypeParameters(created, arity);
 
-
-        // ---- NEW: make exception-like classes throwable (handles SomeOtherException1, etc.)
+        // If it looks like an exception/error, set a throwable superclass.
         if (created instanceof CtClass) {
             CtClass<?> cls = (CtClass<?>) created;
             String simple = name;
 
-            // looks like an exception/error if it contains the token, even with numeric suffixes
             boolean looksException = simple.matches(".*Exception(\\d+)?$") || simple.contains("Exception");
             boolean looksError     = simple.matches(".*Error(\\d+)?$")     || simple.endsWith("Error");
 
             if (looksError) {
                 cls.setSuperclass(f.Type().createReference("java.lang.Error"));
             } else if (looksException) {
-                // unchecked so we don't have to rewrite method signatures
                 cls.setSuperclass(f.Type().createReference("java.lang.RuntimeException"));
             }
         }
-        // -----------------------------------------------
 
         createdTypes.add(qn);
         return true;
     }
 
+    /* ======================================================================
+     *                                FIELDS
+     * ====================================================================== */
 
-    /* ---------- FIELDS ---------- */
-
+    /**
+     * Apply all FieldStubPlans; creates public fields (and static if required).
+     * Adds explicit import for unknown.Unknown when necessary.
+     * @return number of newly created fields
+     */
     public int applyFieldPlans(Collection<FieldStubPlan> plans) {
         int created = 0;
         for (FieldStubPlan p : plans) {
@@ -99,8 +121,6 @@ public final class SpoonStubber {
             if ("unknown.Unknown".equals(readable(fieldType)) || "Unknown".equals(fieldType.getSimpleName())) {
                 ensureExplicitUnknownImport(owner);
             }
-
-
 
             Set<ModifierKind> mods = new HashSet<>();
             mods.add(ModifierKind.PUBLIC);
@@ -116,12 +136,21 @@ public final class SpoonStubber {
         return created;
     }
 
-    /* ---------- CONSTRUCTORS ---------- */
+    /* ======================================================================
+     *                             CONSTRUCTORS
+     * ====================================================================== */
+
+    /**
+     * Apply all ConstructorStubPlans; creates public constructors with normalized params.
+     * Adds explicit import for unknown.Unknown when parameters use it.
+     * @return number of newly created constructors
+     */
     public int applyConstructorPlans(Collection<ConstructorStubPlan> plans) {
         int created = 0;
         for (ConstructorStubPlan p : plans) {
             CtClass<?> owner = ensurePublicClass(p.ownerType);
-            // normalize params first
+
+            // Normalize params first.
             List<CtTypeReference<?>> normParams = new ArrayList<>();
             for (CtTypeReference<?> t : p.parameterTypes) normParams.add(normalizeUnknownRef(t));
 
@@ -130,7 +159,6 @@ public final class SpoonStubber {
             Set<ModifierKind> mods = new HashSet<>();
             mods.add(ModifierKind.PUBLIC);
             List<CtParameter<?>> params = makeParams(normParams);
-
 
             CtConstructor<?> ctor = f.Constructor().create(owner, mods, params, Collections.emptySet(), f.Core().createBlock());
 
@@ -150,14 +178,23 @@ public final class SpoonStubber {
         return created;
     }
 
+    /* ======================================================================
+     *                                METHODS
+     * ====================================================================== */
 
+    /**
+     * Apply all MethodStubPlans; creates methods with normalized return/param types,
+     * mirrors visibility, and provides default bodies (or none for interfaces).
+     * Also wires Iterable<T> if creating iterator().
+     * @return number of newly created methods
+     */
     public int applyMethodPlans(Collection<MethodStubPlan> plans) {
         int created = 0;
         for (MethodStubPlan p : plans) {
             CtClass<?> owner = ensurePublicClass(p.ownerType);
             if (hasMethod(owner, p.name, p.paramTypes)) continue;
 
-            // normalize return + params before creating the method
+            // Normalize return + params before creating the method.
             CtTypeReference<?> rt0 = normalizeUnknownRef(
                     (p.returnType != null ? p.returnType : f.Type().VOID_PRIMITIVE)
             );
@@ -168,7 +205,7 @@ public final class SpoonStubber {
             for (CtTypeReference<?> t : p.paramTypes) normParams.add(normalizeUnknownRef(t));
             List<CtParameter<?>> params = makeParams(normParams);
 
-            // thrown types unchanged (they normally won’t be "Unknown")
+            // Thrown types unchanged (normally won’t be Unknown).
             Set<CtTypeReference<? extends Throwable>> thrown = new LinkedHashSet<>();
             for (CtTypeReference<?> t : p.thrownTypes) {
                 if (t == null) continue;
@@ -177,6 +214,7 @@ public final class SpoonStubber {
                 thrown.add(tt);
             }
 
+            // Visibility + static.
             Set<ModifierKind> mods = new HashSet<>();
             if (p.isStatic) mods.add(ModifierKind.STATIC);
             switch (p.visibility) {
@@ -188,13 +226,12 @@ public final class SpoonStubber {
 
             CtMethod<?> m = f.Method().create(owner, mods, rt, p.name, params, thrown);
 
-            // If we're stubbing an iterator() compatible with foreach, make the class implement Iterable<E>
+            // If stubbing iterator(), add Iterable<E> to class so foreach works.
             if ("iterator".equals(p.name) && p.paramTypes.isEmpty()) {
-                CtTypeReference<?> rtForIterable = rt0; // method return type
+                CtTypeReference<?> rtForIterable = rt0;
                 String rtQN = safeQN(rtForIterable);
                 if (rtQN.startsWith("java.util.Iterator")) {
                     CtTypeReference<?> iterableRef = f.Type().createReference("java.lang.Iterable");
-
                     try {
                         List<CtTypeReference<?>> args = rtForIterable.getActualTypeArguments();
                         if (args != null && !args.isEmpty() && args.get(0) != null) {
@@ -216,12 +253,12 @@ public final class SpoonStubber {
                 }
             }
 
-
+            // Trace parameters (kept as-is).
             for (int i = 0; i < params.size(); i++) {
                 System.out.println("        param" + i + ": " + readable(params.get(i).getType()));
             }
 
-            // right after params/thrown/mods and BEFORE or AFTER creating CtMethod (order doesn't matter for the CU)
+            // If method uses Unknown (in return or params), add explicit import.
             boolean usesUnknown =
                     "unknown.Unknown".equals(readable(rt0))
                             || "Unknown".equals(rt0.getSimpleName())
@@ -229,14 +266,11 @@ public final class SpoonStubber {
                             "unknown.Unknown".equals(readable(d.getType()))
                                     || "Unknown".equals(d.getType().getSimpleName())
                     );
-
-// (rare) if you might ever put it in throws, extend the check similarly
-
             if (usesUnknown) {
                 ensureExplicitUnknownImport(owner);
             }
 
-
+            // Add a default body (except for interfaces).
             if (!owner.isInterface()) {
                 CtBlock<?> body = f.Core().createBlock();
                 CtReturn<?> ret = defaultReturn(rt0);
@@ -246,7 +280,7 @@ public final class SpoonStubber {
                 m.setBody(null);
             }
 
-            // keep references qualified so auto-imports (or FQNs) work
+            // Keep references qualified so auto-imports or FQNs work.
             ensureImport(owner, rt0);
             for (CtParameter<?> par : params) ensureImport(owner, par.getType());
             for (CtTypeReference<?> t : thrown) ensureImport(owner, t);
@@ -257,8 +291,11 @@ public final class SpoonStubber {
         return created;
     }
 
-    /* ---------- Reporting ---------- */
+    /* ======================================================================
+     *                               REPORTING
+     * ====================================================================== */
 
+    /** Print a simple creation report to stdout. */
     public void report() {
         System.out.println("\n== SPOON STUBS generated ==");
         for (String t : createdTypes)   System.out.println(" +type  "  + t);
@@ -267,8 +304,14 @@ public final class SpoonStubber {
         for (String s : createdMethods) System.out.println(" +method " + s);
     }
 
-    /* ---------- Helpers ---------- */
+    /* ======================================================================
+     *                                HELPERS
+     * ====================================================================== */
 
+    /**
+     * Ensure a public class exists for a reference; creates it if needed.
+     * Returns the CtClass<?> for that type.
+     */
     private CtClass<?> ensurePublicClass(CtTypeReference<?> ref) {
         String qn = ref.getQualifiedName();
         String pkg = "";
@@ -292,15 +335,14 @@ public final class SpoonStubber {
         return cls;
     }
 
-
-
-    // add this helper in SpoonStubber
+    /** Returns true for null/NullType-like references. */
     private boolean isNullish(CtTypeReference<?> t) {
         if (t == null) return true;
         String qn = t.getQualifiedName();
         return qn == null || "null".equals(qn) || qn.contains("NullType");
     }
 
+    /** Create CtParameter list for the provided types; assigns arg0..argN. */
     private List<CtParameter<?>> makeParams(List<CtTypeReference<?>> types) {
         List<CtParameter<?>> params = new ArrayList<>();
         for (int i = 0; i < types.size(); i++) {
@@ -308,7 +350,7 @@ public final class SpoonStubber {
             CtTypeReference<?> raw = (i < types.size() ? types.get(i) : null);
             CtTypeReference<?> safe = (raw == null || isNullish(raw))
                     ? f.Type().createReference(de.upb.sse.jess.generation.unknown.UnknownType.CLASS)
-                    : normalizeUnknownRef(raw); // <— ensure normalization survives
+                    : normalizeUnknownRef(raw); // ensure normalization survives
 
             par.setType(safe);
             par.setSimpleName("arg" + i);
@@ -317,7 +359,7 @@ public final class SpoonStubber {
         return params;
     }
 
-
+    /** Check if a method with name and parameter signature exists. */
     private boolean hasMethod(CtClass<?> owner, String name, List<CtTypeReference<?>> paramTypes) {
         outer:
         for (CtMethod<?> m : owner.getMethods()) {
@@ -334,7 +376,7 @@ public final class SpoonStubber {
         return false;
     }
 
-
+    /** Check if a constructor with parameter signature exists. */
     private boolean hasConstructor(CtClass<?> owner, List<CtTypeReference<?>> paramTypes) {
         outer:
         for (CtConstructor<?> c : owner.getConstructors()) {
@@ -350,36 +392,45 @@ public final class SpoonStubber {
         return false;
     }
 
+    /** Produce a default return statement for the given return type; null for void. */
     private CtReturn<?> defaultReturn(CtTypeReference<?> t) {
         if (t == null || t.equals(f.Type().VOID_PRIMITIVE)) return null;
 
         CtCodeSnippetExpression<Object> expr;
-        if (t.equals(f.Type().BOOLEAN_PRIMITIVE))      expr = f.Code().createCodeSnippetExpression("false");
+        if (t.equals(f.Type().BOOLEAN_PRIMITIVE))        expr = f.Code().createCodeSnippetExpression("false");
         else if (t.equals(f.Type().CHARACTER_PRIMITIVE)) expr = f.Code().createCodeSnippetExpression("'\\0'");
-        else if (t.equals(f.Type().BYTE_PRIMITIVE))    expr = f.Code().createCodeSnippetExpression("(byte)0");
-        else if (t.equals(f.Type().SHORT_PRIMITIVE))   expr = f.Code().createCodeSnippetExpression("(short)0");
-        else if (t.equals(f.Type().INTEGER_PRIMITIVE)) expr = f.Code().createCodeSnippetExpression("0");
-        else if (t.equals(f.Type().LONG_PRIMITIVE))    expr = f.Code().createCodeSnippetExpression("0L");
-        else if (t.equals(f.Type().FLOAT_PRIMITIVE))   expr = f.Code().createCodeSnippetExpression("0f");
-        else if (t.equals(f.Type().DOUBLE_PRIMITIVE))  expr = f.Code().createCodeSnippetExpression("0d");
-        else                                           expr = f.Code().createCodeSnippetExpression("null");
+        else if (t.equals(f.Type().BYTE_PRIMITIVE))      expr = f.Code().createCodeSnippetExpression("(byte)0");
+        else if (t.equals(f.Type().SHORT_PRIMITIVE))     expr = f.Code().createCodeSnippetExpression("(short)0");
+        else if (t.equals(f.Type().INTEGER_PRIMITIVE))   expr = f.Code().createCodeSnippetExpression("0");
+        else if (t.equals(f.Type().LONG_PRIMITIVE))      expr = f.Code().createCodeSnippetExpression("0L");
+        else if (t.equals(f.Type().FLOAT_PRIMITIVE))     expr = f.Code().createCodeSnippetExpression("0f");
+        else if (t.equals(f.Type().DOUBLE_PRIMITIVE))    expr = f.Code().createCodeSnippetExpression("0d");
+        else                                             expr = f.Code().createCodeSnippetExpression("null");
 
         CtReturn<Object> r = f.Core().createReturn();
         r.setReturnedExpression(expr);
         return r;
     }
 
+    /** Safe readable name for types (falls back to "void"). */
     private static String readable(CtTypeReference<?> t) {
         return (t == null ? "void" : String.valueOf(t.getQualifiedName()));
     }
 
+    /** Build a signature string like Owner#name(T1, T2). */
     private static String sig(String ownerFqn, String name, List<CtTypeReference<?>> params) {
         String p = String.join(", ", params.stream().map(SpoonStubber::readable).toArray(String[]::new));
         return ownerFqn + "#" + name + "(" + p + ")";
     }
 
+    /* ======================================================================
+     *                   PACKAGE/QUALIFICATION UTILITIES
+     * ====================================================================== */
 
-    // SpoonStubber.dequalifyCurredequalifyCurrentPackageUnresolvedRefsntPackageUnresolvedRefs()
+    /**
+     * De-qualify unresolved type refs that only appear to be in the current package,
+     * unless they already belong to 'unknown.' space.
+     */
     public void dequalifyCurrentPackageUnresolvedRefs() {
         CtModel model = f.getModel();
         model.getAllTypes().forEach(t -> {
@@ -398,12 +449,11 @@ public final class SpoonStubber {
                         ref.setPackage(null);
                     }
                 }
-
             });
         });
     }
 
-
+    /** Safely get a type's qualified name; returns empty string on failure. */
     private static String safeQN(CtTypeReference<?> t) {
         try {
             String s = (t == null ? null : t.getQualifiedName());
@@ -413,7 +463,10 @@ public final class SpoonStubber {
         }
     }
 
-
+    /**
+     * Force FQN printing for non-JDK, non-primitive types and skip imports.
+     * Keeps primitives/void/arrays and JDK types untouched.
+     */
     private void ensureImport(CtType<?> owner, CtTypeReference<?> ref) {
         if (ref == null) return;
 
@@ -438,8 +491,6 @@ public final class SpoonStubber {
         // If it already has a package (qn contains '.'), keep it qualified.
         // If it is a simple name (no package), DO NOT add any import—just force FQN printing.
         if (!qn.contains(".")) {
-            // If it's bare "Unknown", normalize to unknown.Unknown (you already do this earlier).
-            // Here, just force qualified printing for whatever this is.
             ref.setImplicit(false);
             ref.setSimplyQualified(true); // print FQN, avoid imports entirely
             return;
@@ -454,8 +505,10 @@ public final class SpoonStubber {
         ref.setSimplyQualified(true); // always print FQN
     }
 
-
-
+    /**
+     * Normalize a reference to 'unknown.Unknown' when it appears as bare 'Unknown'
+     * or inside the 'unknown.' package; makes it rely on an explicit import.
+     */
     private CtTypeReference<?> normalizeUnknownRef(CtTypeReference<?> t) {
         if (t == null) return null;
         String qn = safeQN(t);
@@ -466,19 +519,17 @@ public final class SpoonStubber {
                     de.upb.sse.jess.generation.unknown.UnknownType.CLASS
             );
             u.setImplicit(false);
-            u.setSimplyQualified(false);   // <-- simple name, rely on the explicit import
+            u.setSimplyQualified(false);   // simple name, rely on the explicit import
             return u;
         }
         if (qn.startsWith("unknown.")) {
             t.setImplicit(false);
-            t.setSimplyQualified(false);   // <-- simple name, rely on the explicit import
+            t.setSimplyQualified(false);   // simple name, rely on the explicit import
         }
         return t;
     }
 
-
-
-    /** Adds `import unknown.Unknown;` once to the owner's CU. */
+    /** Adds `import unknown.Unknown;` to the owner's CU once (idempotent). */
     private void ensureExplicitUnknownImport(CtType<?> owner) {
         final String FQN = "unknown.Unknown";
         CtCompilationUnit cu = f.CompilationUnit().getOrCreate(owner);
@@ -496,7 +547,10 @@ public final class SpoonStubber {
         }
     }
 
-    // SpoonStubber.java
+    /**
+     * Build a map of simple type name -> set of packages present in the model (non-JDK).
+     * Used to detect ambiguous simple names.
+     */
     private Map<String, Set<String>> simpleNameToPkgs() {
         Map<String, Set<String>> m = new LinkedHashMap<>();
         f.getModel().getAllTypes().forEach(t -> {
@@ -513,7 +567,10 @@ public final class SpoonStubber {
         return m;
     }
 
-    // SpoonStubber.java
+    /**
+     * Qualify ambiguous simple type refs to a chosen package (prefer 'unknown' if present),
+     * and force FQN printing to avoid import conflicts.
+     */
     public void qualifyAmbiguousSimpleTypes() {
         Map<String, Set<String>> map = simpleNameToPkgs();
         // only keep ambiguous entries
@@ -556,9 +613,10 @@ public final class SpoonStubber {
         });
     }
 
-
-    // SpoonStubber.java
-
+    /**
+     * Inspect model usages of a type FQN to infer maximum number of generic type arguments.
+     * @return maximum arity observed (0 if none)
+     */
     private int inferGenericArityFromUsages(String fqn) {
         String simple = fqn.substring(fqn.lastIndexOf('.') + 1);
         int max = 0;
@@ -580,7 +638,9 @@ public final class SpoonStubber {
         return max;
     }
 
-
+    /**
+     * Add type parameters T0..T{arity-1} to a newly created type if it can declare formals.
+     */
     private void addTypeParameters(CtType<?> created, int arity) {
         if (!(created instanceof CtFormalTypeDeclarer) || arity <= 0) return;
         CtFormalTypeDeclarer decl = (CtFormalTypeDeclarer) created;
@@ -594,7 +654,4 @@ public final class SpoonStubber {
             decl.addFormalCtTypeParameter(tp);
         }
     }
-
-
-
 }

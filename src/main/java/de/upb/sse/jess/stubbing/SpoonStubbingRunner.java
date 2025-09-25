@@ -24,6 +24,7 @@ public final class SpoonStubbingRunner implements Stubber {
 
     @Override
     public int run(Path slicedSrcDir, List<Path> classpathJars) throws Exception {
+        System.out.println("\n>> Using stubber: Spoon Based Stubber" );
         // 1) Configure Spoon for Java 11
         Launcher launcher = new Launcher();
         var env = launcher.getEnvironment();

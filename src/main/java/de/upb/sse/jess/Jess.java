@@ -163,14 +163,14 @@ public class Jess {
 
             // Extract original file with adjusted imports
             ex.extract(getFullyQualifiedRootName(root), root);
-
+            System.out.println("\n>> Using stubber: " + this.stubber.getClass().getSimpleName());
             // Stub unresolvable types if not disabled
             if (!config.isDisableStubbing()) {
                 // Compile sliced files
                 boolean successfulPreCompilation = compile(targetClass, classOutput, true);
                 if (successfulPreCompilation) return 0;
 
-                System.out.println("\n>> Using stubber: " + this.stubber.getClass().getSimpleName());
+
 
                 int created = this.stubber.run(Paths.get(SRC_OUTPUT), this.jarPaths);
                 System.out.println("\n== SLICED TYPES (after stubbing) ==");

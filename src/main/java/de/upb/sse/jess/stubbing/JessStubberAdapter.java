@@ -10,6 +10,7 @@ public final class JessStubberAdapter implements Stubber {
 
     @Override
     public int run(Path slicedSrcDir, List<Path> classpathJars) {
+        System.out.println("\n>> Using stubber: Jess Javaparser Based Stubber" );
         try {
             return jess.runJessStubbing(slicedSrcDir.toString());
         } catch (Exception e) {
