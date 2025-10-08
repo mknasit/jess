@@ -20,13 +20,15 @@ public class JessConfiguration {
 
     private String targetVersion = null;
 
-    public JessConfiguration(boolean exitOnCompilationFail, boolean exitOnParsingFail, boolean looseSignatureMatching, boolean keepAsteriskImports, boolean failOnAmbiguity, boolean disableStubbing) {
+    public JessConfiguration(boolean exitOnCompilationFail, boolean exitOnParsingFail, boolean looseSignatureMatching, boolean keepAsteriskImports, boolean failOnAmbiguity, boolean disableStubbing,String targetVersion) {
         this.exitOnCompilationFail = exitOnCompilationFail;
         this.exitOnParsingFail = exitOnParsingFail;
         this.looseSignatureMatching = looseSignatureMatching;
         this.keepAsteriskImports = keepAsteriskImports;
         this.failOnAmbiguity = failOnAmbiguity;
         this.disableStubbing = disableStubbing;
+        this.targetVersion = targetVersion;
+
     }
 
     public StubberKind getStubberKind() { return stubberKind; }

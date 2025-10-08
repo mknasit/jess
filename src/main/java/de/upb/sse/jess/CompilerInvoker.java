@@ -20,54 +20,47 @@ import java.util.stream.Collectors;
 public class CompilerInvoker {
     private String targetVersion;
     private boolean silentCompilation;
+    public static String output;
 
-    public CompilerInvoker() {
-        this(false);
-    }
-
-    public CompilerInvoker(boolean silentCompilation) {
-        this(null, silentCompilation);
-    }
-
+    public CompilerInvoker() { this(false); }
+    public CompilerInvoker(boolean silentCompilation) { this(null, silentCompilation); }
     public CompilerInvoker(String targetVersion, boolean silentCompilation) {
         this.targetVersion = targetVersion;
         this.silentCompilation = silentCompilation;
     }
 
     public boolean compileFile(String fileString, String output) {
+        // keep static field in sync (use the *existing* param name)
+        CompilerInvoker.output = output;
         return this.compileFile(List.of(fileString), output);
     }
 
     public boolean compileFile(List<String> fileStrings, String output) {
+        // keep static field in sync
+        CompilerInvoker.output = output;
+
         List<String> filesToCompile = new ArrayList<>();
         for (String fileString : fileStrings) {
             filesToCompile.addAll(getFileNames(new ArrayList<>(), Path.of(fileString)));
         }
 
-        String classPath = "." + (FileUtil.isWindows() ? ";" : ":") + JarFinder.find(Jess.JAR_DIRECTORY).stream()
-                .collect(Collectors.joining(FileUtil.isWindows() ? ";" : ":"));
+        String classPath = "." + (FileUtil.isWindows() ? ";" : ":") +
+                JarFinder.find(Jess.JAR_DIRECTORY).stream()
+                        .collect(Collectors.joining(FileUtil.isWindows() ? ";" : ":"));
 
         List<String> argLine = new ArrayList<>(filesToCompile);
         if (targetVersion != null && !targetVersion.equals("unknown")) {
-            argLine.add("-source");
-            argLine.add(this.targetVersion);
-            argLine.add("-target");
-            argLine.add(this.targetVersion);
+            argLine.add("-source"); argLine.add(this.targetVersion);
+            argLine.add("-target"); argLine.add(this.targetVersion);
         }
         argLine.add("-Xlint:-options");
-        argLine.add("-cp");
-        argLine.add(classPath);
-        argLine.add("-d");
-        argLine.add(output);
-//        argLine.add("-Xlint:none");
-
-//        cleanUp(output);
-
-        String[] argLineString = argLine.toArray(String[]::new);
+        argLine.add("-cp"); argLine.add(classPath);
+        argLine.add("-d");  argLine.add(output); // <-- still pass the param
+        // ...
         JavaCompiler comp = ToolProvider.getSystemJavaCompiler();
         OutputStream oStream = silentCompilation ? OutputStream.nullOutputStream() : null;
-        InputStream iStream = silentCompilation ? InputStream.nullInputStream() : null;
-        int result = comp.run(iStream, oStream, oStream, argLineString);
+        InputStream  iStream = silentCompilation ? InputStream.nullInputStream()  : null;
+        int result = comp.run(iStream, oStream, oStream, argLine.toArray(String[]::new));
         return result == 0;
     }
 
