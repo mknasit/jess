@@ -30,6 +30,18 @@ public class JessConfiguration {
         this.targetVersion = targetVersion;
 
     }
+    // Legacy 6-arg ctor kept for compatibility with old callers (e.g., Main)
+    public JessConfiguration(boolean exitOnCompilationFail,
+                             boolean exitOnParsingFail,
+                             boolean looseSignatureMatching,
+                             boolean keepAsteriskImports,
+                             boolean failOnAmbiguity,
+                             boolean disableStubbing) {
+        // delegate to your 7-arg ctor; keep Spoon as default stubberKind via the field
+        this(exitOnCompilationFail, exitOnParsingFail, looseSignatureMatching,
+                keepAsteriskImports, failOnAmbiguity, disableStubbing, null); // targetVersion = null
+    }
+
 
     public StubberKind getStubberKind() { return stubberKind; }
     public void setStubberKind(StubberKind kind) { this.stubberKind = kind; }
