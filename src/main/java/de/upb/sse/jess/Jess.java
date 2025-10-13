@@ -38,6 +38,7 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
+import java.util.logging.Logger;
 
 public class Jess {
     public static final String SRC_OUTPUT = "gen";
@@ -52,6 +53,8 @@ public class Jess {
     private final CombinedTypeSolver combinedTypeSolver;
     private final List<Path> jarPaths = new ArrayList<>();
     private final Stubber stubber;
+
+    private static final Logger logger = Logger.getLogger(Jess.class.getName());
 
     public Jess() {
         this(new JessConfiguration(), Collections.emptyList(), Collections.emptyList());
@@ -164,6 +167,7 @@ public class Jess {
             // Extract original file with adjusted imports
             ex.extract(getFullyQualifiedRootName(root), root);
             System.out.println("\n>> Using stubber: " + this.stubber.getClass().getSimpleName());
+            logger.info( "\n>> Using stubber:::::::::::::::::::::::::::::: " + this.stubber.getClass().getSimpleName());
             // Stub unresolvable types if not disabled
             if (!config.isDisableStubbing()) {
                 // Compile sliced files
