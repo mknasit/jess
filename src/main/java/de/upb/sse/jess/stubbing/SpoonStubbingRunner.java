@@ -53,11 +53,13 @@ public final class SpoonStubbingRunner implements Stubber {
         // 3) Generate stubs (separate handlers per kind)
         SpoonStubber stubber = new SpoonStubber(f);
         int created = 0;
-        created += stubber.applyTypePlans(plans.typePlans);           // types (classes/interfaces/annotations)
+        created += stubber.applyTypePlans(plans.typePlans);// types (classes/interfaces/annotations)
         created += stubber.applyFieldPlans(plans.fieldPlans);         // fields
         created += stubber.applyConstructorPlans(plans.ctorPlans);    // constructors
         created += stubber.applyMethodPlans(plans.methodPlans);
+        stubber.finalizeRepeatableAnnotations();
 
+        stubber.canonicalizeAllMetaAnnotations();
         stubber.dequalifyCurrentPackageUnresolvedRefs();
         stubber.qualifyAmbiguousSimpleTypes();           // NEW pass
 

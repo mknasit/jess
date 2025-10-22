@@ -98,12 +98,14 @@ public final class SpoonCollector {
         collectUnresolvedFields(model, result);
         collectUnresolvedCtorCalls(model, result);
         collectUnresolvedMethodCalls(model, result);
+        collectUnresolvedAnnotations(model, result);
 
         collectExceptionTypes(model, result);
         collectSupertypes(model, result);
 
         collectFromInstanceofCastsClassLiteralsAndForEach(model, result);
         collectUnresolvedDeclaredTypes(model, result);
+        collectAnnotationTypeUsages(model, result);
         collectOverloadGaps(model, result);
 
         seedOnDemandImportAnchors(model, result);
@@ -343,9 +345,7 @@ public final class SpoonCollector {
      *                           CONSTRUCTORS PASS
      * ====================================================================== */
 
-    /**
-     * Collect constructor stubs from unresolved constructor calls.
-     */
+
     private void collectUnresolvedCtorCalls(CtModel model, CollectResult out) {
         var unresolved = model.getElements((CtConstructorCall<?> cc) -> {
             var ex = cc.getExecutable();
@@ -354,16 +354,58 @@ public final class SpoonCollector {
 
         for (CtConstructorCall<?> cc : unresolved) {
             CtTypeReference<?> rawOwner = cc.getType();
+
+            // ----- NEW: detect member-inner creation on any CtConstructorCall -----
+            CtExpression<?> targetExpr = null;
+            try {
+                // Spoon 10.x: CtConstructorCall has getTarget()
+                targetExpr = (CtExpression<?>) cc.getClass().getMethod("getTarget").invoke(cc);
+            } catch (Throwable ignore) {
+                // Older Spoon variants: anonymous/inner had getEnclosingExpression()
+                try {
+                    targetExpr = (CtExpression<?>) cc.getClass()
+                            .getMethod("getEnclosingExpression")
+                            .invoke(cc);
+                } catch (Throwable ignored) {}
+            }
+
+            if (targetExpr != null) {
+                CtTypeReference<?> outerT = null;
+                try { outerT = targetExpr.getType(); } catch (Throwable ignored) {}
+
+                if (outerT != null) {
+                    // resolve simple 'Outer' using explicit single-type imports (and star) first
+                    CtTypeReference<?> resolvedOuter = chooseOwnerPackage(outerT, cc);
+                    String outerFqn = safeQN(resolvedOuter);
+                    if (outerFqn.isEmpty()) outerFqn = resolvedOuter.getQualifiedName();
+
+                    String innerSimple = rawOwner.getSimpleName();
+                    CtTypeReference<?> memberOwner = f.Type().createReference(outerFqn + "$" + innerSimple);
+
+                    List<CtTypeReference<?>> ps =
+                            inferParamTypesFromCall(cc.getExecutable(), cc.getArguments());
+
+                    out.typePlans.add(new TypeStubPlan(outerFqn, TypeStubPlan.Kind.CLASS));
+                    out.typePlans.add(new TypeStubPlan(outerFqn + "$" + innerSimple, TypeStubPlan.Kind.CLASS));
+                    out.ctorPlans.add(new ConstructorStubPlan(memberOwner, ps));
+                    continue; // handled -> do NOT fall back to generic path
+                }
+            }
+            // ---------------------------------------------------------------------
+
             CtTypeReference<?> owner = chooseOwnerPackage(rawOwner, cc);
             if (isJdkType(owner)) continue;
 
-            // Walk generic type args referenced in the owner type.
             collectTypeRefDeep(cc, rawOwner, out);
-
             List<CtTypeReference<?>> ps = inferParamTypesFromCall(cc.getExecutable(), cc.getArguments());
-            out.ctorPlans.add(new ConstructorStubPlan(owner, ps));
+
+            // Preserve nested owners ($) if present
+            String ownerFqn = nestedAwareFqnOf(owner);
+            out.ctorPlans.add(new ConstructorStubPlan(f.Type().createReference(ownerFqn), ps));
         }
+
     }
+
 
     /* ======================================================================
      *                             METHODS PASS
@@ -394,19 +436,57 @@ public final class SpoonCollector {
 
             CtTypeReference<?> rawOwner = resolveOwnerTypeFromInvocation(inv);
             CtTypeReference<?> owner = chooseOwnerPackage(rawOwner, inv);
+
+            Boolean defaultOnIface = false;
+            CtExpression<?> tgt = inv.getTarget();
+            boolean implicitThis = (tgt == null) || (tgt instanceof spoon.reflect.code.CtThisAccess<?>);
+            if (implicitThis) {
+                CtClass<?> enclosingClass = inv.getParent(CtClass.class);
+                if (enclosingClass != null) {
+                    List<CtTypeReference<?>> nonJdkIfaces = enclosingClass.getSuperInterfaces()
+                            .stream()
+                            .filter(Objects::nonNull)
+                            .filter(ifr -> {
+                                String qn = safeQN(ifr);
+                                return !(qn.startsWith("java.") || qn.startsWith("javax.")
+                                        || qn.startsWith("jakarta.") || qn.startsWith("sun.")
+                                        || qn.startsWith("jdk."));
+                            })
+                            .collect(java.util.stream.Collectors.toList());
+
+                    if (nonJdkIfaces.size() == 1) {
+                        owner = chooseOwnerPackage(nonJdkIfaces.get(0), inv);
+                        defaultOnIface = true;
+                    }
+                    // if 0 or >1, keep the original owner heuristic (usually the class)
+                }
+            }
+
+            if (owner == null || "unknown.Missing".equals(safeQN(owner)) || inv.getTarget() == null) {
+                CtTypeReference<?> fromStatic = resolveOwnerFromStaticImports(inv, name);
+                if (fromStatic != null) owner = chooseOwnerPackage(fromStatic, inv);
+            }
+
             if (isJdkType(owner)) continue;
+
+
 
             boolean isStatic = inv.getTarget() instanceof CtTypeAccess<?>;
             boolean isSuperCall = inv.getTarget() instanceof CtSuperAccess<?>;
 
             CtTypeReference<?> returnType = inferReturnTypeFromContext(inv);
+            if (returnType == null && isStandaloneInvocation(inv)) {
+                returnType = f.Type().VOID_PRIMITIVE;
+            }
+
+// If there is no explicit target but we resolved it via static import, mark static.
+            if (!isStatic && inv.getTarget() == null) {
+                if (resolveOwnerFromStaticImports(inv, name) != null) isStatic = true;
+            }
+
             List<CtTypeReference<?>> paramTypes = inferParamTypesFromCall(ex, inv.getArguments());
 
-            // Strict-mode ambiguity checks.
-            if (returnType == null && isStandaloneInvocation(inv) && cfg.isFailOnAmbiguity()) {
-                String ownerQN = owner != null ? owner.getQualifiedName() : "<unknown>";
-                throw new AmbiguityException("Ambiguous method return (used as statement): " + ownerQN + "#" + name + "(...)");
-            }
+     
 
             List<CtTypeReference<?>> fromRef = (ex != null ? ex.getParameters() : Collections.emptyList());
             boolean refSane = fromRef != null && !fromRef.isEmpty() && fromRef.stream().allMatch(this::isSaneType);
@@ -429,25 +509,11 @@ public final class SpoonCollector {
                                     .orElse(Collections.emptySet()))
                             : Collections.emptyList();
 
-            out.methodPlans.add(new MethodStubPlan(owner, name, returnType, paramTypes, isStatic, vis, thrown));
+            out.methodPlans.add(new MethodStubPlan(owner, name, returnType, paramTypes, isStatic, vis, thrown,defaultOnIface));
         }
     }
 
-    /**
-     * Legacy owner resolution kept for reference; unused in the current flow.
-     */
-    private CtTypeReference<?> resolveOwnerTypeFromInvocationOLD(CtInvocation<?> inv) {
-        if (inv.getTarget() instanceof CtTypeAccess) {
-            return ((CtTypeAccess<?>) inv.getTarget()).getAccessedType();
-        }
-        if (inv.getTarget() != null) {
-            try { return inv.getTarget().getType(); } catch (Throwable ignored) {}
-        }
-        if (inv.getExecutable() != null && inv.getExecutable().getDeclaringType() != null) {
-            return inv.getExecutable().getDeclaringType();
-        }
-        return f.Type().createReference("unknown.Missing");
-    }
+
 
     /**
      * Resolve the *owner* type for a method invocation (handles static, field receiver, generic).
@@ -461,12 +527,26 @@ public final class SpoonCollector {
         // 2) Prefer declared type of a field access receiver, if present.
         if (inv.getTarget() instanceof CtFieldAccess) {
             CtFieldAccess<?> fa = (CtFieldAccess<?>) inv.getTarget();
+
+            // Best: the type of the field access expression itself
             try {
-                if (fa.getVariable() != null && fa.getVariable().getType() != null) {
+                CtTypeReference<?> t = fa.getType();
+                if (t != null) return t;
+            } catch (Throwable ignored) {}
+
+            // Fallback: field reference’s declared type
+            try {
+                if (fa.getVariable() != null && fa.getVariable().getType() != null)
                     return fa.getVariable().getType();
-                }
             } catch (Throwable ignored) { }
+
+            // Last: the target expression type (e.g., this)
+            try {
+                if (fa.getTarget() != null && fa.getTarget().getType() != null)
+                    return fa.getTarget().getType();
+            } catch (Throwable ignored) {}
         }
+
 
         // 3) Generic expression type.
         if (inv.getTarget() != null) {
@@ -571,6 +651,86 @@ public final class SpoonCollector {
         if (qn == null || "null".equals(qn) || qn.contains("NullType")) return false;
         if (!qn.contains(".") && "Unknown".equals(t.getSimpleName())) return false;
         return true;
+    }
+
+    /* ======================================================================
+     *                         ANNOTATIONS
+     * ====================================================================== */
+
+    // SpoonCollector.java
+    private void collectUnresolvedAnnotations(CtModel model, CollectResult out) {
+        // Walk all annotation occurrences in the slice
+        for (CtAnnotation<?> ann : model.getElements((CtAnnotation<?> a) -> true)) {
+            CtTypeReference<?> t = ann.getAnnotationType();
+            if (t == null) continue;
+            // already resolved? skip
+            try { if (t.getDeclaration() != null) continue; } catch (Throwable ignored) {}
+
+            // JDK annotations? skip
+            if (isJdkType(t)) continue;
+
+            // Decide the package for this unresolved annotation via your existing heuristic
+            CtTypeReference<?> resolved = chooseOwnerPackage(t, ann);
+            if (resolved == null) continue;
+            String annFqn = resolved.getQualifiedName();
+            out.typePlans.add(new TypeStubPlan(annFqn, TypeStubPlan.Kind.ANNOTATION));
+
+            // If the same unresolved annotation appears more than once on the SAME element => repeatable
+            CtElement owner = ann.getAnnotatedElement();
+            if (owner != null) {
+                long sameCount = owner.getAnnotations().stream()
+                        .map(a -> {
+                            CtTypeReference<?> rt = a.getAnnotationType();
+                            return (rt == null ? "" : safeQN(chooseOwnerPackage(rt, a)));
+                        })
+                        .filter(fqn -> annFqn.equals(fqn))
+                        .count();
+
+                if (sameCount >= 2) {
+                    String pkg = annFqn.substring(0, annFqn.lastIndexOf('.'));
+                    String simple = annFqn.substring(annFqn.lastIndexOf('.') + 1);
+                    // container naming: Tag -> Tags
+                    String containerSimple = simple.endsWith("s") ? (simple + "es") : (simple + "s");
+                    String containerFqn = pkg + "." + containerSimple;
+                    out.typePlans.add(new TypeStubPlan(containerFqn, TypeStubPlan.Kind.ANNOTATION));
+                }
+            }
+        }
+    }
+
+    private void collectAnnotationTypeUsages(CtModel model, CollectResult out) {
+        for (CtAnnotation<?> a : model.getElements((CtAnnotation<?> x) -> true)) {
+            CtTypeReference<?> at = a.getAnnotationType();
+            if (at == null) continue;
+
+            // If simple name, try to resolve via explicit import in this CU
+            String qn = safeQN(at);
+            if (!qn.contains(".")) {
+                CtTypeReference<?> resolved = resolveFromExplicitTypeImports(a, at.getSimpleName());
+                if (resolved != null) {
+                    out.typePlans.add(new TypeStubPlan(resolved.getQualifiedName(), TypeStubPlan.Kind.ANNOTATION));
+                    // Also plan container (Tag -> Tags) in same pkg, as annotation
+                    String pkg = resolved.getPackage() == null ? "" : resolved.getPackage().getQualifiedName();
+                    String simple = resolved.getSimpleName();
+                    String containerSimple = simple.endsWith("s") ? simple + "es" : simple + "s";
+                    String containerFqn = (pkg.isEmpty() ? containerSimple : pkg + "." + containerSimple);
+                    out.typePlans.add(new TypeStubPlan(containerFqn, TypeStubPlan.Kind.ANNOTATION));
+                    continue;
+                }
+            }
+
+            // Otherwise, keep whatever we have if it’s non-JDK
+            if (!isJdkType(at)) {
+                out.typePlans.add(new TypeStubPlan((qn.isEmpty() ? "unknown."+at.getSimpleName() : qn),
+                        TypeStubPlan.Kind.ANNOTATION));
+                // Plan container in same package
+                String pkg = at.getPackage() == null ? "" : at.getPackage().getQualifiedName();
+                String simple = at.getSimpleName();
+                String containerSimple = simple.endsWith("s") ? simple + "es" : simple + "s";
+                String containerFqn = (pkg.isEmpty() ? containerSimple : pkg + "." + containerSimple);
+                out.typePlans.add(new TypeStubPlan(containerFqn, TypeStubPlan.Kind.ANNOTATION));
+            }
+        }
     }
 
     /* ======================================================================
@@ -732,7 +892,10 @@ public final class SpoonCollector {
             return;
         }
 
-        out.typePlans.add(new TypeStubPlan(qn, TypeStubPlan.Kind.CLASS));
+       // out.typePlans.add(new TypeStubPlan(qn, TypeStubPlan.Kind.CLASS));
+        String nestedFqn = nestedAwareFqnOf(t);
+        out.typePlans.add(new TypeStubPlan(nestedFqn, TypeStubPlan.Kind.CLASS));
+
     }
 
     /* ======================================================================
@@ -829,7 +992,9 @@ public final class SpoonCollector {
     /**
      * Choose a package for a possibly simple owner reference, honoring star imports and strict mode.
      */
+
     private CtTypeReference<?> chooseOwnerPackage(CtTypeReference<?> ownerRef, CtElement ctx) {
+
         if (ownerRef == null) return f.Type().createReference("unknown.Missing");
 
         String qn = safeQN(ownerRef);
@@ -842,7 +1007,14 @@ public final class SpoonCollector {
 
         if (qn.contains(".")) return ownerRef;
 
+        // ---- NEW: prefer explicit single-type import if present ----
         String simple = Optional.ofNullable(ownerRef.getSimpleName()).orElse("Missing");
+        CtTypeReference<?> explicit = resolveFromExplicitTypeImports(ctx, simple);
+        if (explicit != null) {
+            return explicit; // e.g., ext.outer.Outer
+        }
+        // ------------------------------------------------------------
+
         List<String> starPkgs = starImportsInOrder(ctx);
 
         if (starPkgs.contains("unknown")) return f.Type().createReference("unknown." + simple);
@@ -851,7 +1023,7 @@ public final class SpoonCollector {
 
         if (starPkgs.size() > 1) {
             if (cfg.isFailOnAmbiguity()) {
-                return f.Type().createReference("unknown." + simple);
+                throw new AmbiguityException("Ambiguous simple type '" + simple + "' from on-demand imports: " + starPkgs);
             } else {
                 return f.Type().createReference(starPkgs.get(0) + "." + simple);
             }
@@ -1353,4 +1525,64 @@ public final class SpoonCollector {
         return qn != null && (qn.startsWith("java.") || qn.startsWith("javax.") ||
                 qn.startsWith("jakarta.") || qn.startsWith("sun.") || qn.startsWith("jdk."));
     }
+
+
+    /** FQN that uses '$' for member classes (Outer$Inner) instead of dotted form. */
+    /** FQN that uses '$' for member classes (Outer$Inner). */
+    private static String nestedAwareFqnOf(CtTypeReference<?> ref) {
+        if (ref == null) return null;
+        CtTypeReference<?> decl = ref.getDeclaringType();
+        if (decl != null) return nestedAwareFqnOf(decl) + "$" + ref.getSimpleName();
+        return ref.getQualifiedName();
+    }
+    // In SpoonCollector
+    private CtTypeReference<?> resolveOwnerFromStaticImports(CtInvocation<?> inv, String methodSimple) {
+        var type = inv.getParent(CtType.class);
+        var pos  = (type != null ? type.getPosition() : null);
+        var cu   = (pos != null ? pos.getCompilationUnit() : null);
+        if (cu == null) return null;
+
+        // 1) Spoon-parsed static method imports
+        for (CtImport imp : cu.getImports()) {
+            try {
+                if (imp.getImportKind().name().contains("METHOD")) { // CtImportKind.METHOD
+                    var ref = imp.getReference();
+                    if (ref instanceof CtExecutableReference) {
+                        var er = (CtExecutableReference<?>) ref;
+                        if (methodSimple.equals(er.getSimpleName()) && er.getDeclaringType() != null) {
+                            return f.Type().createReference(er.getDeclaringType().getQualifiedName());
+                        }
+                    }
+                }
+                // On-demand static: import static pkg.Api.*;
+                if (imp.getImportKind().name().contains("ALL") && imp.getReference() instanceof CtTypeReference) {
+                    // This means: any static member of that type; owner is that type.
+                    CtTypeReference<?> tr = (CtTypeReference<?>) imp.getReference();
+                    return f.Type().createReference(tr.getQualifiedName());
+                }
+            } catch (Throwable ignored) {}
+        }
+
+        // 2) Raw-source fallback (like your star-import parser)
+        try {
+            String src = cu.getOriginalSourceCode();
+            if (src != null) {
+                var m = java.util.regex.Pattern
+                        .compile("\\bimport\\s+static\\s+([\\w\\.]+)\\.(\\*|[A-Za-z_][\\w_]*)\\s*;")
+                        .matcher(src);
+                while (m.find()) {
+                    String clsFqn = m.group(1);
+                    String member = m.group(2);
+                    if ("*".equals(member) || methodSimple.equals(member)) {
+                        return f.Type().createReference(clsFqn);
+                    }
+                }
+            }
+        } catch (Throwable ignored) { }
+        return null;
+    }
+
+
+
+
 }

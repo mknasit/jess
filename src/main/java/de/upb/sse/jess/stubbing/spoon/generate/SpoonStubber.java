@@ -13,6 +13,8 @@ import spoon.reflect.declaration.CtPackage;
 
 import java.util.*;
 
+import static com.github.javaparser.utils.CodeGenerationUtils.f;
+
 public final class SpoonStubber {
 
     /* ======================================================================
@@ -56,6 +58,61 @@ public final class SpoonStubber {
      */
     private boolean ensureTypeExists(TypeStubPlan p) {
         String qn = p.qualifiedName;
+        // --- member type fast-path: plan says Outer$Inner (or deeper) ---
+        if (qn != null && qn.contains("$")) {
+            int lastDot = qn.lastIndexOf('.');
+            String pkg = (lastDot >= 0 ? qn.substring(0, lastDot) : "");
+            String afterPkg = (lastDot >= 0 ? qn.substring(lastDot + 1) : qn); // e.g., Outer$Inner$Deeper
+
+            String[] parts = afterPkg.split("\\$");
+            if (parts.length >= 2) {
+                // 1) ensure outer (top-level) exists as a CLASS
+                String outerFqn = (pkg.isEmpty() ? parts[0] : pkg + "." + parts[0]);
+                CtClass<?> outer = ensurePublicClass(f.Type().createReference(outerFqn));
+
+                // 2) walk/create each nested level under the previous
+                CtType<?> parent = outer;
+                for (int i = 1; i < parts.length; i++) {
+                    String simple = parts[i];
+                    CtType<?> existing = parent.getNestedType(simple);
+                    if (existing == null) {
+                        CtType<?> created;
+                        switch (p.kind) {
+                            case INTERFACE:
+                                created = f.Interface().create(parent, simple);
+                                break;
+                            case ANNOTATION:
+                                created = f.Annotation().create((CtPackage) parent, simple);
+                                // make sure it has public and a default 'value()' (like your top-level path)
+                                created.addModifier(ModifierKind.PUBLIC);
+                                CtAnnotationType<?> at = (CtAnnotationType<?>) created;
+                                if (at.getMethods().stream().noneMatch(m -> "value".equals(m.getSimpleName()))) {
+                                    CtAnnotationMethod<?> am = f.Core().createAnnotationMethod();
+                                    am.setSimpleName("value");
+                                    am.setType(f.Type().STRING);
+                                    at.addMethod(am);
+                                }
+                                break;
+                            default:
+                                created = f.Class().create((CtClass<?>) parent, simple);
+                        }
+                        created.addModifier(ModifierKind.PUBLIC);
+                        parent = created;
+                        createdTypes.add(qn); // record once; harmless if repeated
+                    } else {
+                        parent = existing;
+                    }
+                }
+
+                // Optional: ensure member classes are NON-STATIC by default
+                if (parent instanceof CtClass) {
+                    parent.removeModifier(ModifierKind.STATIC);
+                }
+
+                return false; // we created nested under outer; nothing to add as top-level
+            }
+        }
+
         String pkg = "";
         String name = "Missing";
         int i = qn.lastIndexOf('.');
@@ -67,13 +124,25 @@ public final class SpoonStubber {
         if (existing != null) return false;
 
         CtType<?> created;
+
         switch (p.kind) {
             case INTERFACE:
                 created = f.Interface().create(packageObj, name);
                 break;
-            case ANNOTATION:
-                created = f.Annotation().create(packageObj, name);
+            case ANNOTATION: {
+                CtAnnotationType<?> at = f.Annotation().create(packageObj, name);
+                at.addModifier(ModifierKind.PUBLIC);
+
+                // Add default element: String value();  (harmless if not used, but enables @Tag("x") pattern)
+                if (at.getMethods().stream().noneMatch(m -> "value".equals(m.getSimpleName()))) {
+                    CtAnnotationMethod<?> am = f.Core().createAnnotationMethod();
+                    am.setSimpleName("value");
+                    am.setType(f.Type().STRING);
+                    at.addMethod(am);
+                }
+                created = at;
                 break;
+            }
             default:
                 created = f.Class().create(packageObj, name);
         }
@@ -98,7 +167,8 @@ public final class SpoonStubber {
             }
         }
 
-        createdTypes.add(qn);
+        //createdTypes.add(qn);
+        createdTypes.add(created.getQualifiedName());
         return true;
     }
 
@@ -148,7 +218,8 @@ public final class SpoonStubber {
     public int applyConstructorPlans(Collection<ConstructorStubPlan> plans) {
         int created = 0;
         for (ConstructorStubPlan p : plans) {
-            CtClass<?> owner = ensurePublicClass(p.ownerType);
+            String ownerFqn = p.ownerType.getQualifiedName();
+            CtClass<?> owner = ensurePublicClass(f.Type().createReference(ownerFqn));
 
             // Normalize params first.
             List<CtTypeReference<?>> normParams = new ArrayList<>();
@@ -191,13 +262,13 @@ public final class SpoonStubber {
     public int applyMethodPlans(Collection<MethodStubPlan> plans) {
         int created = 0;
         for (MethodStubPlan p : plans) {
-            CtClass<?> owner = ensurePublicClass(p.ownerType);
+            // choose correct owner: interface if defaultOnInterface, else class
+            CtType<?> owner = ensurePublicOwnerForMethod(p);
+
             if (hasMethod(owner, p.name, p.paramTypes)) continue;
 
-            // Normalize return + params before creating the method.
             CtTypeReference<?> rt0 = normalizeUnknownRef(
-                    (p.returnType != null ? p.returnType : f.Type().VOID_PRIMITIVE)
-            );
+                    (p.returnType != null ? p.returnType : f.Type().VOID_PRIMITIVE));
             @SuppressWarnings({"rawtypes","unchecked"})
             CtTypeReference rt = (CtTypeReference) rt0;
 
@@ -205,7 +276,6 @@ public final class SpoonStubber {
             for (CtTypeReference<?> t : p.paramTypes) normParams.add(normalizeUnknownRef(t));
             List<CtParameter<?>> params = makeParams(normParams);
 
-            // Thrown types unchanged (normally won’t be Unknown).
             Set<CtTypeReference<? extends Throwable>> thrown = new LinkedHashSet<>();
             for (CtTypeReference<?> t : p.thrownTypes) {
                 if (t == null) continue;
@@ -214,7 +284,6 @@ public final class SpoonStubber {
                 thrown.add(tt);
             }
 
-            // Visibility + static.
             Set<ModifierKind> mods = new HashSet<>();
             if (p.isStatic) mods.add(ModifierKind.STATIC);
             switch (p.visibility) {
@@ -226,7 +295,36 @@ public final class SpoonStubber {
 
             CtMethod<?> m = f.Method().create(owner, mods, rt, p.name, params, thrown);
 
-            // If stubbing iterator(), add Iterable<E> to class so foreach works.
+            boolean ownerIsInterface = owner instanceof CtInterface;
+
+            // ------- BODY & interface default handling (Spoon 10) -------
+            if (ownerIsInterface) {
+                if (p.defaultOnInterface) {
+                    // default method on interface
+                    m.setDefaultMethod(true);          // <-- correct way in Spoon 10.x
+                    m.addModifier(ModifierKind.PUBLIC);
+                    CtBlock<?> body = f.Core().createBlock();
+                    CtReturn<?> ret = defaultReturn(rt0);
+                    if (ret != null) body.addStatement(ret);
+                    m.setBody(body);
+                    m.removeModifier(ModifierKind.ABSTRACT);
+                } else {
+                    // abstract interface method
+                    m.setBody(null);
+                    m.addModifier(ModifierKind.PUBLIC);   // optional; interfaces imply public
+                    m.addModifier(ModifierKind.ABSTRACT);
+                }
+            } else {
+                // concrete class method
+                CtBlock<?> body = f.Core().createBlock();
+                CtReturn<?> ret = defaultReturn(rt0);
+                if (ret != null) body.addStatement(ret);
+                m.setBody(body);
+                m.removeModifier(ModifierKind.ABSTRACT);
+            }
+            // -----------------------------------------------------------
+
+            // foreach/Iterable glue (unchanged)
             if ("iterator".equals(p.name) && p.paramTypes.isEmpty()) {
                 CtTypeReference<?> rtForIterable = rt0;
                 String rtQN = safeQN(rtForIterable);
@@ -235,52 +333,29 @@ public final class SpoonStubber {
                     try {
                         List<CtTypeReference<?>> args = rtForIterable.getActualTypeArguments();
                         if (args != null && !args.isEmpty() && args.get(0) != null) {
-                            iterableRef.addActualTypeArgument(args.get(0));  // <E>
+                            iterableRef.addActualTypeArgument(args.get(0));
                         }
                     } catch (Throwable ignored) {}
-
                     boolean already = false;
                     try {
                         for (CtTypeReference<?> si : owner.getSuperInterfaces()) {
                             if (safeQN(si).startsWith("java.lang.Iterable")) { already = true; break; }
                         }
                     } catch (Throwable ignored) {}
-
                     if (!already) owner.addSuperInterface(iterableRef);
-
                     ensureImport(owner, iterableRef);
                     ensureImport(owner, rt0);
                 }
             }
 
-            // Trace parameters (kept as-is).
-            for (int i = 0; i < params.size(); i++) {
-                System.out.println("        param" + i + ": " + readable(params.get(i).getType()));
-            }
-
-            // If method uses Unknown (in return or params), add explicit import.
             boolean usesUnknown =
                     "unknown.Unknown".equals(readable(rt0))
                             || "Unknown".equals(rt0.getSimpleName())
                             || params.stream().anyMatch(d ->
                             "unknown.Unknown".equals(readable(d.getType()))
-                                    || "Unknown".equals(d.getType().getSimpleName())
-                    );
-            if (usesUnknown) {
-                ensureExplicitUnknownImport(owner);
-            }
+                                    || "Unknown".equals(d.getType().getSimpleName()));
+            if (usesUnknown) ensureExplicitUnknownImport(owner);
 
-            // Add a default body (except for interfaces).
-            if (!owner.isInterface()) {
-                CtBlock<?> body = f.Core().createBlock();
-                CtReturn<?> ret = defaultReturn(rt0);
-                if (ret != null) body.addStatement(ret);
-                m.setBody(body);
-            } else {
-                m.setBody(null);
-            }
-
-            // Keep references qualified so auto-imports or FQNs work.
             ensureImport(owner, rt0);
             for (CtParameter<?> par : params) ensureImport(owner, par.getType());
             for (CtTypeReference<?> t : thrown) ensureImport(owner, t);
@@ -290,6 +365,8 @@ public final class SpoonStubber {
         }
         return created;
     }
+
+
 
     /* ======================================================================
      *                               REPORTING
@@ -317,6 +394,21 @@ public final class SpoonStubber {
         String pkg = "";
         String name = "Missing";
         int i = (qn != null ? qn.lastIndexOf('.') : -1);
+
+
+        if (qn != null && qn.contains("$")) {
+            String outerFqn = qn.substring(0, qn.indexOf('$'));
+            String innerSimple = qn.substring(qn.indexOf('$') + 1);
+            // ensure outer
+            CtClass<?> outer = ensurePublicClass(f.Type().createReference(outerFqn));
+            // create member class inside outer if missing
+            CtType<?> ex = outer.getNestedType(innerSimple);
+            if (ex instanceof CtClass) return (CtClass<?>) ex;
+            CtClass<?> inner = f.Class().create(outer, innerSimple);
+            inner.addModifier(ModifierKind.PUBLIC);
+            createdTypes.add(outerFqn + "$" + innerSimple);
+            return inner;
+        }
 
         if (qn != null && !qn.isEmpty()) {
             if (qn.contains(".")) {
@@ -360,21 +452,23 @@ public final class SpoonStubber {
     }
 
     /** Check if a method with name and parameter signature exists. */
-    private boolean hasMethod(CtClass<?> owner, String name, List<CtTypeReference<?>> paramTypes) {
-        outer:
+    private boolean hasMethod(CtType<?> owner, String name, List<CtTypeReference<?>> paramTypes) {
         for (CtMethod<?> m : owner.getMethods()) {
             if (!m.getSimpleName().equals(name)) continue;
             List<CtParameter<?>> ps = m.getParameters();
             if (ps.size() != paramTypes.size()) continue;
+            boolean all = true;
             for (int i = 0; i < ps.size(); i++) {
                 String a = readable(ps.get(i).getType());
                 String b = readable(paramTypes.get(i));
-                if (!Objects.equals(a, b)) continue outer;
+                if (!Objects.equals(a, b)) { all = false; break; }
             }
-            return true;
+            if (all) return true;
         }
         return false;
     }
+
+
 
     /** Check if a constructor with parameter signature exists. */
     private boolean hasConstructor(CtClass<?> owner, List<CtTypeReference<?>> paramTypes) {
@@ -654,4 +748,327 @@ public final class SpoonStubber {
             decl.addFormalCtTypeParameter(tp);
         }
     }
+
+    private CtInterface<?> ensurePublicInterface(CtTypeReference<?> ref) {
+        String qn = ref.getQualifiedName();
+        String pkg = "";
+        String name = "Missing";
+        int i = (qn != null ? qn.lastIndexOf('.') : -1);
+
+        if (qn != null && !qn.isEmpty()) {
+            if (i >= 0) { pkg = qn.substring(0, i); name = qn.substring(i + 1); }
+            else { pkg = "unknown"; name = qn; }
+        }
+
+        CtPackage p = f.Package().getOrCreate(pkg);
+        CtType<?> ex = p.getType(name);
+
+        // If something exists with that name:
+        if (ex != null) {
+            if (ex instanceof CtInterface) {
+                CtInterface<?> itf = (CtInterface<?>) ex;
+                // ensure public
+                if (!itf.getModifiers().contains(ModifierKind.PUBLIC)) {
+                    itf.addModifier(ModifierKind.PUBLIC);
+                }
+                // ensure generic arity (once)
+                if (itf.getFormalCtTypeParameters().isEmpty()) {
+                    int arity = inferGenericArityFromUsages((pkg.isEmpty() ? name : pkg + "." + name));
+                    if (arity > 0) addTypeParameters(itf, arity);
+                }
+                return itf;
+            }
+
+            // If it was created as a class, remove it and recreate as a public interface
+            if (ex instanceof CtClass) {
+                // remove the old type from the package
+                p.removeType(ex);
+            }
+        }
+
+        // Create a new interface
+        CtInterface<?> itf = f.Interface().create(p, name);
+        itf.addModifier(ModifierKind.PUBLIC);
+
+        // Add generic parameters if usages imply arity (e.g., ArrMaker<String>)
+        int arity = inferGenericArityFromUsages((pkg.isEmpty() ? name : pkg + "." + name));
+        if (arity > 0) addTypeParameters(itf, arity);
+
+
+        createdTypes.add((pkg.isEmpty() ? name : (pkg + "." + name)));
+        return itf;
+    }
+
+
+    private CtType<?> ensurePublicOwnerForMethod(MethodStubPlan p) {
+        // If collector already asked for a default method on an interface, respect that.
+        if (p.defaultOnInterface) return ensurePublicInterface(p.ownerType);
+
+        // If the owner type is used in a method-reference or lambda context, it must be an interface.
+        if (isFunctionalInterfaceContext(p.ownerType)) {
+            return ensurePublicInterface(p.ownerType);
+        }
+        // Otherwise keep the old behavior (class)
+        return ensurePublicClass(p.ownerType);
+    }
+
+    // SpoonStubber.java
+
+    private boolean isFunctionalInterfaceContext(CtTypeReference<?> ownerRef) {
+        String want = safeQN(ownerRef);
+        if (want == null || want.isEmpty()) want = ownerRef.getSimpleName();
+        if (want == null || want.isEmpty()) return false;
+
+        // scan locals
+        for (CtLocalVariable<?> lv : f.getModel().getElements((CtLocalVariable<?> v) -> true)) {
+            CtTypeReference<?> t = lv.getType();
+            if (t == null) continue;
+            String qn = safeQN(t);
+            if (!want.equals(qn) && !t.getSimpleName().equals(ownerRef.getSimpleName())) continue;
+
+            CtExpression<?> init = lv.getDefaultExpression();
+            if (init == null) continue;
+
+            // method reference: e.g., String[]::new, SomeType::factory, this::m
+            if (init instanceof spoon.reflect.code.CtExecutableReferenceExpression) return true;
+
+            // lambda: x -> ..., (a,b) -> ...
+            if (init instanceof spoon.reflect.code.CtLambda) return true;
+        }
+
+        // scan fields too (for completeness)
+        for (CtField<?> fd : f.getModel().getElements((CtField<?> v) -> true)) {
+            CtTypeReference<?> t = fd.getType();
+            if (t == null) continue;
+            String qn = safeQN(t);
+            if (!want.equals(qn) && !t.getSimpleName().equals(ownerRef.getSimpleName())) continue;
+
+            CtExpression<?> init = fd.getDefaultExpression();
+            if (init == null) continue;
+
+            if (init instanceof spoon.reflect.code.CtExecutableReferenceExpression) return true;
+            if (init instanceof spoon.reflect.code.CtLambda) return true;
+        }
+
+        return false;
+    }
+
+
+
+    /** Returns an existing type if present. If missing, creates an interface when preferInterface==true, else a class. */
+    private CtType<?> ensurePublicOwner(CtTypeReference<?> ref, boolean preferInterface) {
+        String qn = safeQN(ref);
+        String pkg = "";
+        String name = "Missing";
+        int i = (qn != null ? qn.lastIndexOf('.') : -1);
+        if (qn != null && !qn.isEmpty()) {
+            if (i >= 0) { pkg = qn.substring(0, i); name = qn.substring(i + 1); }
+            else { pkg = "unknown"; name = qn; }
+        }
+        CtPackage p = f.Package().getOrCreate(pkg);
+        CtType<?> ex = p.getType(name);
+        if (ex != null) return ex;
+
+        if (preferInterface) {
+            CtInterface<?> itf = f.Interface().create(p, name);
+            itf.addModifier(ModifierKind.PUBLIC);
+            createdTypes.add((pkg.isEmpty() ? name : (pkg + "." + name)));
+            return itf;
+        } else {
+            CtClass<?> cls = f.Class().create(p, name);
+            cls.addModifier(ModifierKind.PUBLIC);
+            createdTypes.add((pkg.isEmpty() ? name : (pkg + "." + name)));
+            return cls;
+        }
+    }
+
+    public void finalizeRepeatableAnnotations() {
+        // package -> simpleName -> annotation type
+        Map<String, Map<String, CtAnnotationType<?>>> byPkg = new LinkedHashMap<>();
+        for (CtType<?> t : f.getModel().getAllTypes()) {
+            if (!(t instanceof CtAnnotationType)) continue;
+            String pkg = Optional.ofNullable(t.getPackage()).map(CtPackage::getQualifiedName).orElse("");
+            byPkg.computeIfAbsent(pkg, k -> new LinkedHashMap<>())
+                    .put(t.getSimpleName(), (CtAnnotationType<?>) t);
+        }
+
+        for (var ePkg : byPkg.entrySet()) {
+            String pkg = ePkg.getKey();
+            Map<String, CtAnnotationType<?>> anns = ePkg.getValue();
+
+
+
+            for (var eBase : anns.entrySet()) {
+                String baseSimple = eBase.getKey();
+                CtAnnotationType<?> base = eBase.getValue();
+
+                // Heuristic: container name = Base+'s' (Tag -> Tags). Works for the test.
+                String containerSimple = baseSimple.endsWith("s") ? baseSimple + "es" : baseSimple + "s";
+                CtAnnotationType<?> container = anns.get(containerSimple);
+                if (container == null) continue; // nothing to wire
+
+                // Build refs
+                String baseFqn = (pkg.isEmpty() ? baseSimple : pkg + "." + baseSimple);
+                String containerFqn = (pkg.isEmpty() ? containerSimple : pkg + "." + containerSimple);
+                CtTypeReference<?> baseRef = f.Type().createReference(baseFqn);
+                CtTypeReference<?> arrayOfBaseRef = f.Type().createArrayReference(baseRef);
+
+                // Ensure the container has value(): Base[] (create or fix)
+                CtAnnotationMethod<?> valueM = (CtAnnotationMethod<?>) container.getMethods().stream()
+                        .filter(m -> "value".equals(m.getSimpleName()))
+                        .findFirst().orElse(null);
+
+                if (valueM == null) {
+                    valueM = f.Core().createAnnotationMethod();
+                    valueM.setSimpleName("value");
+                    valueM.setType(arrayOfBaseRef);
+                    container.addMethod(valueM);
+                } else {
+                    // fix wrong type like String -> Tag[]
+                    valueM.setType(arrayOfBaseRef);
+                }
+
+                // Add @Repeatable(Container.class) on base if missing
+                boolean alreadyRepeatable = base.getAnnotations().stream().anyMatch(a -> {
+                    try { return "java.lang.annotation.Repeatable"
+                            .equals(a.getAnnotationType().getQualifiedName()); }
+                    catch (Throwable ignored) { return false; }
+                });
+
+                if (!alreadyRepeatable) {
+                    CtAnnotation<?> rep = f.Core().createAnnotation();
+                    rep.setAnnotationType(f.Type().createReference("java.lang.annotation.Repeatable"));
+
+                    // class literal via snippet is fine with Spoon
+                    CtCodeSnippetExpression<?> classLit =
+                            f.Code().createCodeSnippetExpression(containerFqn + ".class");
+
+                    rep.addValue("value", classLit);
+                    base.addAnnotation(rep);
+                }
+
+                // After you have base (CtAnnotationType<?>) and container (CtAnnotationType<?>) …
+
+// 1) Copy @Target if present on base -> container (exact same elements)
+                CtAnnotation<?> baseTarget = findMeta(base, "Target");
+                if (baseTarget != null && findMeta(container, "Target") == null) {
+                    container.addAnnotation(cloneMeta(baseTarget));
+                }
+
+// 2) Copy @Retention if present
+                CtAnnotation<?> baseRetention = findMeta(base, "Retention");
+                if (baseRetention != null && findMeta(container, "Retention") == null) {
+                    container.addAnnotation(cloneMeta(baseRetention));
+                }
+
+// 3) Mirror @Documented/@Inherited if present
+                CtAnnotation<?> baseDoc = findMeta(base, "Documented");
+                if (baseDoc != null && findMeta(container, "Documented") == null) {
+                    container.addAnnotation(cloneMeta(baseDoc));
+                }
+                CtAnnotation<?> baseInh = findMeta(base, "Inherited");
+                if (baseInh != null && findMeta(container, "Inherited") == null) {
+                    container.addAnnotation(cloneMeta(baseInh));
+                }
+
+// 4) Ensure base’s @Repeatable points to the container (you already do this); keep it but canonicalize:
+                for (CtAnnotation<?> a : base.getAnnotations()) canonicalizeMetaAnnotationType(a);
+                for (CtAnnotation<?> a : container.getAnnotations()) canonicalizeMetaAnnotationType(a);
+
+            }
+        }
+    }
+
+
+    // --- in SpoonStubber ---
+
+    /** Force JDK meta-annotation types on a given annotation instance. */
+    private void canonicalizeMetaAnnotationType(CtAnnotation<?> ann) {
+        if (ann == null || ann.getAnnotationType() == null) return;
+        String simple = ann.getAnnotationType().getSimpleName();
+        switch (simple) {
+            case "Target":
+                ann.setAnnotationType(f.Type().createReference("java.lang.annotation.Target"));
+                break;
+            case "Retention":
+                ann.setAnnotationType(f.Type().createReference("java.lang.annotation.Retention"));
+                break;
+            case "Repeatable":
+                ann.setAnnotationType(f.Type().createReference("java.lang.annotation.Repeatable"));
+                break;
+            case "Documented":
+                ann.setAnnotationType(f.Type().createReference("java.lang.annotation.Documented"));
+                break;
+            case "Inherited":
+                ann.setAnnotationType(f.Type().createReference("java.lang.annotation.Inherited"));
+                break;
+            default:
+                // leave others alone
+        }
+    }
+
+    private static CtAnnotation<?> findMeta(CtAnnotationType<?> t, String simple) {
+        for (CtAnnotation<?> a : t.getAnnotations()) {
+            try {
+                if (simple.equals(a.getAnnotationType().getSimpleName())) return a;
+            } catch (Throwable ignored) {}
+        }
+        return null;
+    }
+
+    @SuppressWarnings({"unchecked","rawtypes"})
+    private CtAnnotation<?> cloneMeta(CtAnnotation<?> src) {
+        if (src == null) return null;
+
+        CtAnnotation<?> c = f.Core().createAnnotation();
+        c.setAnnotationType(src.getAnnotationType().clone());
+
+        // Spoon 10.x: Map<String, CtExpression<?>>
+        try {
+            Map<String, CtExpression> vals = src.getValues();
+            if (vals != null) {
+                for (Map.Entry<String, CtExpression> e : vals.entrySet()) {
+                    c.addValue(e.getKey(), e.getValue().clone());
+                }
+            }
+        } catch (Throwable ignore) {
+            // Older Spoon variants: getElementValues(): Map<CtMethod<?>, CtExpression<?>>
+            try {
+                Map<?, ?> vals = (Map<?, ?>) CtAnnotation.class
+                        .getMethod("getElementValues")
+                        .invoke(src);
+                if (vals != null) {
+                    for (Map.Entry<?, ?> e : ((Map<?, ?>) vals).entrySet()) {
+                        Object k = e.getKey();
+                        String name;
+                        try {
+                            // k might be CtMethod or CtExecutableReference
+                            name = (String) k.getClass().getMethod("getSimpleName").invoke(k);
+                        } catch (Throwable t2) { name = "value"; }
+                        c.addValue(name, ((CtExpression<?>) e.getValue()).clone());
+                    }
+                }
+            } catch (Throwable t3) {
+                // last resort: nothing to copy
+            }
+        }
+
+        canonicalizeMetaAnnotationType(c);
+        return c;
+    }
+
+
+    public void canonicalizeAllMetaAnnotations() {
+        for (CtType<?> t : f.getModel().getAllTypes()) {
+            if (!(t instanceof CtAnnotationType)) continue;
+            CtAnnotationType<?> at = (CtAnnotationType<?>) t;
+            for (CtAnnotation<?> a : at.getAnnotations()) canonicalizeMetaAnnotationType(a);
+        }
+    }
+
+
+
+
+
+
 }

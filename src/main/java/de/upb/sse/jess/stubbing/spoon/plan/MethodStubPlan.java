@@ -15,6 +15,8 @@ public class MethodStubPlan {
     public final boolean isStatic;
     public final Visibility visibility;
     public final List<CtTypeReference<?>> thrownTypes;  // NEW
+    public final boolean defaultOnInterface;
+
 
     public MethodStubPlan(CtTypeReference<?> ownerType, String name,
                           CtTypeReference<?> returnType, List<CtTypeReference<?>> paramTypes,
@@ -27,21 +29,26 @@ public class MethodStubPlan {
         this.isStatic    = isStatic;
         this.visibility  = visibility;
         this.thrownTypes = (thrownTypes == null ? java.util.Collections.emptyList() : thrownTypes);
+        this.defaultOnInterface = false;
     }
 
-    // Back-compat ctor → PUBLIC + no throws
-    public MethodStubPlan(CtTypeReference<?> ownerType, String name,
-                          CtTypeReference<?> returnType, List<CtTypeReference<?>> paramTypes,
-                          boolean isStatic, Visibility visibility) {
-        this(ownerType, name, returnType, paramTypes, isStatic, visibility,
-                java.util.Collections.emptyList());
+    public MethodStubPlan(CtTypeReference<?> ownerType,
+                          String name,
+                          CtTypeReference<?> returnType,
+                          List<CtTypeReference<?>> paramTypes,
+                          boolean isStatic,
+                          Visibility visibility,
+                          List<CtTypeReference<?>> thrownTypes,
+                          boolean defaultOnInterface) {
+        this.ownerType = ownerType;
+        this.name = name;
+        this.returnType = returnType;
+        this.paramTypes = paramTypes;
+        this.isStatic = isStatic;
+        this.visibility = visibility;
+        this.thrownTypes = thrownTypes;
+        this.defaultOnInterface = defaultOnInterface;
     }
 
-    // Oldest back-compat ctor
-    public MethodStubPlan(CtTypeReference<?> ownerType, String name,
-                          CtTypeReference<?> returnType, List<CtTypeReference<?>> paramTypes,
-                          boolean isStatic) {
-        this(ownerType, name, returnType, paramTypes, isStatic, Visibility.PUBLIC,
-                java.util.Collections.emptyList());
-    }
+
 }
