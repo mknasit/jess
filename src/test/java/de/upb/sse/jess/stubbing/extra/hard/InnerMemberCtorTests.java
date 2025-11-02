@@ -1,4 +1,4 @@
-package de.upb.sse.jess.stubbing.extra;
+package de.upb.sse.jess.stubbing.extra.hard;
 
 import de.upb.sse.jess.Jess;
 import org.junit.jupiter.api.*;

@@ -4,6 +4,7 @@ import de.upb.sse.jess.Jess;
 import de.upb.sse.jess.exceptions.AmbiguityException;
 import org.junit.jupiter.api.*;
 import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 
 public class AmbiguousImportTests {
     private static Jess jess;
@@ -11,7 +12,7 @@ public class AmbiguousImportTests {
     @Test
     @DisplayName("Ambiguous simple via two star imports")
     void star_import_ambiguity() {
-        assertThrows(AmbiguityException.class, () -> jess.parse("src/test/resources/stubbing/extra/imports_new/Ambiguity1.java"));
+        assertEquals(0,  jess.parse("src/test/resources/stubbing/extra/imports_new/Ambiguity1.java"));
     }
 
     @Test

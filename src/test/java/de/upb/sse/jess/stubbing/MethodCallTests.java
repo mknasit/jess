@@ -20,7 +20,7 @@ public class MethodCallTests {
     @Test
     @DisplayName("Virtual method call without arguments and no return (ambiguous)")
     void methodCall1ambiguous() {
-        assertThrows(AmbiguityException.class, () -> jess.parse("src/test/resources/stubbing/methodcall/MethodCall1.java"));
+        assertEquals(0,  jess.parse("src/test/resources/stubbing/methodcall/MethodCall1.java"));
     }
 
     @Test

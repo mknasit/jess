@@ -1,5 +1,5 @@
 package fixtures.enums1;
-enum FS { A, B; }
+
 class Enum1 {
     String m() {
         FS[] all = FS.values();

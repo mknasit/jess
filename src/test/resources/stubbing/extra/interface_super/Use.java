@@ -1,12 +1,7 @@
 package fixtures.ifacesuper;
 
-interface A {
-    default String m() { return "A"; }
-}
-interface B extends A {
-    default String m() { return "B"; }
-    default String call() { return A.super.m(); } // <— requires qualified super
-}
+import ext.iface.B;
+
 class Use implements B {
-    String s() { return call(); }
+    String s() { return call(); } // calls B.default call(), which does A.super.m()
 }

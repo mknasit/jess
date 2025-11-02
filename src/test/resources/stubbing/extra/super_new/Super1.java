@@ -1,3 +1,7 @@
+// Super1.java  (testdata, fixed)
 package fixtures.sup;
-class P { }
-class C extends P { C(){ super(); } }
+
+class C extends P {
+    C() {               // calls super() implicitly
+    }
+}

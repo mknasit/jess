@@ -1,8 +1,6 @@
 package fixtures.arrctor;
 
-interface ArrMaker<T> {
-    T[] make(int n);
-}
+import ext.arr.ArrMaker;
 
 class Use {
     String[] go() {

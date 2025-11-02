@@ -1,4 +1,21 @@
 package fixtures.bridge;
-interface Box<T>{ T get(); }
-class S implements Box<String> { public String get(){ return "x"; } }
-class Use { String s(){ return new S().get(); } }
+
+interface Box<T> {
+    T get();
+}
+
+class Use {
+    String direct() {
+        return new S().get();
+    }
+
+    Object erasedUse() {
+        Box raw = new S();
+        return raw.get();
+    }
+
+    String viaParam() {
+        Box<String> b = new S();
+        return b.get();
+    }
+}

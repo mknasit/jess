@@ -1,0 +1,1 @@
+interface I { default String hi(){ return "x"; } }
