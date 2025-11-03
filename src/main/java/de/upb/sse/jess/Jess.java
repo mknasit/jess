@@ -307,9 +307,16 @@ public class Jess {
         return parseResult.getResult().get();
     }
 
-    private String getFullyQualifiedRootName(CompilationUnit cu) {
+    private String getFullyQualifiedRootNameold(CompilationUnit cu) {
         return (String) cu.findFirst(TypeDeclaration.class).get().getFullyQualifiedName().get();
     }
+
+    private String getFullyQualifiedRootName(CompilationUnit cu) {
+        return (String) cu.findFirst(TypeDeclaration.class)
+                .flatMap(TypeDeclaration::getFullyQualifiedName)
+                .orElse("unknown.Root");
+    }
+
 
     private CompilationUnit getCleanRoot() {
         return this.cleanRoot.clone();

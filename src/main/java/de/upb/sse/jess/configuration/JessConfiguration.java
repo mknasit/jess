@@ -16,7 +16,7 @@ public class JessConfiguration {
     private boolean disableStubbing = false;
     public enum StubberKind { JESS, SPOON }
 
-    private StubberKind stubberKind = StubberKind.SPOON;
+    private StubberKind stubberKind = StubberKind.SPOON ;
 
     private String targetVersion = null;
 

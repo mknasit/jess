@@ -31,14 +31,14 @@ public class UnknownTypeTests {
     @DisplayName("Generate stub with unknown import")
     void unknownType1() {
         assertEquals(0, jess.parse("src/test/resources/stubbing/unknowntype/UnknownType1.java"));
-        assertTrue(new File("gen/unknown/SomeObject.java").exists());
+        assertTrue(new File("gen/org/example/SomeObject.java").exists());
     }
 
     @Test
     @DisplayName("Method is called with null literal")
     void unknownType2() throws IOException {
         assertEquals(0, jess.parse("src/test/resources/stubbing/unknowntype/UnknownType2.java"));
-        CompilationUnit cu = StaticJavaParser.parse(Path.of("gen/unknown/SomeObject.java"));
+        CompilationUnit cu = StaticJavaParser.parse(Path.of("gen/org/example/SomeObject.java"));
         Optional<MethodDeclaration> mdOpt = cu.findFirst(MethodDeclaration.class);
         assertEquals(UnknownType.CLASS, mdOpt.get().getParameter(0).getTypeAsString());
         assertEquals("void", mdOpt.get().getTypeAsString());
@@ -48,7 +48,7 @@ public class UnknownTypeTests {
     @DisplayName("Nested method calls")
     void unknownType3() throws IOException {
         assertEquals(0, jess.parse("src/test/resources/stubbing/unknowntype/UnknownType3.java"));
-        CompilationUnit cu = StaticJavaParser.parse(Path.of("gen/unknown/SomeObject.java"));
+        CompilationUnit cu = StaticJavaParser.parse(Path.of("gen/org/example/SomeObject.java"));
         Optional<MethodDeclaration> visitMethod = cu.findAll(MethodDeclaration.class).stream().filter(md -> md.getNameAsString().equals("visit")).findFirst();
         Optional<MethodDeclaration> visit2Method = cu.findAll(MethodDeclaration.class).stream().filter(md -> md.getNameAsString().equals("visit2")).findFirst();
         assertEquals("void", visitMethod.get().getTypeAsString());
@@ -60,7 +60,7 @@ public class UnknownTypeTests {
     @DisplayName("Unknown field access")
     void unknownType4() throws IOException {
         assertEquals(0, jess.parse("src/test/resources/stubbing/unknowntype/UnknownType4.java"));
-        CompilationUnit cu = StaticJavaParser.parse(Path.of("gen/unknown/SomeObject.java"));
+        CompilationUnit cu = StaticJavaParser.parse(Path.of("gen/org/example/SomeObject.java"));
         Optional<FieldDeclaration> fieldOpt = cu.findFirst(FieldDeclaration.class);
         assertEquals(UnknownType.CLASS, fieldOpt.get().getVariables().get(0).getTypeAsString());
     }
