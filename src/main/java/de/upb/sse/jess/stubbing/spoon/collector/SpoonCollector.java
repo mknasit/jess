@@ -44,6 +44,43 @@ public final class SpoonCollector {
         public final List<FieldStubPlan> fieldPlans = new ArrayList<>();
         public final List<ConstructorStubPlan> ctorPlans = new ArrayList<>();
         public final List<MethodStubPlan> methodPlans = new ArrayList<>();
+        public final Set<String> ambiguousSimples = new LinkedHashSet<>();
+
+    }
+
+    // --- Minimal JDK simple-name → package map (extend as needed) ---
+    private static final java.util.Map<String,String> JDK_SIMPLE = new java.util.HashMap<>();
+    static {
+        // lang
+        JDK_SIMPLE.put("String", "java.lang");
+        JDK_SIMPLE.put("Object", "java.lang");
+        JDK_SIMPLE.put("Throwable", "java.lang");
+        JDK_SIMPLE.put("Exception", "java.lang");
+        JDK_SIMPLE.put("RuntimeException", "java.lang");
+        JDK_SIMPLE.put("Iterable", "java.lang"); // special-cased below to java.lang.Iterable
+        // util
+        JDK_SIMPLE.put("List", "java.util");
+        JDK_SIMPLE.put("ArrayList", "java.util");
+        JDK_SIMPLE.put("Map", "java.util");
+        JDK_SIMPLE.put("HashMap", "java.util");
+        JDK_SIMPLE.put("Set", "java.util");
+        JDK_SIMPLE.put("HashSet", "java.util");
+        JDK_SIMPLE.put("Optional", "java.util");
+        JDK_SIMPLE.put("Iterator", "java.util");
+        JDK_SIMPLE.put("Collection", "java.util");
+        // nio
+        JDK_SIMPLE.put("Path", "java.nio.file");
+        JDK_SIMPLE.put("Files", "java.nio.file");
+        // time
+        JDK_SIMPLE.put("Instant", "java.time");
+        JDK_SIMPLE.put("Duration", "java.time");
+        // regex
+        JDK_SIMPLE.put("Pattern", "java.util.regex");
+        JDK_SIMPLE.put("Matcher", "java.util.regex");
+    }
+
+    private static boolean isKnownJdkSimple(String simple) {
+        return JDK_SIMPLE.containsKey(simple);
     }
 
     /* ======================================================================
@@ -97,6 +134,55 @@ public final class SpoonCollector {
 
         // Ensure owners exist for any planned members / references discovered above.
         result.typePlans.addAll(ownersNeedingTypes(result));
+
+        // --- compute scoped ambiguous simple names ---
+        java.util.Map<String, java.util.Set<String>> simpleToPkgs = new java.util.HashMap<>();
+
+
+// (1) add existing model types
+        model.getAllTypes().forEach(t -> {
+            String qn = safeQN(t.getReference());
+            if (qn == null) return;
+            int lastDot = qn.lastIndexOf('.');
+            String pkg = (lastDot >= 0 ? qn.substring(0, lastDot) : "");
+            String simple = t.getSimpleName();
+            if (simple == null) return;
+            if (isJdkPackage(pkg)) return;
+            simpleToPkgs.computeIfAbsent(simple, k -> new java.util.LinkedHashSet<>()).add(pkg);
+        });
+
+// (2) add planned owner types (where we will create/mirror)
+        java.util.stream.Stream.concat(
+                result.typePlans.stream().map(tp -> tp.qualifiedName),
+                java.util.stream.Stream.concat(
+                        result.fieldPlans.stream().map(fp -> fp.ownerType.getQualifiedName()),
+                        java.util.stream.Stream.concat(
+                                result.ctorPlans.stream().map(cp -> cp.ownerType.getQualifiedName()),
+                                result.methodPlans.stream().map(mp -> mp.ownerType.getQualifiedName())
+                        )
+                )
+        ).filter(java.util.Objects::nonNull).forEach(qn -> {
+            int lastDot = qn.lastIndexOf('.');
+            String pkg = (lastDot >= 0 ? qn.substring(0, lastDot) : "");
+            String simple = (lastDot >= 0 ? qn.substring(lastDot + 1) : qn);
+            if (isJdkPackage(pkg)) return;
+            simpleToPkgs.computeIfAbsent(simple, k -> new java.util.LinkedHashSet<>()).add(pkg);
+        });
+
+// (3) keep only those simples that are (a) part of our plans and (b) map to >1 pkgs
+        java.util.Set<String> plannedSimples = new java.util.HashSet<>();
+        result.typePlans.forEach(tp -> { String qn = tp.qualifiedName; if (qn != null) plannedSimples.add(qn.substring(qn.lastIndexOf('.')+1)); });
+        result.fieldPlans.forEach(fp -> plannedSimples.add(fp.ownerType.getSimpleName()));
+        result.ctorPlans.forEach(cp -> plannedSimples.add(cp.ownerType.getSimpleName()));
+        result.methodPlans.forEach(mp -> plannedSimples.add(mp.ownerType.getSimpleName()));
+
+        simpleToPkgs.forEach((simple, pkgs) -> {
+            if (pkgs.size() > 1 && plannedSimples.contains(simple)) {
+                result.ambiguousSimples.add(simple);
+            }
+        });
+
+
         return result;
     }
 
@@ -388,6 +474,15 @@ public final class SpoonCollector {
 
                     List<CtTypeReference<?>> ps =
                             inferParamTypesFromCall(cc.getExecutable(), cc.getArguments());
+                    // Functional arg coercion for constructor parameters
+                    List<CtExpression<?>> cargs = cc.getArguments();
+                    for (int i = 0; i < cargs.size() && i < ps.size(); i++) {
+                        CtExpression<?> a = cargs.get(i);
+                        CtTypeReference<?> expected = ps.get(i);
+                        CtTypeReference<?> coerced = coerceFunctionalToTarget(a, expected);
+                        if (coerced != expected) ps.set(i, coerced);
+                    }
+
 
                     out.typePlans.add(new TypeStubPlan(outerFqn, TypeStubPlan.Kind.CLASS));
                     out.typePlans.add(new TypeStubPlan(outerFqn + "$" + innerSimple, TypeStubPlan.Kind.CLASS));
@@ -599,8 +694,12 @@ public final class SpoonCollector {
             // parameter types (collapse anonymous classes)
             List<CtTypeReference<?>> paramTypes = inferParamTypesFromCall(ex, inv.getArguments());
             List<CtExpression<?>> args = inv.getArguments();
+            // collapse anonymous classes to nominal super (first interface, else superclass),
+// then coerce functional args (lambda/method-ref), then fix varargs element type
             for (int i = 0; i < args.size() && i < paramTypes.size(); i++) {
                 CtExpression<?> a = args.get(i);
+
+                // --- anonymous class -> interface/superclass ---
                 if (a instanceof spoon.reflect.code.CtNewClass) {
                     var nc = (spoon.reflect.code.CtNewClass<?>) a;
                     CtClass<?> anon = nc.getAnonymousClass();
@@ -609,13 +708,9 @@ public final class SpoonCollector {
                         try {
                             var ifaces = anon.getSuperInterfaces();
                             if (ifaces != null && !ifaces.isEmpty()) pick = ifaces.iterator().next();
-                        } catch (Throwable ignored) {
-                        }
+                        } catch (Throwable ignored) { }
                         if (pick == null) {
-                            try {
-                                pick = anon.getSuperclass();
-                            } catch (Throwable ignored) {
-                            }
+                            try { pick = anon.getSuperclass(); } catch (Throwable ignored) { }
                         }
                         if (pick != null) {
                             CtTypeReference<?> chosen = chooseOwnerPackage(pick, inv);
@@ -623,7 +718,27 @@ public final class SpoonCollector {
                         }
                     }
                 }
+
+                // --- functional arg coercion (lambda / method-ref) ---
+                CtTypeReference<?> expected = paramTypes.get(i);
+                CtTypeReference<?> coerced = coerceFunctionalToTarget(a, expected);
+                if (coerced != expected) {
+                    paramTypes.set(i, coerced);
+                }
             }
+
+// --- varargs element type coercion (when call looks varargs) ---
+            if (makeVarargs && !paramTypes.isEmpty()) {
+                int varargIndex = paramTypes.size() - 1;
+                CtTypeReference<?> currentElem = paramTypes.get(varargIndex);
+                java.util.List<CtTypeReference<?>> coerced =
+                        coerceVarargs(args, varargIndex, currentElem);
+                // last param represents the vararg element type (SpoonStubber will turn it into array)
+                if (!coerced.isEmpty() && coerced.get(0) != null) {
+                    paramTypes.set(varargIndex, coerced.get(0));
+                }
+            }
+
 
             // ambiguity guard
             List<CtTypeReference<?>> fromRef = (ex != null ? ex.getParameters() : java.util.Collections.emptyList());
@@ -777,6 +892,27 @@ public final class SpoonCollector {
             }
         }
 
+//        if (p instanceof CtConditional) {
+//            CtConditional<?> ce = (CtConditional<?>) p;
+//            CtExpression<?> thenExp = ce.getThenExpression();
+//            CtExpression<?> elseExp = ce.getElseExpression();
+//
+//            boolean inThen = thenExp == inv;
+//            CtExpression<?> other = inThen ? elseExp : (elseExp == inv ? thenExp : null);
+//            if (other != null) {
+//                try {
+//                    CtTypeReference<?> ot = other.getType();
+//                    if (isSaneType(ot)) return ot;
+//                } catch (Throwable ignored) {}
+//            }
+//            try {
+//                CtTypeReference<?> t = ce.getType();
+//                if (isSaneType(t)) return t;
+//            } catch (Throwable ignored) {}
+//        }
+
+
+
         if (p instanceof CtInvocation) {
             CtInvocation<?> outer = (CtInvocation<?>) p;
             int idx = -1;
@@ -799,6 +935,85 @@ public final class SpoonCollector {
                 return f.Type().createReference(de.upb.sse.jess.generation.unknown.UnknownType.CLASS);
             }
         }
+
+        // --- FOREACH: for (E x : call()) { ... } ---
+        if (p instanceof spoon.reflect.code.CtForEach) {
+            var fe = (spoon.reflect.code.CtForEach) p;
+            try {
+                CtTypeReference<?> varT = fe.getVariable().getType();
+                if (isSaneType(varT)) {
+                    // prefer Iterable<E> (do not stub JDK types)
+                    CtTypeReference<?> it = f.Type().createReference("java.lang.Iterable");
+                    it.addActualTypeArgument(varT.clone());
+                    return it;
+                }
+            } catch (Throwable ignored) {}
+            // fallback: Iterable<unknown.Unknown>
+            CtTypeReference<?> it = f.Type().createReference("java.lang.Iterable");
+            it.addActualTypeArgument(f.Type().createReference("unknown.Unknown"));
+            return it;
+        }
+
+// --- ARRAY CONTEXT: call()[i] or assigned to E[] ---
+        if (p instanceof spoon.reflect.code.CtArrayAccess) {
+            CtTypeReference<?> component = null;
+            try {
+                var aa = (spoon.reflect.code.CtArrayAccess<?, ?>) p;
+                CtTypeReference<?> at = aa.getType();
+                if (at instanceof spoon.reflect.reference.CtArrayTypeReference) {
+                    component = ((spoon.reflect.reference.CtArrayTypeReference<?>) at).getComponentType();
+                }
+            } catch (Throwable ignored) {}
+
+            if (isSaneType(component)) {
+                // Build E[] properly
+                CtTypeReference<?> arr = f.Type().createArrayReference(component.clone());
+                return arr;
+            }
+            // fallback: unknown.Unknown[]
+            CtTypeReference<?> arr = f.Type().createArrayReference(f.Type().createReference("unknown.Unknown"));
+            return arr;
+        }
+
+
+// --- STRING CONCAT: "x" + call() or call() + "x" ---
+        if (p instanceof spoon.reflect.code.CtBinaryOperator) {
+            var bo = (spoon.reflect.code.CtBinaryOperator<?>) p;
+            if (bo.getKind() == spoon.reflect.code.BinaryOperatorKind.PLUS) {
+                try {
+                    CtTypeReference<?> lt = bo.getLeftHandOperand() != null ? bo.getLeftHandOperand().getType() : null;
+                    CtTypeReference<?> rt = bo.getRightHandOperand() != null ? bo.getRightHandOperand().getType() : null;
+                    if ((lt != null && "java.lang.String".equals(safeQN(lt))) ||
+                            (rt != null && "java.lang.String".equals(safeQN(rt)))) {
+                        return f.Type().createReference("java.lang.String");
+                    }
+                } catch (Throwable ignored) {}
+            }
+        }
+
+// --- TERNARY: cond ? call() : other (or vice versa) ---
+        // --- TERNARY: cond ? call() : other (or vice versa) ---
+        if (p instanceof spoon.reflect.code.CtConditional) {
+            var ce = (spoon.reflect.code.CtConditional<?>) p;
+            var thenExp = ce.getThenExpression();
+            var elseExp = ce.getElseExpression();
+
+            boolean inThen = thenExp == inv;
+            var other = inThen ? elseExp : (elseExp == inv ? thenExp : null);
+            if (other != null) {
+                try {
+                    CtTypeReference<?> ot = other.getType();
+                    if (isSaneType(ot)) return ot;
+                } catch (Throwable ignored) {}
+            }
+            try { // shallow LUB fallback
+                CtTypeReference<?> t = ce.getType();
+                if (isSaneType(t)) return t;
+            } catch (Throwable ignored) {}
+            return f.Type().createReference("java.lang.Object");
+        }
+
+
 
         try {
             return inv.getType();
@@ -1060,39 +1275,43 @@ public final class SpoonCollector {
     private void maybePlanDeclaredType(CtElement ctx, CtTypeReference<?> t, CollectResult out) {
         if (t == null) return;
 
+        // arrays → recurse on component
         try {
             if (t.isArray() || t instanceof CtArrayTypeReference) {
                 CtTypeReference<?> comp = componentOf(t);
                 if (comp != null) maybePlanDeclaredType(ctx, comp, out);
                 return;
             }
-        } catch (Throwable ignored) {
-        }
+        } catch (Throwable ignored) {}
 
+        // primitives / void
         try {
             if (t.isPrimitive()) return;
             if (t.equals(f.Type().VOID_PRIMITIVE)) return;
-        } catch (Throwable ignored) {
-        }
+        } catch (Throwable ignored) {}
 
+        // already resolved in model?
         try {
             if (t.getDeclaration() != null) return;
-        } catch (Throwable ignored) {
-        }
+        } catch (Throwable ignored) {}
+
+        // JDK types are never stubbed
+        if (isJdkType(t)) return;
 
         String qn = safeQN(t);
         String simple = t.getSimpleName();
         if (simple == null || simple.isEmpty()) return;
 
-        if (isJdkType(t)) return;
-
+        // ---- SIMPLE NAME branch -------------------------------------------------
         if (!qn.contains(".")) {
+            // 1) explicit single-type import wins
             CtTypeReference<?> explicit = resolveFromExplicitTypeImports(ctx, simple);
             if (explicit != null) {
                 out.typePlans.add(new TypeStubPlan(explicit.getQualifiedName(), TypeStubPlan.Kind.CLASS));
                 return;
             }
 
+            // 2) on-demand (star) imports, preserving order (excluding unknown)
             List<String> starPkgs = starImportsInOrder(ctx);
             List<String> nonUnknown = starPkgs.stream()
                     .filter(p -> !"unknown".equals(p))
@@ -1103,52 +1322,19 @@ public final class SpoonCollector {
             }
             if (!nonUnknown.isEmpty()) {
                 out.typePlans.add(new TypeStubPlan(nonUnknown.get(0) + "." + simple, TypeStubPlan.Kind.CLASS));
-            } else {
-                out.typePlans.add(new TypeStubPlan("unknown." + simple, TypeStubPlan.Kind.CLASS));
+                return;
             }
-            return;
-        }
 
-        // --- existing code above ---
-// if (!qn.contains(".")) { ... we are in the simple-name branch ... }
-
-// keep what you already have:
-        CtTypeReference<?> explicit = resolveFromExplicitTypeImports(ctx, simple);
-        if (explicit != null) {
-            out.typePlans.add(new TypeStubPlan(explicit.getQualifiedName(), TypeStubPlan.Kind.CLASS));
-            return;
-        }
-
-// you already compute starPkgs and nonUnknown; keep that:
-        List<String> starPkgs = starImportsInOrder(ctx);
-        List<String> nonUnknown = starPkgs.stream()
-                .filter(p -> !"unknown".equals(p))
-                .collect(java.util.stream.Collectors.toList());
-
-// *** ADD THIS BLOCK: current package beats imports (JLS) ***
-        CtPackage pkg = Optional.ofNullable(ctx.getParent(CtType.class))
-                .map(CtType::getPackage).orElse(null);
-        String currentPkg = (pkg == null ? "" : pkg.getQualifiedName());
-        if (!currentPkg.isEmpty()) {
-            // same-package simple type must be treated as currentPkg.Simple
-            out.typePlans.add(new TypeStubPlan(currentPkg + "." + simple, TypeStubPlan.Kind.CLASS));
-            return;
-        }
-
-// keep your ambiguity/selection over nonUnknown stars:
-        if (nonUnknown.size() > 1 && cfg.isFailOnAmbiguity()) {
-            throw new AmbiguityException("Ambiguous simple type '" + simple + "' from on-demand imports: " + nonUnknown);
-        }
-        if (!nonUnknown.isEmpty()) {
-            out.typePlans.add(new TypeStubPlan(nonUnknown.get(0) + "." + simple, TypeStubPlan.Kind.CLASS));
-        } else {
-            // only then fall back to unknown.*
+            // 3) fallback to unknown.*
             out.typePlans.add(new TypeStubPlan("unknown." + simple, TypeStubPlan.Kind.CLASS));
+            return;
         }
-        return;
 
-
+        // ---- FQN branch ---------------------------------------------------------
+        // Non-JDK and unresolved → plan its qualified name as-is.
+        out.typePlans.add(new TypeStubPlan(qn, TypeStubPlan.Kind.CLASS));
     }
+
 
     /* ======================================================================
      *                           OWNER / IMPORT SEEDING
@@ -1253,64 +1439,71 @@ public final class SpoonCollector {
 
     private CtTypeReference<?> chooseOwnerPackage(CtTypeReference<?> ownerRef, CtElement ctx) {
         if (ownerRef == null) return f.Type().createReference("unknown.Missing");
+        if (ownerRef.isPrimitive() || ownerRef.isArray()) return ownerRef;
 
         String qn = safeQN(ownerRef);
 
-        // If it looks qualified and not a local-assumed simple, keep as is
-        if (qn.contains(".") && !isLocallyAssumedOrSimple(ownerRef, ctx)) {
-            return ownerRef;
-        }
-
-        // Treat locally-assumed qualified refs as simple (so we can re-qualify)
+        if (qn.contains(".") && !isLocallyAssumedOrSimple(ownerRef, ctx)) return ownerRef;
         if (qn.contains(".") && isLocallyAssumedOrSimple(ownerRef, ctx)) {
             ownerRef = f.Type().createReference(ownerRef.getSimpleName());
             qn = ownerRef.getQualifiedName();
         }
-
-        // Still qualified? keep it.
         if (qn.contains(".")) return ownerRef;
 
-        // --- simple name path from here ---
-        String simple = Optional.ofNullable(ownerRef.getSimpleName()).orElse("Missing");
+        String simple = java.util.Optional.ofNullable(ownerRef.getSimpleName()).orElse("Missing");
 
-        // 1) explicit single-type import wins
+        // (A) explicit single-type import wins
         CtTypeReference<?> explicit = resolveFromExplicitTypeImports(ctx, simple);
         if (explicit != null) return explicit;
 
-        // 2) current package should win over synthetic unknown.* (JLS: types in same package are always visible)
-        CtPackage pkg = Optional.ofNullable(ctx.getParent(CtType.class))
-                .map(CtType::getPackage).orElse(null);
-        String currentPkg = (pkg == null ? "" : pkg.getQualifiedName());
+        // (A2) if simple is a well-known JDK type, prefer its JDK package
+        if (isKnownJdkSimple(simple)) {
+            return f.Type().createReference(JDK_SIMPLE.get(simple) + "." + simple);
+        }
 
-        // Get star imports in source order and drop the synthetic "unknown"
-        List<String> starPkgs = starImportsInOrder(ctx);
-        List<String> nonUnknownStars = starPkgs.stream()
+        // (B) star-imports
+        java.util.List<String> stars = starImportsInOrder(ctx);
+
+        java.util.List<String> nonJdkNonUnknown = stars.stream()
+                .map(String::trim)
                 .filter(p -> !"unknown".equals(p))
+                .filter(p -> !isJdkPackage(p))
                 .collect(java.util.stream.Collectors.toList());
 
-        // Prefer current package when there is no real (non-unknown) star-import signal
-        if (!currentPkg.isEmpty() && nonUnknownStars.isEmpty()) {
-            return f.Type().createReference(currentPkg + "." + simple);
+        if (nonJdkNonUnknown.size() == 1) {
+            return f.Type().createReference(nonJdkNonUnknown.get(0) + "." + simple);
         }
-
-        // 3) real star-import candidates (non-unknown)
-        if (nonUnknownStars.size() == 1) {
-            return f.Type().createReference(nonUnknownStars.get(0) + "." + simple);
-        }
-        if (nonUnknownStars.size() > 1) {
+        if (nonJdkNonUnknown.size() > 1) {
             if (cfg.isFailOnAmbiguity()) {
-                throw new AmbiguityException("Ambiguous simple type '" + simple + "' from on-demand imports: " + nonUnknownStars);
+                throw new AmbiguityException("Ambiguous simple type '" + simple + "' from on-demand imports: " + nonJdkNonUnknown);
             } else {
-                return f.Type().createReference(nonUnknownStars.get(0) + "." + simple);
+                return f.Type().createReference("unknown." + simple);
             }
         }
 
-        // 4) if nothing else matched, prefer current package; only then fall back to unknown.*
-        if (!currentPkg.isEmpty()) {
-            return f.Type().createReference(currentPkg + "." + simple);
-        }
+        // (C) prefer unknown if unknown.* present
+        boolean hasUnknownStar = stars.stream().anyMatch("unknown"::equals);
+        if (hasUnknownStar) return f.Type().createReference("unknown." + simple);
+
+        // (D) current package (skip if default)
+        String currentPkg = java.util.Optional.ofNullable(ctx)
+                .map(c -> c.getParent(CtType.class))
+                .map(CtType::getPackage)
+                .map(spoon.reflect.declaration.CtPackage::getQualifiedName)
+                .orElse("");
+        if (!currentPkg.isEmpty()) return f.Type().createReference(currentPkg + "." + simple);
+
+        // (E) fallback
         return f.Type().createReference("unknown." + simple);
     }
+
+    private boolean isJdkPackage(String pkg) {
+        return pkg.startsWith("java.") || pkg.startsWith("javax.")
+                || pkg.startsWith("jakarta.") || pkg.startsWith("sun.") || pkg.startsWith("jdk.")
+                || pkg.startsWith("javafx.");
+    }
+
+
 
     /**
      * Resolve an explicit single-type import to a concrete type reference, if present.
@@ -1432,9 +1625,27 @@ public final class SpoonCollector {
             CtTypeReference<?> returnType = inferReturnTypeFromContext(inv);
             if (returnType == null) returnType = f.Type().VOID_PRIMITIVE;
 
-            List<CtTypeReference<?>> paramTypes = inv.getArguments().stream()
-                    .map(this::paramTypeOrObject)
-                    .collect(Collectors.toList());
+//            List<CtTypeReference<?>> paramTypes = inv.getArguments().stream()
+//                    .map(this::paramTypeOrObject)
+//                    .collect(Collectors.toList());
+
+            List<CtExpression<?>> args = inv.getArguments();
+            List<CtTypeReference<?>> paramTypes = new ArrayList<>(args.size());
+            for (int i = 0; i < args.size(); i++) {
+                CtTypeReference<?> base = paramTypeOrObject(args.get(i));
+                base = coerceFunctionalToTarget(args.get(i), base);
+                paramTypes.add(base);
+            }
+            boolean v = looksLikeVarargs(inv);
+            if (v && !paramTypes.isEmpty()) {
+                int varargIndex = paramTypes.size() - 1;
+                CtTypeReference<?> elem = paramTypes.get(varargIndex);
+                List<CtTypeReference<?>> coerced = coerceVarargs(args, varargIndex, elem);
+                if (!coerced.isEmpty() && coerced.get(0) != null) {
+                    paramTypes.set(varargIndex, coerced.get(0));
+                }
+            }
+
 
             MethodStubPlan.Visibility vis = MethodStubPlan.Visibility.PACKAGE;
             try {
@@ -1934,62 +2145,6 @@ public final class SpoonCollector {
 
 
     /**
-     * returns "unknown.Foo" if inv target is a type-access to unknown.*; else null
-     */
-    private String callSiteOwnerFqn(spoon.reflect.code.CtInvocation<?> inv) {
-        var tgt = inv.getTarget();
-        if (tgt instanceof spoon.reflect.code.CtTypeAccess) {
-            var qn = ((spoon.reflect.code.CtTypeAccess<?>) tgt).getAccessedType().getQualifiedName();
-            if (qn != null && qn.startsWith("unknown.")) return qn;
-        }
-        // fallback: sometimes getExecutable has declaringType
-        try {
-            var dt = inv.getExecutable().getDeclaringType();
-            if (dt != null) {
-                var qn = dt.getQualifiedName();
-                if (qn != null && qn.startsWith("unknown.")) return qn;
-            }
-        } catch (Throwable ignored) {
-        }
-        return null;
-    }
-
-
-    /** Unified static call-site check. */
-    /**
-     * Detect if an invocation must be treated as static:
-     * - explicit TypeAccess target (Foo.m())
-     * - implicit target but resolved via static import
-     * - inside static field initializer
-     * - inside static initializer block (CtAnonymousExecutable with STATIC)
-     * - inside static method
-     */
-    private boolean isStaticCallSite(CtInvocation<?> inv, String name) {
-        CtExpression<?> tgt = inv.getTarget();
-        if (tgt instanceof CtTypeAccess<?>) return true;
-
-        if (tgt == null) {
-            // static import resolution
-            CtTypeReference<?> fromStatic = resolveOwnerFromStaticImports(inv, name);
-            if (fromStatic != null) return true;
-
-            // static field initializer?
-            CtField<?> fld = inv.getParent(CtField.class);
-            if (fld != null && fld.hasModifier(ModifierKind.STATIC)) return true;
-
-            // static initializer block?
-            CtAnonymousExecutable anon = inv.getParent(CtAnonymousExecutable.class);
-            if (anon != null && anon.hasModifier(ModifierKind.STATIC)) return true;
-
-            // static method?
-            CtMethod<?> meth = inv.getParent(CtMethod.class);
-            if (meth != null && meth.hasModifier(ModifierKind.STATIC)) return true;
-        }
-
-        return false;
-    }
-
-    /**
      * Heuristic: when owner is a type named like an enum (or the call-site uses enum helpers),
      * we normalize enum utilities; this returns true for cases inside an enum body as well.
      */
@@ -2143,6 +2298,39 @@ public final class SpoonCollector {
         } catch (Throwable ignored) {
         }
         return false;
+    }
+
+    // If arg is a lambda/method-ref and expected param type is known FI, keep it;
+// if target type is unknown, prefer raw Object (legal & robust) over <Unknown>.
+    private CtTypeReference<?> coerceFunctionalToTarget(CtExpression<?> arg, CtTypeReference<?> expected) {
+        if (arg == null) return expected;
+        boolean isFunc = (arg instanceof spoon.reflect.code.CtLambda)
+                || (arg instanceof spoon.reflect.code.CtExecutableReferenceExpression);
+        if (!isFunc) return expected;
+        if (isSaneType(expected)) return expected; // target FI known → mirror it
+        // no target type → raw/erased target to avoid illegal generics
+        return f.Type().createReference("java.lang.Object");
+    }
+
+    // If varargs: pick a concrete element type from non-null args; else keep current/Unknown.
+    private java.util.List<CtTypeReference<?>> coerceVarargs(java.util.List<CtExpression<?>> args,
+                                                             int varargIndex,
+                                                             CtTypeReference<?> currentElem) {
+        if (varargIndex < 0 || varargIndex >= args.size()) {
+            return java.util.Collections.singletonList(currentElem);
+        }
+        CtTypeReference<?> chosen = null;
+        for (int i = varargIndex; i < args.size(); i++) {
+            CtExpression<?> a = args.get(i);
+            if (a == null) continue;
+            if (a instanceof spoon.reflect.code.CtLiteral && ((spoon.reflect.code.CtLiteral<?>) a).getValue() == null) continue;
+            try {
+                CtTypeReference<?> t = a.getType();
+                if (isSaneType(t)) { chosen = t; break; }
+            } catch (Throwable ignored) {}
+        }
+        if (chosen == null) chosen = (currentElem != null ? currentElem : f.Type().createReference("unknown.Unknown"));
+        return java.util.Collections.singletonList(chosen);
     }
 
 }

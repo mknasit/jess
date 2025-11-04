@@ -1,4 +1,3 @@
-// de/upb/sse/jess/stubbing/SpoonStubbingRunner.java
 package de.upb.sse.jess.stubbing;
 
 import de.upb.sse.jess.configuration.JessConfiguration;
@@ -9,12 +8,12 @@ import spoon.Launcher;
 import spoon.reflect.CtModel;
 import spoon.reflect.code.CtInvocation;
 import spoon.reflect.code.CtTypeAccess;
+import spoon.reflect.declaration.CtType;
 import spoon.reflect.factory.Factory;
 import spoon.reflect.reference.CtTypeReference;
 import spoon.reflect.visitor.DefaultJavaPrettyPrinter;
 import spoon.reflect.visitor.filter.TypeFilter;
 
-import spoon.reflect.declaration.CtType;
 import java.nio.file.Path;
 import java.util.List;
 
@@ -27,7 +26,14 @@ public final class SpoonStubbingRunner implements Stubber {
 
     @Override
     public int run(Path slicedSrcDir, List<Path> classpathJars) throws Exception {
-        System.out.println("\n>> Using stubber: Spoon Based Stubber" );
+        System.out.println("\n>> Using stubber: Spoon Based Stubber");
+
+        // Let -Djess.failOnAmbiguity=true|false override BEFORE collection
+        String sys = System.getProperty("jess.failOnAmbiguity");
+        if (sys != null) {
+            cfg.setFailOnAmbiguity(Boolean.parseBoolean(sys));
+        }
+
         // 1) Configure Spoon for Java 11
         Launcher launcher = new Launcher();
         var env = launcher.getEnvironment();
@@ -51,24 +57,32 @@ public final class SpoonStubbingRunner implements Stubber {
         SpoonCollector collector = new SpoonCollector(f, cfg);
         CollectResult plans = collector.collect(model);
 
+        // 3) Generate stubs
+        // If your SpoonStubber has a (Factory) ctor, use that. Otherwise keep (Factory, CtModel).
+        SpoonStubber stubber = new SpoonStubber(f, model);
 
-
-        // 3) Generate stubs (separate handlers per kind)
-        SpoonStubber stubber = new SpoonStubber(f,model);
         int created = 0;
-        created += stubber.applyTypePlans(plans.typePlans);// types (classes/interfaces/annotations)
-        created += stubber.applyFieldPlans(plans.fieldPlans);         // fields
-        created += stubber.applyConstructorPlans(plans.ctorPlans);    // constructors
-        created += stubber.applyMethodPlans(plans.methodPlans);
-        stubber.finalizeRepeatableAnnotations();
+        created += stubber.applyTypePlans(plans.typePlans);       // types (classes/interfaces/annotations)
+        created += stubber.applyFieldPlans(plans.fieldPlans);     // fields
+        created += stubber.applyConstructorPlans(plans.ctorPlans);// constructors
+        created += stubber.applyMethodPlans(plans.methodPlans);   // methods
 
-        stubber.canonicalizeAllMetaAnnotations();
+        // Qualify ONLY the ambiguous names we actually touched (scoped)
+        stubber.qualifyAmbiguousSimpleTypes(plans.ambiguousSimples);
+
+        // Optional polish (off by default; enable via -Djess.metaPolish=true)
+        boolean metaPolish = Boolean.getBoolean("jess.metaPolish");
+        if (metaPolish) {
+            stubber.finalizeRepeatableAnnotations();
+            stubber.canonicalizeAllMetaAnnotations();
+        }
+
+        // Keep this if you still rely on import binding for same-package unresolved refs
         stubber.dequalifyCurrentPackageUnresolvedRefs();
-        stubber.qualifyAmbiguousSimpleTypes();           // NEW pass
 
-        stubber.report();                                             // nice summary
+        stubber.report(); // summary
 
-        // remove unknown.Helper if a real Helper exists
+        // Remove unknown.Helper if a real Helper exists
         model.getAllTypes().stream()
                 .collect(java.util.stream.Collectors.groupingBy(CtType::getSimpleName))
                 .forEach((simple, list) -> {
@@ -82,7 +96,7 @@ public final class SpoonStubbingRunner implements Stubber {
                     }
                 });
 
-// rebind invocations that still target unknown.Helper
+        // Rebind invocations that still target unknown.Helper
         for (CtInvocation<?> inv : model.getElements(new TypeFilter<>(CtInvocation.class))) {
             if (!(inv.getTarget() instanceof CtTypeAccess)) continue;
             CtTypeAccess<?> ta = (CtTypeAccess<?>) inv.getTarget();
@@ -95,7 +109,7 @@ public final class SpoonStubbingRunner implements Stubber {
             try { qn = tr.getQualifiedName(); } catch (Throwable e) { qn = null; }
             if (!"unknown.Helper".equals(qn)) continue;
 
-            // prefer Helper in the current package of this file
+            // Prefer Helper in the current package of this file
             CtType<?> ownerType = inv.getParent(CtType.class);
             String currentPkg = (ownerType != null && ownerType.getPackage() != null)
                     ? ownerType.getPackage().getQualifiedName() : "";
@@ -117,7 +131,6 @@ public final class SpoonStubbingRunner implements Stubber {
             }
 
             if (to != null) {
-                // *** key change to avoid the generic error ***
                 inv.setTarget(f.Code().createTypeAccess(to));
             } else {
                 // last resort: drop the explicit target (let auto-import resolve)
@@ -125,7 +138,7 @@ public final class SpoonStubbingRunner implements Stubber {
             }
         }
 
-        // 4) Pretty-print (use default printer; safer with JDK11 snippets)
+        // 4) Pretty-print (use default printer; safe with Java 11)
         env.setPrettyPrinterCreator(() -> new DefaultJavaPrettyPrinter(env));
         launcher.prettyprint();
 

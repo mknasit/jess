@@ -87,18 +87,21 @@ public final class SpoonStubber {
                             case INTERFACE:
                                 created = f.Interface().create(parent, simple);
                                 break;
-                            case ANNOTATION:
-                                created = f.Annotation().create((CtPackage) parent, simple);
-                                // make sure it has public and a default 'value()' (like your top-level path)
-                                created.addModifier(ModifierKind.PUBLIC);
-                                CtAnnotationType<?> at = (CtAnnotationType<?>) created;
+                            case ANNOTATION: {
+                                CtAnnotationType<?> at = f.Core().createAnnotationType();
+                                at.setSimpleName(simple);
+                                ((CtType<?>) parent).addNestedType(at);   // attach as nested
+                                at.addModifier(ModifierKind.PUBLIC);
                                 if (at.getMethods().stream().noneMatch(m -> "value".equals(m.getSimpleName()))) {
                                     CtAnnotationMethod<?> am = f.Core().createAnnotationMethod();
                                     am.setSimpleName("value");
                                     am.setType(f.Type().STRING);
                                     at.addMethod(am);
                                 }
+                                created = at;
                                 break;
+                            }
+
                             default:
                                 created = f.Class().create((CtClass<?>) parent, simple);
                         }
@@ -889,48 +892,34 @@ public final class SpoonStubber {
      * Qualify ambiguous simple type refs to a chosen package (prefer 'unknown' if present),
      * and force FQN printing to avoid import conflicts.
      */
-    public void qualifyAmbiguousSimpleTypes() {
-        Map<String, Set<String>> map = simpleNameToPkgs();
-        // only keep ambiguous entries
-        map.entrySet().removeIf(e -> e.getValue().size() < 2);
-        if (map.isEmpty()) return;
 
-        // choose a package per simple name (prefer 'unknown' if present)
+    public void qualifyAmbiguousSimpleTypes(java.util.Set<String> onlySimples) {
+        if (onlySimples == null || onlySimples.isEmpty()) return;
+        Map<String, Set<String>> map = simpleNameToPkgs();
+        map.entrySet().removeIf(e -> e.getValue().size() < 2 || !onlySimples.contains(e.getKey()));
+        if (map.isEmpty()) return;
         Map<String, String> chosen = new HashMap<>();
         for (var e : map.entrySet()) {
             Set<String> pkgs = e.getValue();
-            String pick = pkgs.contains("unknown") ? "unknown" : pkgs.iterator().next(); // deterministic
+            String pick = pkgs.contains("unknown") ? "unknown" : pkgs.iterator().next();
             chosen.put(e.getKey(), pick);
         }
-
-        // walk all type refs and qualify simple ones that are ambiguous
         f.getModel().getAllTypes().forEach(owner -> {
             owner.getElements(el -> el instanceof CtTypeReference<?>).forEach(refEl -> {
                 CtTypeReference<?> ref = (CtTypeReference<?>) refEl;
                 String simple = ref.getSimpleName();
                 if (simple == null || simple.isEmpty()) return;
-
-                // already qualified? skip
-                String qn = safeQN(ref);
+                String qn = readable(ref);
                 if (qn.contains(".")) return;
-
                 String pkg = chosen.get(simple);
-                if (pkg == null) return; // not ambiguous
-
-                // qualify to the chosen pkg
-                if (!pkg.isEmpty()) {
-                    ref.setPackage(f.Package().createReference(pkg));
-                } else {
-                    ref.setPackage(null);
-                }
-
-                // make sure it prints as FQN (avoids import games)
+                if (pkg == null) return;
+                if (!pkg.isEmpty()) ref.setPackage(f.Package().createReference(pkg));
+                else ref.setPackage(null);
                 ref.setImplicit(false);
                 ref.setSimplyQualified(true);
             });
         });
     }
-
     /**
      * Inspect model usages of a type FQN to infer maximum number of generic type arguments.
      *
@@ -977,45 +966,6 @@ public final class SpoonStubber {
         }
     }
 
-
-    private boolean isFunctionalInterfaceContext(CtTypeReference<?> ownerRef) {
-        String want = safeQN(ownerRef);
-        if (want == null || want.isEmpty()) want = ownerRef.getSimpleName();
-        if (want == null || want.isEmpty()) return false;
-
-        // scan locals
-        for (CtLocalVariable<?> lv : f.getModel().getElements((CtLocalVariable<?> v) -> true)) {
-            CtTypeReference<?> t = lv.getType();
-            if (t == null) continue;
-            String qn = safeQN(t);
-            if (!want.equals(qn) && !t.getSimpleName().equals(ownerRef.getSimpleName())) continue;
-
-            CtExpression<?> init = lv.getDefaultExpression();
-            if (init == null) continue;
-
-            // method reference: e.g., String[]::new, SomeType::factory, this::m
-            if (init instanceof spoon.reflect.code.CtExecutableReferenceExpression) return true;
-
-            // lambda: x -> ..., (a,b) -> ...
-            if (init instanceof spoon.reflect.code.CtLambda) return true;
-        }
-
-        // scan fields too (for completeness)
-        for (CtField<?> fd : f.getModel().getElements((CtField<?> v) -> true)) {
-            CtTypeReference<?> t = fd.getType();
-            if (t == null) continue;
-            String qn = safeQN(t);
-            if (!want.equals(qn) && !t.getSimpleName().equals(ownerRef.getSimpleName())) continue;
-
-            CtExpression<?> init = fd.getDefaultExpression();
-            if (init == null) continue;
-
-            if (init instanceof spoon.reflect.code.CtExecutableReferenceExpression) return true;
-            if (init instanceof spoon.reflect.code.CtLambda) return true;
-        }
-
-        return false;
-    }
 
 
     public void finalizeRepeatableAnnotations() {
@@ -1207,4 +1157,7 @@ public final class SpoonStubber {
             for (CtAnnotation<?> a : at.getAnnotations()) canonicalizeMetaAnnotationType(a);
         }
     }
+
+
+
 }
