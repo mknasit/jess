@@ -45,6 +45,7 @@ public final class SpoonCollector {
         public final List<ConstructorStubPlan> ctorPlans = new ArrayList<>();
         public final List<MethodStubPlan> methodPlans = new ArrayList<>();
         public final Set<String> ambiguousSimples = new LinkedHashSet<>();
+        public final Map<String, Set<CtTypeReference<?>>> implementsPlans = new LinkedHashMap<>();
 
     }
 
@@ -114,7 +115,7 @@ public final class SpoonCollector {
      */
     public CollectResult collect(CtModel model) {
         CollectResult result = new CollectResult();
-
+        ensureRepeatablesForDuplicateUses(model);
         // --- order matters only for readability; each pass is independent ---
         collectUnresolvedFields(model, result);
         collectUnresolvedCtorCalls(model, result);
@@ -431,8 +432,8 @@ public final class SpoonCollector {
      *                           CONSTRUCTORS PASS
      * ====================================================================== */
 
-
     private void collectUnresolvedCtorCalls(CtModel model, CollectResult out) {
+        // unresolved constructor calls
         var unresolved = model.getElements((CtConstructorCall<?> cc) -> {
             var ex = cc.getExecutable();
             return ex == null || ex.getDeclaration() == null;
@@ -441,40 +442,37 @@ public final class SpoonCollector {
         for (CtConstructorCall<?> cc : unresolved) {
             CtTypeReference<?> rawOwner = cc.getType();
 
-            // ----- NEW: detect member-inner creation on any CtConstructorCall -----
+            // ---------- MEMBER-INNER new Outer().new Inner(...) ----------
             CtExpression<?> targetExpr = null;
             try {
-                // Spoon 10.x: CtConstructorCall has getTarget()
+                // Spoon 10.x has getTarget()
                 targetExpr = (CtExpression<?>) cc.getClass().getMethod("getTarget").invoke(cc);
             } catch (Throwable ignore) {
-                // Older Spoon variants: anonymous/inner had getEnclosingExpression()
                 try {
+                    // fallback on older variants
                     targetExpr = (CtExpression<?>) cc.getClass()
                             .getMethod("getEnclosingExpression")
                             .invoke(cc);
-                } catch (Throwable ignored) {
-                }
+                } catch (Throwable ignored) {}
             }
 
             if (targetExpr != null) {
                 CtTypeReference<?> outerT = null;
-                try {
-                    outerT = targetExpr.getType();
-                } catch (Throwable ignored) {
-                }
+                try { outerT = targetExpr.getType(); } catch (Throwable ignored) {}
 
                 if (outerT != null) {
-                    // resolve simple 'Outer' using explicit single-type imports (and star) first
                     CtTypeReference<?> resolvedOuter = chooseOwnerPackage(outerT, cc);
                     String outerFqn = safeQN(resolvedOuter);
-                    if (outerFqn.isEmpty()) outerFqn = resolvedOuter.getQualifiedName();
-
+                    if (outerFqn == null || outerFqn.isEmpty()) {
+                        outerFqn = resolvedOuter.getQualifiedName();
+                    }
                     String innerSimple = rawOwner.getSimpleName();
+
                     CtTypeReference<?> memberOwner = f.Type().createReference(outerFqn + "$" + innerSimple);
 
+                    // params + functional coercion
                     List<CtTypeReference<?>> ps =
                             inferParamTypesFromCall(cc.getExecutable(), cc.getArguments());
-                    // Functional arg coercion for constructor parameters
                     List<CtExpression<?>> cargs = cc.getArguments();
                     for (int i = 0; i < cargs.size() && i < ps.size(); i++) {
                         CtExpression<?> a = cargs.get(i);
@@ -483,27 +481,82 @@ public final class SpoonCollector {
                         if (coerced != expected) ps.set(i, coerced);
                     }
 
-
+                    // plan types + ctor
                     out.typePlans.add(new TypeStubPlan(outerFqn, TypeStubPlan.Kind.CLASS));
                     out.typePlans.add(new TypeStubPlan(outerFqn + "$" + innerSimple, TypeStubPlan.Kind.CLASS));
                     out.ctorPlans.add(new ConstructorStubPlan(memberOwner, ps));
-                    continue; // handled -> do NOT fall back to generic path
+                    // do NOT fall through to generic path
+                    continue;
                 }
             }
-            // ---------------------------------------------------------------------
+            // -------------------------------------------------------------
+
+            // --- infer superinterface from assignment/var-init target ---
+            CtTypeReference<?> targetType = null;
+            CtElement p = cc.getParent();
+            if (p instanceof CtVariable && Objects.equals(((CtVariable<?>) p).getDefaultExpression(), cc)) {
+                targetType = ((CtVariable<?>) p).getType();
+            } else if (p instanceof CtAssignment && Objects.equals(((CtAssignment<?, ?>) p).getAssignment(), cc)) {
+                try {
+                    targetType = ((CtExpression<?>) ((CtAssignment<?, ?>) p).getAssigned()).getType();
+                } catch (Throwable ignored) {}
+            }
 
             CtTypeReference<?> owner = chooseOwnerPackage(rawOwner, cc);
-            if (isJdkType(owner)) continue;
 
-            collectTypeRefDeep(cc, rawOwner, out);
-            List<CtTypeReference<?>> ps = inferParamTypesFromCall(cc.getExecutable(), cc.getArguments());
+            // Only enqueue "implements" when: owner is concrete/non-unknown AND target looks like interface/unknown
+            if (owner != null && !safeQN(owner).startsWith("unknown.")
+                    && targetType != null && isSaneType(targetType) && !isJdkType(targetType)) {
 
-            // Preserve nested owners ($) if present
-            String ownerFqn = nestedAwareFqnOf(owner);
-            out.ctorPlans.add(new ConstructorStubPlan(f.Type().createReference(ownerFqn), ps));
+                boolean looksUnknown = safeQN(targetType).startsWith("unknown.");
+                boolean isInterface = false;
+                try { isInterface = targetType.getTypeDeclaration() instanceof CtInterface; } catch (Throwable ignored) {}
+
+                // skip self (by erasure)
+                boolean isSelf = erasureFqn(targetType).equals(erasureFqn(owner));
+
+                if ((isInterface || looksUnknown) && !isSelf) {
+                    var set = out.implementsPlans
+                            .computeIfAbsent(owner.getQualifiedName(), k -> new LinkedHashSet<>());
+
+                    String newErasure = erasureFqn(targetType);
+                    CtTypeReference<?> existingRaw = set.stream()
+                            .filter(r -> erasureFqn(r).equals(newErasure))
+                            .findFirst().orElse(null);
+
+                    boolean newIsParam = !targetType.getActualTypeArguments().isEmpty();
+                    boolean oldIsParam = existingRaw != null && !existingRaw.getActualTypeArguments().isEmpty();
+
+                    if (existingRaw == null) {
+                        set.add(targetType.clone());
+                    } else if (newIsParam && !oldIsParam) {
+                        set.remove(existingRaw);
+                        set.add(targetType.clone()); // upgrade raw → parameterized
+                    }
+                }
+            }
+
+            // --- normal ctor stubbing ---
+            if (owner != null && !isJdkType(owner)) {
+                collectTypeRefDeep(cc, rawOwner, out);
+                List<CtTypeReference<?>> ps = inferParamTypesFromCall(cc.getExecutable(), cc.getArguments());
+
+                // functional coercion for ctor params
+                List<CtExpression<?>> cargs = cc.getArguments();
+                for (int i = 0; i < cargs.size() && i < ps.size(); i++) {
+                    CtExpression<?> a = cargs.get(i);
+                    CtTypeReference<?> expected = ps.get(i);
+                    CtTypeReference<?> coerced = coerceFunctionalToTarget(a, expected);
+                    if (coerced != expected) ps.set(i, coerced);
+                }
+
+                // preserve nested owners ($)
+                String ownerFqn = nestedAwareFqnOf(owner);
+                out.ctorPlans.add(new ConstructorStubPlan(f.Type().createReference(ownerFqn), ps));
+            }
         }
-
     }
+
 
 
     /* ======================================================================
@@ -574,6 +627,11 @@ public final class SpoonCollector {
             // decide staticness & varargs early
             boolean makeStatic = isStaticCallSite(inv);
             boolean makeVarargs = looksLikeVarargs(inv);
+
+            // treat unqualified call in static context as static
+            if (!makeStatic && inv.getTarget() == null && isInStaticContext(inv)) {
+                makeStatic = true;
+            }
 
             // --- owner from call-site -------------------------------------------
             CtExpression<?> tgt = inv.getTarget();
@@ -674,6 +732,30 @@ public final class SpoonCollector {
                     mirrorOwnerRef = f.Type().createReference("unknown." + owner.getSimpleName());
                 }
             }
+
+            if (mirror && mirrorOwnerRef != null) {
+                String simple = owner != null ? owner.getSimpleName() : null;
+                boolean realExists =
+                        (simple != null) && (
+                                inv.getFactory().getModel().getAllTypes().stream().anyMatch(t ->
+                                        simple.equals(t.getSimpleName())
+                                                && t.getPackage() != null
+                                                && !"unknown".equals(t.getPackage().getQualifiedName()))
+                                        ||
+                                        out.typePlans.stream().anyMatch(tp -> {
+                                            int i = tp.qualifiedName.lastIndexOf('.');
+                                            String pkg = i >= 0 ? tp.qualifiedName.substring(0, i) : "";
+                                            String s   = i >= 0 ? tp.qualifiedName.substring(i+1) : tp.qualifiedName;
+                                            return simple.equals(s) && !"unknown".equals(pkg);
+                                        })
+                        );
+                if (realExists) {
+                    mirror = false;
+                    mirrorOwnerRef = null;
+                }
+            }
+
+
 
 
             if (isJdkType(owner)) continue;
@@ -891,27 +973,6 @@ public final class SpoonCollector {
                 if (isStringy(other)) return f.Type().STRING;
             }
         }
-
-//        if (p instanceof CtConditional) {
-//            CtConditional<?> ce = (CtConditional<?>) p;
-//            CtExpression<?> thenExp = ce.getThenExpression();
-//            CtExpression<?> elseExp = ce.getElseExpression();
-//
-//            boolean inThen = thenExp == inv;
-//            CtExpression<?> other = inThen ? elseExp : (elseExp == inv ? thenExp : null);
-//            if (other != null) {
-//                try {
-//                    CtTypeReference<?> ot = other.getType();
-//                    if (isSaneType(ot)) return ot;
-//                } catch (Throwable ignored) {}
-//            }
-//            try {
-//                CtTypeReference<?> t = ce.getType();
-//                if (isSaneType(t)) return t;
-//            } catch (Throwable ignored) {}
-//        }
-
-
 
         if (p instanceof CtInvocation) {
             CtInvocation<?> outer = (CtInvocation<?>) p;
@@ -1481,10 +1542,6 @@ public final class SpoonCollector {
             }
         }
 
-        // (C) prefer unknown if unknown.* present
-        boolean hasUnknownStar = stars.stream().anyMatch("unknown"::equals);
-        if (hasUnknownStar) return f.Type().createReference("unknown." + simple);
-
         // (D) current package (skip if default)
         String currentPkg = java.util.Optional.ofNullable(ctx)
                 .map(c -> c.getParent(CtType.class))
@@ -1492,6 +1549,11 @@ public final class SpoonCollector {
                 .map(spoon.reflect.declaration.CtPackage::getQualifiedName)
                 .orElse("");
         if (!currentPkg.isEmpty()) return f.Type().createReference(currentPkg + "." + simple);
+
+        // (C) prefer unknown if unknown.* present
+        boolean hasUnknownStar = stars.stream().anyMatch("unknown"::equals);
+        if (hasUnknownStar) return f.Type().createReference("unknown." + simple);
+
 
         // (E) fallback
         return f.Type().createReference("unknown." + simple);
@@ -2195,14 +2257,6 @@ public final class SpoonCollector {
     }
 
 
-    private CtTypeReference<?> typeOf(CtExpression<?> e) {
-        try {
-            return (e != null ? e.getType() : null);
-        } catch (Throwable ignore) {
-            return null;
-        }
-    }
-
     private CtTypeReference<?> deepComponentType(CtTypeReference<?> t) {
         while (t instanceof CtArrayTypeReference) {
             t = ((CtArrayTypeReference<?>) t).getComponentType();
@@ -2332,5 +2386,146 @@ public final class SpoonCollector {
         if (chosen == null) chosen = (currentElem != null ? currentElem : f.Type().createReference("unknown.Unknown"));
         return java.util.Collections.singletonList(chosen);
     }
+
+    private String erasureFqn(CtTypeReference<?> tr) {
+        String qn = safeQN(tr);
+        int lt = qn.indexOf('<');
+        return (lt >= 0 ? qn.substring(0, lt) : qn);
+    }
+
+
+
+    private boolean isInStaticContext(CtInvocation<?> inv) {
+        // static field initializer
+        CtField<?> fld = inv.getParent(CtField.class);
+        if (fld != null && fld.hasModifier(ModifierKind.STATIC)) {
+            return true;
+        }
+
+        // class initializer blocks are CtAnonymousExecutable in Spoon 10.x
+        CtAnonymousExecutable init = inv.getParent(CtAnonymousExecutable.class);
+        if (init != null && init.hasModifier(ModifierKind.STATIC)) {
+            return true;
+        }
+
+        return false;
+    }
+    private void ensureRepeatableAnnotation(String annFqn) {
+        CtType<?> annDecl = f.Type().get(annFqn);
+        if (!(annDecl instanceof CtAnnotationType)) {
+            int i = annFqn.lastIndexOf('.');
+            String pkg = i >= 0 ? annFqn.substring(0, i) : "";
+            String sn  = i >= 0 ? annFqn.substring(i + 1) : annFqn;
+            CtPackage p = ensurePackage(pkg);
+            annDecl = f.Annotation().create(p, sn);
+        }
+        CtAnnotationType<?> tag = (CtAnnotationType<?>) annDecl;
+
+        // container: <Ann>s
+        String containerFqn = annFqn + "s";
+        CtType<?> containerDecl = f.Type().get(containerFqn);
+        if (!(containerDecl instanceof CtAnnotationType)) {
+            int j = containerFqn.lastIndexOf('.');
+            String cpkg = j >= 0 ? containerFqn.substring(0, j) : "";
+            String csn  = j >= 0 ? containerFqn.substring(j + 1) : containerFqn;
+            CtPackage p2 = ensurePackage(cpkg);
+            containerDecl = f.Annotation().create(p2, csn);
+        }
+        CtAnnotationType<?> tags = (CtAnnotationType<?>) containerDecl;
+
+        // Tag.value(): String (create if missing)
+        ensureAnnotationMethod(tag, "value", f.Type().createReference("java.lang.String"));
+
+        // Tags.value(): Tag[]
+        CtArrayTypeReference<?> tagArray = f.Core().createArrayTypeReference();
+        tagArray.setComponentType(tag.getReference());
+        ensureAnnotationMethod(tags, "value", tagArray);
+
+        // add @Repeatable(Tags.class) to Tag if missing
+        boolean hasRepeatable = tag.getAnnotations().stream()
+                .anyMatch(a -> "java.lang.annotation.Repeatable".equals(safeQN(a.getAnnotationType())));
+        if (!hasRepeatable) {
+            CtAnnotation<?> rep = f.Core().createAnnotation();
+            rep.setAnnotationType(f.Type().createReference("java.lang.annotation.Repeatable"));
+            rep.addValue("value", tags.getReference());
+            tag.addAnnotation(rep);
+        }
+    }
+
+    private void ensureAnnotationMethod(CtAnnotationType<?> at, String name, CtTypeReference<?> ret) {
+        boolean exists = at.getMethods().stream().anyMatch(m -> name.equals(m.getSimpleName()));
+        if (!exists) {
+            CtAnnotationMethod<Object> m = f.Core().createAnnotationMethod();
+            m.setSimpleName(name);
+            m.setType(ret);
+            at.addMethod(m);
+        }
+    }
+
+
+
+    // Call this once before stubbing annotations are emitted
+    private void ensureRepeatablesForDuplicateUses(CtModel model) {
+        for (CtType<?> top : model.getAllTypes()) {
+            for (CtElement elem : allAnnotatableOf(top)) {
+                List<CtAnnotation<?>> anns = elem.getAnnotations();
+                if (anns == null || anns.isEmpty()) continue;
+
+                Map<String, List<CtAnnotation<?>>> byType =
+                        anns.stream()
+                                .collect(java.util.stream.Collectors.groupingBy(
+                                        a -> safeQN(a.getAnnotationType())
+                                ));
+
+                byType.forEach((annFqn, list) -> {
+                    if (annFqn == null) return;
+                    if (list.size() > 1) {
+                        // make <Ann>, <Anns>, and put @Repeatable(<Anns>.class) on <Ann>
+                        ensureRepeatableAnnotation(annFqn);
+                    }
+                });
+            }
+        }
+    }
+
+
+    /** Enumerate the typical annotatable sites under a type (and recurse into nested types). */
+    private List<CtElement> allAnnotatableOf(CtType<?> t) {
+        List<CtElement> out = new java.util.ArrayList<>();
+        if (t == null) return out;
+
+        // the type itself
+        out.add(t);
+
+        // fields (incl. enum constants)
+        out.addAll(t.getFields());
+
+        // methods
+        out.addAll(t.getMethods());
+
+        // ctors (only for classes)
+        if (t instanceof CtClass<?>) {
+            out.addAll(((CtClass<?>) t).getConstructors());
+        }
+
+        // class/instance initializer blocks: query under this type
+        out.addAll(t.getElements(new spoon.reflect.visitor.filter.TypeFilter<>(CtAnonymousExecutable.class)));
+
+        // recurse into nested types
+        for (CtType<?> nested : t.getNestedTypes()) {
+            out.addAll(allAnnotatableOf(nested));
+        }
+
+        return out;
+    }
+    private CtPackage ensurePackage(String fqn) {
+        if (fqn == null || fqn.isEmpty()) {
+            // Spoon 10.x: use root package for the default package
+            return f.Package().getRootPackage();
+        }
+        return f.Package().getOrCreate(fqn);
+    }
+
+
 
 }

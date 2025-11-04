@@ -6,6 +6,7 @@ import de.upb.sse.jess.stubbing.spoon.collector.SpoonCollector.CollectResult;
 import de.upb.sse.jess.stubbing.spoon.generate.SpoonStubber;
 import spoon.Launcher;
 import spoon.reflect.CtModel;
+import spoon.reflect.code.CtConstructorCall;
 import spoon.reflect.code.CtInvocation;
 import spoon.reflect.code.CtTypeAccess;
 import spoon.reflect.declaration.CtType;
@@ -13,9 +14,13 @@ import spoon.reflect.factory.Factory;
 import spoon.reflect.reference.CtTypeReference;
 import spoon.reflect.visitor.DefaultJavaPrettyPrinter;
 import spoon.reflect.visitor.filter.TypeFilter;
+import spoon.reflect.declaration.CtPackage;
 
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Optional;
+
+import static de.upb.sse.jess.stubbing.spoon.generate.SpoonStubber.safeQN;
 
 public final class SpoonStubbingRunner implements Stubber {
     private final JessConfiguration cfg;
@@ -63,6 +68,7 @@ public final class SpoonStubbingRunner implements Stubber {
 
         int created = 0;
         created += stubber.applyTypePlans(plans.typePlans);       // types (classes/interfaces/annotations)
+        stubber.applyImplementsPlans(plans.implementsPlans);
         created += stubber.applyFieldPlans(plans.fieldPlans);     // fields
         created += stubber.applyConstructorPlans(plans.ctorPlans);// constructors
         created += stubber.applyMethodPlans(plans.methodPlans);   // methods
@@ -86,14 +92,63 @@ public final class SpoonStubbingRunner implements Stubber {
         model.getAllTypes().stream()
                 .collect(java.util.stream.Collectors.groupingBy(CtType::getSimpleName))
                 .forEach((simple, list) -> {
-                    if (!"Helper".equals(simple)) return;
                     boolean hasReal = list.stream().anyMatch(t ->
                             t.getPackage() != null && !"unknown".equals(t.getPackage().getQualifiedName()));
-                    if (hasReal) {
-                        list.stream()
-                                .filter(t -> t.getPackage() != null && "unknown".equals(t.getPackage().getQualifiedName()))
-                                .forEach(CtType::delete);
+                    if (!hasReal) return;
+// 1) delete unknown.Simple
+                    list.stream()
+                            .filter(t -> t.getPackage() != null && "unknown".equals(t.getPackage().getQualifiedName()))
+                            .forEach(CtType::delete);
+
+// 2) rebind type-accesses unknown.Simple -> real package.Simple
+                    for (CtTypeAccess<?> ta : model.getElements(new TypeFilter<>(CtTypeAccess.class))) {
+                        CtTypeReference<?> tr = ta.getAccessedType();
+                        if (tr == null) continue;
+                        String qn = safeQN(tr);
+                        if (!qn.equals("unknown." + simple)) continue;
+
+                        // prefer current CU package’s <Simple>, else any non-unknown <pkg>.<Simple>
+                        String currentPkg = Optional.ofNullable(ta.getParent(CtType.class))
+                                .map(CtType::getPackage).map(CtPackage::getQualifiedName).orElse("");
+
+                        CtTypeReference<?> to = null;
+                        if (!currentPkg.isEmpty()) {
+                            to = model.getAllTypes().stream()
+                                    .filter(t -> simple.equals(t.getSimpleName()))
+                                    .filter(t -> t.getPackage() != null && currentPkg.equals(t.getPackage().getQualifiedName()))
+                                    .map(CtType::getReference).findFirst().orElse(null);
+                        }
+                        if (to == null) {
+                            to = model.getAllTypes().stream()
+                                    .filter(t -> simple.equals(t.getSimpleName()))
+                                    .filter(t -> t.getPackage() != null && !"unknown".equals(t.getPackage().getQualifiedName()))
+                                    .map(CtType::getReference).findFirst().orElse(null);
+                        }
+                        if (to != null) {
+                            // IMPORTANT: replace node, don't call setAccessedType(..)
+                            CtTypeAccess<?> newTA = f.Code().createTypeAccess(to);
+                            ta.replace(newTA);
+                        }
                     }
+
+// 3) rebind constructor calls unknown.Simple -> real package.Simple
+                    for (CtConstructorCall<?> cc : model.getElements(new TypeFilter<>(CtConstructorCall.class))) {
+                        CtTypeReference<?> tr = cc.getType();
+                        if (tr == null) continue;
+                        String qn = safeQN(tr);
+                        if (!qn.equals("unknown." + simple)) continue;
+
+                        CtTypeReference<?> to = model.getAllTypes().stream()
+                                .filter(t -> simple.equals(t.getSimpleName()))
+                                .filter(t -> t.getPackage() != null && !"unknown".equals(t.getPackage().getQualifiedName()))
+                                .map(CtType::getReference).findFirst().orElse(null);
+
+                        if (to != null) {
+                            cc.setType(to);
+                        }
+                    }
+
+
                 });
 
         // Rebind invocations that still target unknown.Helper

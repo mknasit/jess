@@ -770,7 +770,7 @@ public final class SpoonStubber {
     /**
      * Safely get a type's qualified name; returns empty string on failure.
      */
-    private static String safeQN(CtTypeReference<?> t) {
+    public static String safeQN(CtTypeReference<?> t) {
         try {
             String s = (t == null ? null : t.getQualifiedName());
             return (s == null ? "" : s);
@@ -1156,6 +1156,82 @@ public final class SpoonStubber {
             CtAnnotationType<?> at = (CtAnnotationType<?>) t;
             for (CtAnnotation<?> a : at.getAnnotations()) canonicalizeMetaAnnotationType(a);
         }
+    }
+
+
+    public void applyImplementsPlans(Map<String, Set<CtTypeReference<?>>> plans) {
+        if (plans == null || plans.isEmpty()) return;
+
+        for (var e : plans.entrySet()) {
+            final String ownerFqn = e.getKey();
+            CtType<?> owner = f.Type().get(ownerFqn);
+            if (owner == null) {
+                // create an empty public class owner if it does not exist yet
+                int i = ownerFqn.lastIndexOf('.');
+                String pkg = i >= 0 ? ownerFqn.substring(0, i) : "";
+                String sn  = i >= 0 ? ownerFqn.substring(i + 1) : ownerFqn;
+                CtPackage p = ensurePackage(pkg);
+                owner = f.Class().create(p, sn);
+                owner.addModifier(ModifierKind.PUBLIC);
+            }
+
+            for (CtTypeReference<?> t : e.getValue()) {
+                if (t == null) continue;
+
+                // erasure FQN of target
+                String tErasureFqn = erasureFqn(t);
+
+                // skip self: SomeObject implements SomeObject
+                if (ownerFqn.equals(tErasureFqn)) continue;
+
+                // ensure target exists and is an INTERFACE (never a class)
+                CtType<?> targetDecl = f.Type().get(tErasureFqn);
+                if (targetDecl == null) {
+                    int j = tErasureFqn.lastIndexOf('.');
+                    String tpkg = j >= 0 ? tErasureFqn.substring(0, j) : "";
+                    String tsn  = j >= 0 ? tErasureFqn.substring(j + 1) : tErasureFqn;
+                    CtPackage p = ensurePackage(tpkg);
+                    targetDecl = f.Interface().create(p, tsn); // <-- create interface, not class
+                    targetDecl.addModifier(ModifierKind.PUBLIC);
+                }
+                if (!(targetDecl instanceof CtInterface)) {
+                    // don't add implements to a concrete class; skip
+                    continue;
+                }
+
+                // avoid duplicates (by erasure), optionally upgrade raw -> parameterized
+                CtTypeReference<?> targetIfaceRef = targetDecl.getReference();
+                CtTypeReference<?> existing = owner.getSuperInterfaces().stream()
+                        .filter(x -> erasureFqn(x).equals(tErasureFqn))
+                        .findFirst().orElse(null);
+
+                if (existing == null) {
+                    // add (prefer the parameterized shape you collected)
+                    owner.addSuperInterface(t.clone());
+                } else {
+                    // upgrade raw -> parameterized if you found a better one
+                    if (existing.getActualTypeArguments().isEmpty() && !t.getActualTypeArguments().isEmpty()) {
+                        owner.getSuperInterfaces().remove(existing);
+                        owner.addSuperInterface(t.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    private String erasureFqn(CtTypeReference<?> tr) {
+        String qn = safeQN(tr);
+        int lt = qn.indexOf('<');
+        return (lt >= 0 ? qn.substring(0, lt) : qn);
+    }
+
+
+    private CtPackage ensurePackage(String fqn) {
+        if (fqn == null || fqn.isEmpty()) {
+            // Spoon 10.x: use root package for the default package
+            return f.Package().getRootPackage();
+        }
+        return f.Package().getOrCreate(fqn);
     }
 
 
