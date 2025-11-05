@@ -47,6 +47,9 @@ public final class SpoonCollector {
         public final Set<String> ambiguousSimples = new LinkedHashSet<>();
         public final Map<String, Set<CtTypeReference<?>>> implementsPlans = new LinkedHashMap<>();
         public final java.util.Set<String> enumOwners = new java.util.LinkedHashSet<>();
+        // de.upb.sse.jess.stubbing.spoon.collector.CollectResult
+        public Map<String, String> unknownToConcrete = new java.util.HashMap<>();
+
 
 
     }
@@ -189,7 +192,7 @@ public final class SpoonCollector {
             }
         });
 
-
+        preferConcreteOverUnknown(result);
         return result;
     }
 
@@ -1453,18 +1456,42 @@ public final class SpoonCollector {
             }
 
             // 2) on-demand (star) imports, preserving order (excluding unknown)
-            List<String> starPkgs = starImportsInOrder(ctx);
-            List<String> nonUnknown = starPkgs.stream()
-                    .filter(p -> !"unknown".equals(p))
-                    .collect(java.util.stream.Collectors.toList());
-
-            if (nonUnknown.size() > 1 && cfg.isFailOnAmbiguity()) {
-                throw new AmbiguityException("Ambiguous simple type '" + simple + "' from on-demand imports: " + nonUnknown);
+            // Pseudocode close to your current block that decides owner for a simple type
+            List<String> starPkgs = starImportsInOrder(ctx);         // in source order
+            List<String> candidates = new ArrayList<>();
+            for (String p : starPkgs) {
+                if ("unknown".equals(p)) continue;                  // never create in unknown here
+                String fqn = p + "." + simple;
+                CtType<?> cttype = f.Type().get(fqn);
+                if (cttype != null) candidates.add(fqn);
             }
-            if (!nonUnknown.isEmpty()) {
-                addTypePlanIfNonJdk(out, nonUnknown.get(0) + "." + simple, TypeStubPlan.Kind.CLASS);
+
+// --- Case 1: resolution ambiguity (existing types)
+            if (candidates.size() > 1) {
+                if (cfg.isFailOnAmbiguity()) {
+                    throw new AmbiguityException("Ambiguous simple type '" + simple + "' from on-demand imports: " + candidates);
+                } else {
+                    out.ambiguousSimples.add(simple);
+                    // do NOT create anything here; your later qualify pass will handle it
+                    return;
+                }
+            }
+
+// --- Case 2: single existing type → use it
+            if (candidates.size() == 1) {
+                addTypePlanIfNonJdk(out, candidates.get(0), TypeStubPlan.Kind.CLASS);
                 return;
             }
+
+// --- Case 3: creation (doesn't exist anywhere) → first star-import package
+            for (String p : starPkgs) {
+                if ("unknown".equals(p)) continue;
+                if (isJdkPackage(p)) continue;                      // never create in JDK
+                String chosen = p + "." + simple;
+                addTypePlanIfNonJdk(out, chosen, TypeStubPlan.Kind.CLASS);
+                return;
+            }
+
 
             // 3) fallback to unknown.*
             addTypePlanIfNonJdk(out, "unknown." + simple, TypeStubPlan.Kind.CLASS);
@@ -2312,57 +2339,6 @@ public final class SpoonCollector {
     }
 
 
-    /**
-     * Heuristic: when owner is a type named like an enum (or the call-site uses enum helpers),
-     * we normalize enum utilities; this returns true for cases inside an enum body as well.
-     */
-
-
-    private boolean isStaticCallSite(CtInvocation<?> inv) {
-        // 1) Explicit TypeName.m(...) => static
-        if (inv.getTarget() instanceof CtTypeAccess<?>) return true;
-
-        // 2) Explicit super.m(...) is never static
-        if (inv.getTarget() instanceof CtSuperAccess<?>) return false;
-
-        // 3) Implicit target: look at surrounding static context
-        if (inv.getTarget() == null) {
-            // 3a) static import resolution
-            String name = inv.getExecutable() != null ? inv.getExecutable().getSimpleName() : null;
-            if (name != null) {
-                CtTypeReference<?> fromStatic = resolveOwnerFromStaticImports(inv, name);
-                if (fromStatic != null) return true;
-            }
-
-            // 3b) static field initializer?
-            CtField<?> fld = inv.getParent(CtField.class);
-            if (fld != null && fld.hasModifier(ModifierKind.STATIC)) return true;
-
-            // 3c) static initializer block? (Spoon 10.x uses CtAnonymousExecutable)
-            CtAnonymousExecutable block = inv.getParent(CtAnonymousExecutable.class);
-            if (block != null && block.hasModifier(ModifierKind.STATIC)) return true;
-
-            // 3d) static method?
-            CtMethod<?> m = inv.getParent(CtMethod.class);
-            if (m != null && m.hasModifier(ModifierKind.STATIC)) return true;
-
-            // 3e) ENUM FALLBACK:
-            // Inside an enum, a top-level initializer (incl. field init) is in the static init.
-            // If we're in an enum AND not in a non-static method body, consider it static.
-            CtEnum<?> en = inv.getParent(CtEnum.class);
-            if (en != null) {
-                CtMethod<?> enclosingMethod = inv.getParent(CtMethod.class);
-                if (enclosingMethod == null || enclosingMethod.hasModifier(ModifierKind.STATIC)) {
-                    return true;
-                }
-            }
-        }
-
-        // Otherwise: has a non-type target -> not static
-        return false;
-    }
-
-
     private CtTypeReference<?> deepComponentType(CtTypeReference<?> t) {
         while (t instanceof CtArrayTypeReference) {
             t = ((CtArrayTypeReference<?>) t).getComponentType();
@@ -2861,7 +2837,12 @@ public final class SpoonCollector {
 
             // ---- (2) Determine the referenced method name ----
             String name = (ex != null ? ex.getSimpleName() : null);
-            if (name == null || name.isEmpty()) name = "m";
+            String mrefText = String.valueOf(mref);
+
+// --- NEW: detect constructor method refs robustly ---
+            boolean isCtorRef =
+                    (name == null && mrefText != null && mrefText.contains("::new"))   // textual fallback
+                            || "new".equals(name) || "<init>".equals(name);
 
 // ---- (3) Choose owner correctly: static Type::m vs instance obj::m ----
             CtExpression<?> target = mref.getTarget();
@@ -2869,58 +2850,55 @@ public final class SpoonCollector {
             boolean isStatic = false;
 
             if (target instanceof CtTypeAccess<?>) {
-                // STATIC METHOD REF: Type::method
-                // -> force owner from the literal text to avoid Spoon pointing at the enclosing type.
-                String mrText = String.valueOf(mref);           // e.g., "A::inc" or "fixtures.mref2.A::inc"
-                int idx = (mrText != null ? mrText.indexOf("::") : -1);
-                if (idx > 0) {
-                    String left = mrText.substring(0, idx).trim();  // "A" or "fixtures.mref2.A"
-                    String curPkg = java.util.Optional.ofNullable(mref.getParent(CtType.class))
-                            .map(CtType::getPackage)
-                            .map(spoon.reflect.declaration.CtPackage::getQualifiedName)
-                            .orElse("");
-
-                    String forcedQN = left.contains(".") ? left : (curPkg.isEmpty() ? left : (curPkg + "." + left));
-                    ownerRef = f.Type().createReference(forcedQN);
-                    isStatic = true;
-
-                    // ensure the owner type exists (never generate JDK)
-                    if (!(forcedQN.startsWith("java.") || forcedQN.startsWith("javax.")
-                            || forcedQN.startsWith("jakarta.") || forcedQN.startsWith("sun.")
-                            || forcedQN.startsWith("jdk."))) {
-                        out.typePlans.add(new TypeStubPlan(forcedQN, TypeStubPlan.Kind.CLASS));
+                // For constructor refs, owner is exactly the LHS type
+                String forcedQN = null;
+                if (isCtorRef) {
+                    CtTypeReference<?> lhs = ((CtTypeAccess<?>) target).getAccessedType();
+                    ownerRef = chooseOwnerPackage(lhs, mref);
+                    isStatic = false; // ctors are never static
+                } else {
+                    // existing logic for static Type::method ...
+                    String mrText = mrefText;
+                    int idx = (mrText != null ? mrText.indexOf("::") : -1);
+                    if (idx > 0) {
+                        String left = mrText.substring(0, idx).trim();
+                        String curPkg = java.util.Optional.ofNullable(mref.getParent(CtType.class))
+                                .map(CtType::getPackage).map(CtPackage::getQualifiedName).orElse(null);
+                        forcedQN = (left.indexOf('.') >= 0 || curPkg == null ? left : curPkg + "." + left);
+                        ownerRef = f.Type().createReference(forcedQN);
+                        isStatic = true;
                     }
-                    System.out.println("[mref] static forced owner = " + forcedQN + "  (text=" + mrText + ")");
                 }
             } else {
                 // INSTANCE METHOD REF: obj::method
-                // -> use the TYPE of the target expression (e.g., for 'b::plus', target type is B)
                 CtTypeReference<?> objT = (target != null ? target.getType() : null);
-                ownerRef = chooseOwnerPackage(objT, mref); // resolves to fixtures.mref2.B
+                ownerRef = chooseOwnerPackage(objT, mref);
                 isStatic = false;
-
-                // Make sure the owner type exists if it’s not JDK
-                String ownerQn = safeQN(ownerRef);
-                if (ownerQn != null && !(ownerQn.startsWith("java.") || ownerQn.startsWith("javax.")
-                        || ownerQn.startsWith("jakarta.") || ownerQn.startsWith("sun.")
-                        || ownerQn.startsWith("jdk."))) {
-                    out.typePlans.add(new TypeStubPlan(ownerQn, TypeStubPlan.Kind.CLASS));
-                }
             }
 
+// If owner unresolved or JDK, bail
             if (ownerRef == null || isJdkType(ownerRef)) continue;
 
-// ---- (4) SAM shape (ret + params) and plan the referenced method on the owner ----
+// ---- (4) SAM shape (ret + params) ----
             var shape2 = samShapeOrDefault(fiType);
             CtTypeReference<?> samRet2 = shape2.getKey();
             List<CtTypeReference<?>> samParams2 = shape2.getValue();
 
+// --- NEW: plan CONSTRUCTOR for ::new, otherwise plan METHOD ---
+            if (isCtorRef) {
+                // Ensure owner type exists (non-JDK)
+                String ownerQn = safeQN(ownerRef);
+                if (ownerQn != null && !isJdkFqn(ownerQn)) {
+                    out.typePlans.add(new TypeStubPlan(ownerQn, TypeStubPlan.Kind.CLASS));
+                }
+                out.ctorPlans.add(new ConstructorStubPlan(ownerRef, samParams2));
+                continue; // do not add a method plan for ::new
+            }
+
+// Existing method plan path
             out.methodPlans.add(new MethodStubPlan(
-                    ownerRef,
-                    name,
-                    samRet2,
-                    samParams2,
-                    isStatic,                                 // <-- instance for obj::, static for Type::
+                    ownerRef, name, samRet2, samParams2,
+                    /*isStatic*/ isStatic,
                     MethodStubPlan.Visibility.PUBLIC,
                     java.util.Collections.emptyList(),
                     /*defaultOnInterface*/ false,
@@ -2929,6 +2907,49 @@ public final class SpoonCollector {
                     /*mirrorOwnerRef*/ null
             ));
 
+        }
+    }
+
+    // In SpoonCollector
+    private static String simpleNameOfFqn(String fqn) {
+        int i = fqn.lastIndexOf('.');
+        return i < 0 ? fqn : fqn.substring(i + 1);
+    }
+
+    /**
+     * If both unknown.Simple and some.pkg.Simple are scheduled, prefer the concrete type:
+     *  - drop the unknown.* plan
+     *  - record a rebind hint unknown.Simple -> some.pkg.Simple
+     */
+    private void preferConcreteOverUnknown(CollectResult out) {
+        if (out == null || out.typePlans == null || out.typePlans.isEmpty()) return;
+
+        // Find concrete winners keyed by simple name
+        java.util.Map<String, String> concreteBySimple = new java.util.HashMap<>();
+        for (TypeStubPlan p : out.typePlans) {
+            String qn = p.qualifiedName;
+            if (qn == null) continue;
+            if (!qn.startsWith("unknown.")) {
+                concreteBySimple.put(simpleNameOfFqn(qn), qn);
+            }
+        }
+        if (concreteBySimple.isEmpty()) return;
+
+        // Remove unknown.* twins
+        java.util.Iterator<TypeStubPlan> it = out.typePlans.iterator();
+        while (it.hasNext()) {
+            TypeStubPlan p = it.next();
+            String qn = p.qualifiedName;
+            if (qn == null || !qn.startsWith("unknown.")) continue;
+            String simple = simpleNameOfFqn(qn);
+            if (concreteBySimple.containsKey(simple)) {
+                it.remove();
+            }
+        }
+
+        // Publish rebind hints
+        for (java.util.Map.Entry<String, String> e : concreteBySimple.entrySet()) {
+            out.unknownToConcrete.put("unknown." + e.getKey(), e.getValue());
         }
     }
 

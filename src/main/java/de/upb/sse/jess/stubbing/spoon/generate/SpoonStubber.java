@@ -10,12 +10,8 @@ import spoon.reflect.reference.CtTypeReference;
 
 import spoon.reflect.declaration.CtType;
 import spoon.reflect.declaration.CtPackage;
-import spoon.reflect.visitor.filter.TypeFilter;
 
 import java.util.*;
-import java.util.concurrent.atomic.AtomicInteger;
-
-import static de.upb.sse.jess.stubbing.spoon.collector.SpoonCollector.safeQN;
 
 public final class SpoonStubber {
 
@@ -52,34 +48,41 @@ public final class SpoonStubber {
      *
      * @return number of newly created types
      */
-
     public int applyTypePlans(Collection<TypeStubPlan> plans) {
-        List<TypeStubPlan> ordered = new ArrayList<>(plans);
-        ordered.sort((a, b) -> {
-            boolean au = a.qualifiedName != null && a.qualifiedName.startsWith("unknown.");
-            boolean bu = b.qualifiedName != null && b.qualifiedName.startsWith("unknown.");
-            return (au == bu) ? 0 : (au ? 1 : -1);
-        });
-
         int created = 0;
-        for (TypeStubPlan p : ordered) {
-            String qn = p.qualifiedName;
-            if (qn != null && (qn.startsWith("java.")
-                    || qn.startsWith("javax.")
-                    || qn.startsWith("jakarta.")
-                    || qn.startsWith("sun.")
-                    || qn.startsWith("jdk."))) {
-                continue; // skip creating any JDK/Jakarta types
-            }
+        if (plans == null || plans.isEmpty()) return created;
 
-            if (ensureTypeExists(p)) {
+        // (1) collect simple names that have a non-unknown plan
+        java.util.Set<String> concretePlannedSimples = new java.util.HashSet<>();
+        for (TypeStubPlan p : plans) {
+            String qn = p.qualifiedName;
+            if (qn != null && !qn.startsWith("unknown.")) {
+                int dot = qn.lastIndexOf('.');
+                String simple = (dot < 0 ? qn : qn.substring(dot + 1));
+                concretePlannedSimples.add(simple);
                 created++;
-                // optional: debug
-                 System.out.println("[types] created " + p.qualifiedName);
             }
+        }
+
+        // (2) create types, skipping unknown twins
+        for (TypeStubPlan p : plans) {
+            String qn = p.qualifiedName;
+            if (qn == null) continue;
+            if (qn.startsWith("unknown.")) {
+                int dot = qn.lastIndexOf('.');
+                String simple = (dot < 0 ? qn : qn.substring(dot + 1));
+                if (concretePlannedSimples.contains(simple)) {
+                    continue; // do not create unknown.Simple when pkg.Simple is planned
+                }
+            }
+            ensureTypeExists(p);
+            created++;// your existing creator
         }
         return created;
     }
+
+
+
 
 
     /**
@@ -256,6 +259,10 @@ public final class SpoonStubber {
     public int applyFieldPlans(Collection<FieldStubPlan> plans) {
         int created = 0;
         for (FieldStubPlan p : plans) {
+
+            CtTypeReference<?> ownerRef = normalizeOwnerRef(p.ownerType);
+            if (ownerRef == null) continue;
+
             CtClass<?> owner = ensurePublicClass(p.ownerType);
             if (owner.getField(p.fieldName) != null) continue;
 
@@ -290,10 +297,11 @@ public final class SpoonStubber {
      */
     public int applyConstructorPlans(Collection<ConstructorStubPlan> plans) {
         int created = 0;
+        if (plans == null || plans.isEmpty()) return created;
         for (ConstructorStubPlan p : plans) {
-            String ownerFqn = p.ownerType.getQualifiedName();
-            CtClass<?> owner = ensurePublicClass(f.Type().createReference(ownerFqn));
 
+            CtTypeReference<?> ownerRef = normalizeOwnerRef(p.ownerType);
+            CtClass<?> owner = ensurePublicClass(ownerRef);
             // Normalize params first.
             List<CtTypeReference<?>> normParams = new ArrayList<>();
             for (CtTypeReference<?> t : p.parameterTypes) normParams.add(normalizeUnknownRef(t));
@@ -338,15 +346,14 @@ public final class SpoonStubber {
 
         for (MethodStubPlan p : plans) {
 
-            // Start from the plan’s declared owner (immutable in your plan class)
-            CtTypeReference<?> oref = p.ownerType;
-            CtTypeReference<?> normalizedOwnerRef = oref;
+
+            CtTypeReference<?> normalizedOwnerRef = normalizeOwnerRef(p.ownerType);;
 
             String oqn = null;
-            try { oqn = (oref != null ? oref.getQualifiedName() : null); } catch (Throwable ignored) {}
+            try { oqn = (normalizedOwnerRef != null ? normalizedOwnerRef.getQualifiedName() : null); } catch (Throwable ignored) {}
 
             if (oqn != null && oqn.startsWith("unknown.")) {
-                String simple = oref.getSimpleName();
+                String simple = normalizedOwnerRef.getSimpleName();
 
                 // (1) prefer an already-created concrete owner (same simple name)
                 CtTypeReference<?> concrete = null;
@@ -1432,25 +1439,6 @@ public final class SpoonStubber {
 
 
 
-
-
-    private String erasureFqn(CtTypeReference<?> tr) {
-        String qn = safeQN(tr);
-        int lt = qn.indexOf('<');
-        return (lt >= 0 ? qn.substring(0, lt) : qn);
-    }
-
-
-    private CtPackage ensurePackage(String fqn) {
-        if (fqn == null || fqn.isEmpty()) {
-            // unnamed/default package
-            CtPackage root = f.getModel().getRootPackage();
-            return root.getFactory().Package().getRootPackage(); // or simply root
-        }
-        // Spoon will create missing segments as needed:
-        return f.Package().getOrCreate(fqn);
-    }
-
     // After generation, rebind superclasses that still point at unknown.* to a concrete owner we created,
 // preferring the current package if available; otherwise keep as-is.
     public void rebindUnknownSupertypesToConcrete() {
@@ -1496,50 +1484,80 @@ public final class SpoonStubber {
         }
     }
 
-
-    public void rebindUnknownTypeReferencesToConcrete() {
-        // Build a map: SimpleName -> first concrete (non-unknown) FQN we have
-        Map<String, String> concreteBySimple = new LinkedHashMap<>();
-        for (CtType<?> t : f.getModel().getAllTypes()) {
-            CtPackage p = t.getPackage();
-            String pkg = (p == null ? "" : p.getQualifiedName());
-            if (!"unknown".equals(pkg)) {
-                concreteBySimple.putIfAbsent(t.getSimpleName(), t.getQualifiedName());
-            }
+    public void rebindUnknownTypeReferencesToConcrete(Map<String, String> unknownToConcrete) {
+        // Build a fallback index: simple name -> concrete FQN present in the model
+        Map<String, String> concreteBySimple = new HashMap<>();
+        for (CtType<?> t : model.getAllTypes()) {
+            String qn = safeQN(t.getReference());
+            if (qn == null || qn.startsWith("unknown.")) continue;
+            concreteBySimple.put(simpleNameOfFqn(qn), qn);
         }
 
-        // 1) fix CtTypeReference-qualified names that point at unknown.*
-        for (CtTypeReference<?> r : f.getModel().getElements(new TypeFilter<>(CtTypeReference.class))) {
-            String qn = safeQN(r);
-            if (qn == null || !qn.startsWith("unknown.")) continue;
-
-            String simple = r.getSimpleName();
-            String concreteFqn = concreteBySimple.get(simple);
-            if (concreteFqn == null) continue; // no concrete alternative -> keep
-
-            CtTypeReference<?> to = f.Type().createReference(concreteFqn);
-            r.replace(to);
-        }
-
-// 2) fix type-accesses: unknown.F::something etc.
-        for (CtTypeAccess<?> ta : f.getModel().getElements(new TypeFilter<>(CtTypeAccess.class))) {
-            CtTypeReference<?> tr = null;
-            try { tr = ta.getAccessedType(); } catch (Throwable ignored) {}
-            if (tr == null) continue;
-
+        // Visit every type reference and adjust package/simple name when a mapping exists
+        for (CtTypeReference<?> tr : model.getElements(new spoon.reflect.visitor.filter.TypeFilter<>(CtTypeReference.class))) {
             String qn = safeQN(tr);
             if (qn == null || !qn.startsWith("unknown.")) continue;
 
-            String simple = tr.getSimpleName();
-            String concreteFqn = concreteBySimple.get(simple);
-            if (concreteFqn == null) continue;
+            // 1) Primary mapping from Collector (unknownToConcrete)
+            String mapped = (unknownToConcrete != null ? unknownToConcrete.get(qn) : null);
 
-            CtTypeAccess<?> repl = f.Code().createTypeAccess(f.Type().createReference(concreteFqn));
-            ta.replace(repl);
+            // 2) Fallback: unique concrete by simple name
+            if (mapped == null) {
+                mapped = concreteBySimple.get(tr.getSimpleName());
+            }
+            if (mapped == null) continue; // nothing to rebind
+
+                String pkg = getPackageOfFqn(mapped);
+            String sn  = simpleNameOfFqn(mapped);
+
+            if (pkg.isEmpty()) {
+                tr.setPackage(null);
+            } else {
+                // Use the reference's own factory to get a package reference
+                spoon.reflect.reference.CtPackageReference pref =
+                        tr.getFactory().Package().getOrCreate(pkg).getReference();
+                tr.setPackage(pref);
+            }
+            tr.setSimpleName(sn);
         }
-
     }
 
+
+
+
+
+    private static String simpleNameOfFqn(String fqn) {
+        int i = (fqn == null ? -1 : fqn.lastIndexOf('.'));
+        return (i < 0 ? fqn : fqn.substring(i + 1));
+    }
+
+    private static String getPackageOfFqn(String fqn) {
+        int i = (fqn == null ? -1 : fqn.lastIndexOf('.'));
+        return (i <= 0 ? "" : fqn.substring(0, i));
+    }
+
+    /** Returns a concrete (non-unknown) type in the model with the given simple name, or null. */
+    private CtType<?> findConcreteBySimple(String simple) {
+        if (simple == null) return null;
+        for (CtType<?> t : model.getAllTypes()) {
+            String qn = safeQN(t.getReference());
+            if (qn == null || qn.startsWith("unknown.")) continue;
+            if (simple.equals(simpleNameOfFqn(qn))) return t;
+        }
+        return null;
+    }
+
+    private CtTypeReference<?> normalizeOwnerRef(CtTypeReference<?> ownerRef) {
+        if (ownerRef == null) return null;
+        String qn = safeQN(ownerRef);
+        if (qn != null && qn.startsWith("unknown.")) {
+            CtType<?> concrete = findConcreteBySimple(ownerRef.getSimpleName());
+            if (concrete != null) {
+                return concrete.getReference();
+            }
+        }
+        return ownerRef;
+    }
 
 
 
@@ -1607,7 +1625,7 @@ public final class SpoonStubber {
             return existing;
         }
         if (existing instanceof CtClass) {
-            // If we created this class in this run and it is still empty, replace it with an interface
+            // If we created this class in this run, and it is still empty, replace it with an interface
             String fqn = (pkgName.isEmpty() ? simple : pkgName + "." + simple);
             boolean weCreated = createdTypes.contains(fqn);
             boolean looksEmpty =

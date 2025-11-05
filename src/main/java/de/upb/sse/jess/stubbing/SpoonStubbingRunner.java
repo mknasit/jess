@@ -75,7 +75,8 @@ public final class SpoonStubbingRunner implements Stubber {
         stubber.applyImplementsPlans(plans.implementsPlans);
 
 
-        stubber.rebindUnknownTypeReferencesToConcrete();
+        //stubber.rebindUnknownTypeReferencesToConcrete();
+        stubber.rebindUnknownTypeReferencesToConcrete(plans.unknownToConcrete);
         stubber.removeUnknownStarImportsIfUnused();
        stubber.rebindUnknownSupertypesToConcrete();
         stubber.dequalifyCurrentPackageUnresolvedRefs();

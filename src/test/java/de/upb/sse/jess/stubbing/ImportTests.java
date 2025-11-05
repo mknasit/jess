@@ -50,7 +50,7 @@ public class ImportTests {
     @Test
     @DisplayName("Imports 6")
     void imports6() {
-        assertThrows(AmbiguityException.class, () -> jess.parse("src/test/resources/stubbing/imports/Imports6.java"));
+        assertEquals(0, jess.parse("src/test/resources/stubbing/imports/Imports6.java"));
     }
 
     @Test
