@@ -10,6 +10,7 @@ import spoon.reflect.reference.CtTypeReference;
 
 import spoon.reflect.declaration.CtType;
 import spoon.reflect.declaration.CtPackage;
+import spoon.reflect.visitor.filter.TypeFilter;
 
 import java.util.*;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -62,6 +63,15 @@ public final class SpoonStubber {
 
         int created = 0;
         for (TypeStubPlan p : ordered) {
+            String qn = p.qualifiedName;
+            if (qn != null && (qn.startsWith("java.")
+                    || qn.startsWith("javax.")
+                    || qn.startsWith("jakarta.")
+                    || qn.startsWith("sun.")
+                    || qn.startsWith("jdk."))) {
+                continue; // skip creating any JDK/Jakarta types
+            }
+
             if (ensureTypeExists(p)) {
                 created++;
                 // optional: debug
@@ -80,6 +90,13 @@ public final class SpoonStubber {
      */
     private boolean ensureTypeExists(TypeStubPlan p) {
         String qn = p.qualifiedName;
+        if (qn != null && (qn.startsWith("java.")
+                || qn.startsWith("javax.")
+                || qn.startsWith("jakarta.")
+                || qn.startsWith("sun.")
+                || qn.startsWith("jdk."))) {
+            return false;
+        }
         if (qn != null && qn.startsWith("unknown.")) {
             String simple = qn.substring(qn.lastIndexOf('.') + 1);
 
@@ -136,33 +153,17 @@ public final class SpoonStubber {
                 for (int i = 1; i < parts.length; i++) {
                     String simple = parts[i];
                     CtType<?> existing = parent.getNestedType(simple);
-                    if (existing == null) {
-                        CtType<?> created;
-                        switch (p.kind) {
-                            case INTERFACE:
-                                created = f.Interface().create(parent, simple);
-                                break;
-                            case ANNOTATION: {
-                                CtAnnotationType<?> at = f.Core().createAnnotationType();
-                                at.setSimpleName(simple);
-                                ((CtType<?>) parent).addNestedType(at);   // attach as nested
-                                at.addModifier(ModifierKind.PUBLIC);
-                                if (at.getMethods().stream().noneMatch(m -> "value".equals(m.getSimpleName()))) {
-                                    CtAnnotationMethod<?> am = f.Core().createAnnotationMethod();
-                                    am.setSimpleName("value");
-                                    am.setType(f.Type().STRING);
-                                    at.addMethod(am);
-                                }
-                                created = at;
-                                break;
-                            }
-
-                            default:
-                                created = f.Class().create((CtClass<?>) parent, simple);
+                    if (existing != null) {
+                        // Upgrade/downgrade if the existing kind is wrong
+                        if (p.kind == TypeStubPlan.Kind.INTERFACE && existing instanceof CtClass) {
+                            existing.delete();
+                        } else if (p.kind == TypeStubPlan.Kind.CLASS && existing instanceof CtInterface) {
+                            existing.delete();
+                        } else if (p.kind == TypeStubPlan.Kind.ANNOTATION && !(existing instanceof CtAnnotationType)) {
+                            existing.delete();
+                        } else {
+                            return false;
                         }
-                        created.addModifier(ModifierKind.PUBLIC);
-                        parent = created;
-                        createdTypes.add(qn); // record once; harmless if repeated
                     } else {
                         parent = existing;
                     }
@@ -476,34 +477,6 @@ public final class SpoonStubber {
                 m.removeModifier(ModifierKind.ABSTRACT);
             }
 
-//            // 8) foreach glue: Iterable if iterator() is created (keep your logic)
-//            if ("iterator".equals(p.name) && p.paramTypes.isEmpty()) {
-//                CtTypeReference<?> rtForIterable = rt0;
-//                String rtQN = safeQN(rtForIterable);
-//                if (rtQN.startsWith("java.util.Iterator")) {
-//                    CtTypeReference<?> iterableRef = f.Type().createReference("java.lang.Iterable");
-//                    try {
-//                        List<CtTypeReference<?>> args = rtForIterable.getActualTypeArguments();
-//                        if (args != null && !args.isEmpty() && args.get(0) != null) {
-//                            iterableRef.addActualTypeArgument(args.get(0));
-//                        }
-//                    } catch (Throwable ignored) {
-//                    }
-//                    boolean already = false;
-//                    try {
-//                        for (CtTypeReference<?> si : owner.getSuperInterfaces()) {
-//                            if (safeQN(si).startsWith("java.lang.Iterable")) {
-//                                already = true;
-//                                break;
-//                            }
-//                        }
-//                    } catch (Throwable ignored) {
-//                    }
-//                    if (!already) owner.addSuperInterface(iterableRef);
-//                    ensureImport(owner, iterableRef);
-//                    ensureImport(owner, rt0);
-//                }
-//            }
 
             // 9) imports for owner
             boolean usesUnknown =
@@ -1279,53 +1252,184 @@ public final class SpoonStubber {
         }
     }
 
-
     public void applyImplementsPlans(Map<String, Set<CtTypeReference<?>>> plans) {
-        if (plans == null) return;
+        if (plans == null || plans.isEmpty()) return;
 
         for (var e : plans.entrySet()) {
             String ownerFqn = e.getKey();
-            CtType<?> owner = f.Type().get(ownerFqn);
+            if (ownerFqn == null || ownerFqn.isEmpty()) continue;
+
+            // always create/fetch the owner only (never the interface type)
+            CtType<?> owner = ensurePublicOwnerForFqn(ownerFqn);
             if (owner == null) continue;
 
-            for (CtTypeReference<?> si : e.getValue()) {
-                if (si == null) continue;
+            Set<CtTypeReference<?>> ifaces = e.getValue();
+            if (ifaces == null || ifaces.isEmpty()) continue;
 
-                String tErasure = erasureFqn(si); // your existing erasure helper
+            for (CtTypeReference<?> ifaceRef : ifaces) {
+                if (ifaceRef == null) continue;
 
-                CtType<?> target = f.Type().get(tErasure);
-                if (target == null) {
-                    // create interface stub (NEVER a class)
-                    int dot = tErasure.lastIndexOf('.');
-                    String pkg = (dot >= 0 ? tErasure.substring(0, dot) : "");
-                    String sn  = (dot >= 0 ? tErasure.substring(dot + 1) : tErasure);
+                String iqn = safeQN(ifaceRef);
+                if (iqn == null || iqn.isEmpty()) continue;
 
-                    CtPackage p = ensurePackage(pkg); // your existing ensurePackage; if not, see minimal impl below
-                    target = f.Interface().create(p, sn);
-                } else if (target instanceof CtClass) {
-                    // upgrade: replace the class with an interface of the same FQN
-                    String tErasureFqn = target.getQualifiedName();
-                    int dot = tErasureFqn.lastIndexOf('.');
-                    String pkg = (dot >= 0 ? tErasureFqn.substring(0, dot) : "");
-                    String sn  = (dot >= 0 ? tErasureFqn.substring(dot + 1) : tErasureFqn);
-
-                    CtPackage p = (target.getParent() instanceof CtPackage)
-                            ? (CtPackage) target.getParent()
-                            : ensurePackage(pkg);
-                    target.delete();
-                    target = f.Interface().create(p, sn);
+                // 1) Never create or upgrade JDK/Jakarta/etc. interfaces – just reference them
+                if (isJdkFqn(iqn)) {
+                    CtTypeReference<?> jref = f.Type().createReference(iqn);
+                    // dedupe by erasure/simple name
+                    boolean exists = owner.getSuperInterfaces().stream()
+                            .anyMatch(cur -> cur != null && cur.getSimpleName().equals(jref.getSimpleName()));
+                    if (!exists) owner.addSuperInterface(jref);
+                    continue;
                 }
 
-                // Attach if not already present (dedupe by erasure)
-                String tErasureFqn = target.getQualifiedName();
+                // 2) Non-JDK: prefer an existing interface if present
+                CtType<?> existing = f.Type().get(iqn);
+                CtTypeReference<?> toAttach;
+
+                if (existing instanceof CtInterface) {
+                    toAttach = existing.getReference();
+                } else if (existing instanceof CtClass) {
+                    // Only convert if it’s one of OUR fresh empty stubs
+                    boolean weCreated = createdTypes.contains(existing.getQualifiedName());
+                    boolean looksEmpty =
+                            ((CtClass<?>) existing).getFields().isEmpty()
+                                    && ((CtClass<?>) existing).getConstructors().isEmpty()
+                                    && ((CtClass<?>) existing).getMethods().isEmpty()
+                                    && existing.getNestedTypes().isEmpty();
+
+                    if (weCreated && looksEmpty) {
+                        // replace class with interface of same FQN
+                        String qn = existing.getQualifiedName();
+                        int dot = qn.lastIndexOf('.');
+                        String pkg = (dot >= 0 ? qn.substring(0, dot) : "");
+                        String sn  = (dot >= 0 ? qn.substring(dot + 1) : qn);
+                        CtPackage p = (existing.getParent() instanceof CtPackage)
+                                ? (CtPackage) existing.getParent()
+                                : f.Package().getOrCreate(pkg);
+                        existing.delete();
+                        CtInterface<?> itf = f.Interface().create(p, sn);
+                        itf.addModifier(ModifierKind.PUBLIC);
+                        createdTypes.add(itf.getQualifiedName());
+                        toAttach = itf.getReference();
+                    } else {
+                        // don’t mutate user code – just attach a reference (javac will complain if needed)
+                        toAttach = existing.getReference();
+                    }
+                } else {
+                    // 3) Not present → create a new interface (non-JDK)
+                    int dot = iqn.lastIndexOf('.');
+                    String pkg = (dot >= 0 ? iqn.substring(0, dot) : "");
+                    String sn  = (dot >= 0 ? iqn.substring(dot + 1) : iqn);
+                    CtPackage p = f.Package().getOrCreate(pkg);
+                    CtInterface<?> itf = f.Interface().create(p, sn);
+                    itf.addModifier(ModifierKind.PUBLIC);
+                    createdTypes.add(itf.getQualifiedName());
+                    toAttach = itf.getReference();
+                }
+
+                // 4) attach if not already present (dedupe by erasure/simple)
                 boolean exists = owner.getSuperInterfaces().stream()
-                        .anyMatch(cur -> erasureFqn(cur).equals(tErasureFqn));
-                if (!exists) {
-                    owner.addSuperInterface(target.getReference());
-                }
+                        .anyMatch(cur -> cur != null && cur.getSimpleName().equals(toAttach.getSimpleName()));
+                if (!exists) owner.addSuperInterface(toAttach);
             }
         }
     }
+
+
+
+
+
+    // --- in SpoonStubber --------------------------------------------------------
+
+    /** Return the CtType for the given FQN, creating it (public) if needed.
+     *  Supports member types written as pkg.Outer$Inner$Deeper.
+     *  Never creates types under java.* / javax.* / jakarta.* / sun.* / jdk.*.
+     */
+    // Spoon 10.4.2–compatible
+    private CtType<?> ensurePublicOwnerForFqn(String fqn) {
+        if (fqn == null || fqn.isEmpty()) return null;
+        if (isJdkFqn(fqn)) return f.Type().get(fqn); // never create JDK types
+
+        // Already exists?
+        CtType<?> existing = f.Type().get(fqn);
+        if (existing != null) {
+            if (!existing.hasModifier(ModifierKind.PUBLIC)) existing.addModifier(ModifierKind.PUBLIC);
+            return existing;
+        }
+
+        // Split pkg + after-pkg (may contain $ for members)
+        final int lastDot = fqn.lastIndexOf('.');
+        final String pkgName  = (lastDot >= 0 ? fqn.substring(0, lastDot) : "");
+        final String afterPkg = (lastDot >= 0 ? fqn.substring(lastDot + 1) : fqn);
+
+        // No member part → top-level
+        if (!afterPkg.contains("$")) {
+            CtPackage p = f.Package().getOrCreate(pkgName);
+            CtType<?> t = p.getType(afterPkg);              // <-- lookup in package (Spoon 10)
+            if (t == null) {
+                CtClass<?> c = f.Class().create(p, afterPkg); // <-- create in package (Spoon 10)
+                c.addModifier(ModifierKind.PUBLIC);
+                createdTypes.add(c.getQualifiedName());
+                return c;
+            } else {
+                if (!t.hasModifier(ModifierKind.PUBLIC)) t.addModifier(ModifierKind.PUBLIC);
+                return t;
+            }
+        }
+
+        // Member chain: Outer$Inner$Deeper…
+        String[] parts = afterPkg.split("\\$");
+
+        // 1) ensure top-level Outer
+        String topFqn = (pkgName.isEmpty() ? parts[0] : pkgName + "." + parts[0]);
+        CtType<?> top = f.Type().get(topFqn);
+        if (top == null) {
+            CtPackage p = f.Package().getOrCreate(pkgName);
+            CtClass<?> c = f.Class().create(p, parts[0]);
+            c.addModifier(ModifierKind.PUBLIC);
+            createdTypes.add(c.getQualifiedName());
+            top = c;
+        } else if (!top.hasModifier(ModifierKind.PUBLIC)) {
+            top.addModifier(ModifierKind.PUBLIC);
+        }
+
+        // 2) walk/create nested parts under parent
+        CtType<?> parent = top;
+        for (int i = 1; i < parts.length; i++) {
+            String simple = parts[i];
+            CtType<?> nested = parent.getNestedType(simple);
+            if (nested == null) {
+                // Create a nested *class* by default (safe for stubs)
+                CtClass<?> cls;
+                if (parent instanceof CtClass) {
+                    cls = f.Class().create((CtClass<?>) parent, simple);
+                } else {
+                    // Parent might be interface/annotation/enum – attach via Core + addNestedType
+                    cls = f.Core().createClass();
+                    cls.setSimpleName(simple);
+                    ((CtType<?>) parent).addNestedType(cls);
+                }
+                cls.addModifier(ModifierKind.PUBLIC);
+                cls.removeModifier(ModifierKind.STATIC); // default non-static
+                nested = cls;
+                createdTypes.add(nested.getQualifiedName());
+            } else if (!nested.hasModifier(ModifierKind.PUBLIC)) {
+                nested.addModifier(ModifierKind.PUBLIC);
+            }
+            parent = nested;
+        }
+        return parent;
+    }
+
+    // already in your class or add it if missing
+    private static boolean isJdkFqn(String qn) {
+        return qn != null && (qn.startsWith("java.")
+                || qn.startsWith("javax.")
+                || qn.startsWith("jakarta.")
+                || qn.startsWith("sun.")
+                || qn.startsWith("jdk."));
+    }
+
 
 
 
@@ -1394,65 +1498,48 @@ public final class SpoonStubber {
 
 
     public void rebindUnknownTypeReferencesToConcrete() {
-        CtModel model = f.getModel();
-
-        // simple -> one concrete FQN we created this run
-        java.util.Map<String, String> concreteBySimple = new java.util.HashMap<>();
-        for (String fq : createdTypes) {
-            if (fq == null || fq.startsWith("unknown.")) continue;
-            String simple = fq.contains("$")
-                    ? fq.substring(fq.lastIndexOf('$') + 1)
-                    : fq.substring(fq.lastIndexOf('.') + 1);
-            concreteBySimple.putIfAbsent(simple, fq);
-        }
-        System.out.println("[rebind] concrete map = " + concreteBySimple);
-
-        AtomicInteger changes = new AtomicInteger();
-
-        for (CtType<?> owner : model.getAllTypes()) {
-            final String ownerPkg = java.util.Optional.ofNullable(owner.getPackage())
-                    .map(CtPackage::getQualifiedName)
-                    .orElse("");
-
-            owner.getElements(e -> e instanceof CtTypeReference<?>).forEach(el -> {
-                CtTypeReference<?> ref = (CtTypeReference<?>) el;
-
-                // Drill down to the *base component type* if this is an array
-                CtTypeReference<?> base = ref;
-                while (base instanceof spoon.reflect.reference.CtArrayTypeReference) {
-                    base = ((spoon.reflect.reference.CtArrayTypeReference<?>) base).getComponentType();
-                }
-
-                String qn;
-                try { qn = base.getQualifiedName(); } catch (Throwable t) { qn = null; }
-                if (qn == null || !qn.startsWith("unknown.")) return;
-
-                String simple = base.getSimpleName();
-
-                // 1) Prefer a concrete we generated (e.g., from star-import owner choice)
-                String concreteFqn = concreteBySimple.get(simple);
-                if (concreteFqn != null) {
-                    CtTypeReference<?> newRef = f.Type().createReference(concreteFqn);
-                    base.setPackage(newRef.getPackage());    // CtPackageReference
-                    base.setSimpleName(newRef.getSimpleName());
-                    changes.getAndIncrement();
-                    return;
-                }
-
-                // 2) Otherwise, fall back to current CU package
-                if (!ownerPkg.isEmpty()) {
-                    CtTypeReference<?> newRef = f.Type().createReference(ownerPkg + "." + simple);
-                    base.setPackage(newRef.getPackage());
-                    base.setSimpleName(newRef.getSimpleName());
-                    changes.getAndIncrement();
-                }
-            });
+        // Build a map: SimpleName -> first concrete (non-unknown) FQN we have
+        Map<String, String> concreteBySimple = new LinkedHashMap<>();
+        for (CtType<?> t : f.getModel().getAllTypes()) {
+            CtPackage p = t.getPackage();
+            String pkg = (p == null ? "" : p.getQualifiedName());
+            if (!"unknown".equals(pkg)) {
+                concreteBySimple.putIfAbsent(t.getSimpleName(), t.getQualifiedName());
+            }
         }
 
-        if (changes.get() > 0) {
-            System.out.println("[rebind] replaced " + changes + " unknown.* type refs (arrays supported)");
+        // 1) fix CtTypeReference-qualified names that point at unknown.*
+        for (CtTypeReference<?> r : f.getModel().getElements(new TypeFilter<>(CtTypeReference.class))) {
+            String qn = safeQN(r);
+            if (qn == null || !qn.startsWith("unknown.")) continue;
+
+            String simple = r.getSimpleName();
+            String concreteFqn = concreteBySimple.get(simple);
+            if (concreteFqn == null) continue; // no concrete alternative -> keep
+
+            CtTypeReference<?> to = f.Type().createReference(concreteFqn);
+            r.replace(to);
         }
+
+// 2) fix type-accesses: unknown.F::something etc.
+        for (CtTypeAccess<?> ta : f.getModel().getElements(new TypeFilter<>(CtTypeAccess.class))) {
+            CtTypeReference<?> tr = null;
+            try { tr = ta.getAccessedType(); } catch (Throwable ignored) {}
+            if (tr == null) continue;
+
+            String qn = safeQN(tr);
+            if (qn == null || !qn.startsWith("unknown.")) continue;
+
+            String simple = tr.getSimpleName();
+            String concreteFqn = concreteBySimple.get(simple);
+            if (concreteFqn == null) continue;
+
+            CtTypeAccess<?> repl = f.Code().createTypeAccess(f.Type().createReference(concreteFqn));
+            ta.replace(repl);
+        }
+
     }
+
 
 
 

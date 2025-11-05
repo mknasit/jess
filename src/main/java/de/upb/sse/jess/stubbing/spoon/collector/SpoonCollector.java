@@ -122,10 +122,10 @@ public final class SpoonCollector {
         rebindUnknownHomonyms(model,result);
         // --- order matters only for readability; each pass is independent ---
         collectTryWithResources(model, result);
-        collectMethodReferences(model, result);
         collectUnresolvedFields(model, result);
         collectUnresolvedCtorCalls(model, result);
         collectUnresolvedMethodCalls(model, result);
+        collectMethodReferences(model, result);
         collectUnresolvedAnnotations(model, result);
 
         collectExceptionTypes(model, result);
@@ -207,6 +207,18 @@ public final class SpoonCollector {
         });
 
         for (CtFieldAccess<?> fa : unresolved) {
+            if (fa.getParent(spoon.reflect.code.CtExecutableReferenceExpression.class) != null) {
+                continue; // In A::inc the 'A' token isn't a field; it's a type name
+            }
+            String simple = null;
+            try { simple = fa.getVariable().getSimpleName(); } catch (Throwable ignored) {}
+            if (simple != null) {
+                boolean looksTypeish = Character.isUpperCase(simple.charAt(0));
+                if (looksTypeish && isTypeVisibleInScope(fa, simple)) {
+                    // It's almost certainly a type token that got misclassified as a field
+                    continue;
+                }
+            }
             // Ignore class-literals like Foo.class (modeled as a field 'class').
             String vname = (fa.getVariable() != null ? fa.getVariable().getSimpleName() : null);
             if ("class".equals(vname) && fa.getTarget() instanceof CtTypeAccess) continue;
@@ -237,8 +249,8 @@ public final class SpoonCollector {
             if (fieldType == null) {
                 if (cfg.isFailOnAmbiguity()) {
                     String ownerQN = ownerRef != null ? ownerRef.getQualifiedName() : "<unknown>";
-                    String simple = (fa.getVariable() != null ? fa.getVariable().getSimpleName() : "<missing>");
-                   throw new AmbiguityException("Ambiguous field (no usable type context): " + ownerQN + "#" + simple);
+                    String simplename = (fa.getVariable() != null ? fa.getVariable().getSimpleName() : "<missing>");
+                   throw new AmbiguityException("Ambiguous field (no usable type context): " + ownerQN + "#" + simplename);
                 }
                 fieldType = f.Type().createReference(UNKNOWN_TYPE_FQN);
             }
@@ -246,6 +258,37 @@ public final class SpoonCollector {
             out.fieldPlans.add(new FieldStubPlan(ownerRef, fieldName, fieldType, isStatic));
         }
     }
+
+    private boolean isTypeVisibleInScope(CtElement ctx, String simple) {
+        if (simple == null || simple.isEmpty()) return false;
+        final CtModel model = f.getModel();
+
+        // 1) type exists in the model (non-unknown)
+        boolean existsInModel = model.getAllTypes().stream().anyMatch(t ->
+                simple.equals(t.getSimpleName())
+                        && t.getPackage() != null
+                        && !"unknown".equals(t.getPackage().getQualifiedName())
+        );
+        if (existsInModel) return true;
+
+        // 2) type with same simple name exists in the current CU's package
+        try {
+            CtType<?> host = ctx.getParent(CtType.class);
+            if (host != null && host.getPackage() != null) {
+                String curPkg = host.getPackage().getQualifiedName();
+                boolean inPkg = model.getAllTypes().stream().anyMatch(t ->
+                        simple.equals(t.getSimpleName())
+                                && t.getPackage() != null
+                                && curPkg.equals(t.getPackage().getQualifiedName())
+                );
+                if (inPkg) return true;
+            }
+        } catch (Throwable ignored) {}
+
+        return false;
+    }
+
+
 
     /**
      * Returns true when a field access is used as a bare statement, e.g., {@code x.f;}.
@@ -488,8 +531,9 @@ public final class SpoonCollector {
                     }
 
                     // plan types + ctor
-                    out.typePlans.add(new TypeStubPlan(outerFqn, TypeStubPlan.Kind.CLASS));
-                    out.typePlans.add(new TypeStubPlan(outerFqn + "$" + innerSimple, TypeStubPlan.Kind.CLASS));
+                    addTypePlanIfNonJdk(out, outerFqn, TypeStubPlan.Kind.CLASS);
+                    addTypePlanIfNonJdk(out, outerFqn + "$" + innerSimple, TypeStubPlan.Kind.CLASS);
+
                     out.ctorPlans.add(new ConstructorStubPlan(memberOwner, ps));
                     // do NOT fall through to generic path
                     continue;
@@ -1327,7 +1371,7 @@ public final class SpoonCollector {
                     CtTypeReference<?> t = ex.getType();
                     if (t != null && !isJdkType(t) && t.getDeclaration() == null) {
                         CtTypeReference<?> owner = chooseOwnerPackage(t, thr);
-                        out.typePlans.add(new TypeStubPlan(owner.getQualifiedName(), TypeStubPlan.Kind.CLASS));
+                        addTypePlanIfNonJdk(out, owner.getQualifiedName(), TypeStubPlan.Kind.CLASS);
                         out.ctorPlans.add(new ConstructorStubPlan(owner, Collections.emptyList()));
                     }
                 } catch (Throwable ignored) {
@@ -1404,7 +1448,7 @@ public final class SpoonCollector {
             // 1) explicit single-type import wins
             CtTypeReference<?> explicit = resolveFromExplicitTypeImports(ctx, simple);
             if (explicit != null) {
-                out.typePlans.add(new TypeStubPlan(explicit.getQualifiedName(), TypeStubPlan.Kind.CLASS));
+                addTypePlanIfNonJdk(out, explicit.getQualifiedName(), TypeStubPlan.Kind.CLASS);
                 return;
             }
 
@@ -1418,18 +1462,18 @@ public final class SpoonCollector {
                 throw new AmbiguityException("Ambiguous simple type '" + simple + "' from on-demand imports: " + nonUnknown);
             }
             if (!nonUnknown.isEmpty()) {
-                out.typePlans.add(new TypeStubPlan(nonUnknown.get(0) + "." + simple, TypeStubPlan.Kind.CLASS));
+                addTypePlanIfNonJdk(out, nonUnknown.get(0) + "." + simple, TypeStubPlan.Kind.CLASS);
                 return;
             }
 
             // 3) fallback to unknown.*
-            out.typePlans.add(new TypeStubPlan("unknown." + simple, TypeStubPlan.Kind.CLASS));
+            addTypePlanIfNonJdk(out, "unknown." + simple, TypeStubPlan.Kind.CLASS);
             return;
         }
 
         // ---- FQN branch ---------------------------------------------------------
         // Non-JDK and unresolved → plan its qualified name as-is.
-        out.typePlans.add(new TypeStubPlan(qn, TypeStubPlan.Kind.CLASS));
+        addTypePlanIfNonJdk(out, qn, TypeStubPlan.Kind.CLASS);
     }
 
 
@@ -1472,7 +1516,7 @@ public final class SpoonCollector {
             }
 
             for (String pkg : starPkgs) {
-                out.typePlans.add(new TypeStubPlan(pkg + ".PackageAnchor", TypeStubPlan.Kind.CLASS));
+                addTypePlanIfNonJdk(out, pkg + ".PackageAnchor", TypeStubPlan.Kind.CLASS);
             }
         });
     }
@@ -2536,115 +2580,6 @@ public final class SpoonCollector {
 
 
 
-    private void collectMethodReferences(CtModel model, CollectResult out) {
-        for (spoon.reflect.code.CtExecutableReferenceExpression<?, ?> mr
-                : model.getElements(new spoon.reflect.visitor.filter.TypeFilter<>(spoon.reflect.code.CtExecutableReferenceExpression.class))) {
-
-            var exec = mr.getExecutable();
-            if (exec == null) continue;
-
-            boolean isCtor = false;
-            try { isCtor = exec.isConstructor(); } catch (Throwable ignored) {}
-
-            // Infer FI from the assignment/var type if available
-            CtTypeReference<?> fiType = null;
-            try { fiType = mr.getType(); } catch (Throwable ignored) {}
-            if (fiType == null) {
-                CtVariable<?> v = mr.getParent(CtVariable.class);
-                if (v != null) fiType = v.getType();
-            }
-
-            // If FI is non-JDK, ensure it's an INTERFACE + define a SAM 'apply'
-            if (fiType != null && !isJdkType(fiType)) {
-                String fiErasure = erasureFqn(fiType);
-                out.typePlans.add(new TypeStubPlan(fiErasure, TypeStubPlan.Kind.INTERFACE));
-
-                // Default SAM signature; adjust if you have better inference
-                java.util.List<CtTypeReference<?>> params = java.util.List.of(f.Type().createReference("int"));
-                CtTypeReference<?> ret = f.Type().createReference("int");
-
-                // For array ctor refs, we'll override below
-                out.methodPlans.add(new MethodStubPlan(
-                        f.Type().createReference(fiErasure),
-                        "apply", // or "make" if you prefer; stick to "apply" consistently
-                        ret, params,
-                        false, MethodStubPlan.Visibility.PUBLIC,
-                        java.util.Collections.emptyList(),
-                        /* defaultOnIface */ true,
-                        false, false, null
-                ));
-            }
-
-            // Analyze the target to find the owner
-            CtExpression<?> target = mr.getTarget();
-            CtTypeReference<?> ownerRef = null;
-
-            if (target instanceof CtTypeAccess) {
-                ownerRef = ((CtTypeAccess<?>) target).getAccessedType();
-            } else if (target != null) {
-                try { ownerRef = target.getType(); } catch (Throwable ignored) {}
-            }
-
-            // Array ctor reference: String[]::new
-            boolean isArrayCtor = false;
-            CtArrayTypeReference<?> arrType = null;
-            if (target instanceof CtTypeAccess) {
-                CtTypeReference<?> acc = ((CtTypeAccess<?>) target).getAccessedType();
-                if (acc instanceof CtArrayTypeReference) {
-                    isArrayCtor = true;
-                    arrType = (CtArrayTypeReference<?>) acc;
-                }
-            }
-
-
-            if (isArrayCtor) {
-                // Fix SAM to be make(int)->component[] (or keep 'apply', but ensure signature)
-                if (fiType != null && !isJdkType(fiType)) {
-                    String fiErasure = erasureFqn(fiType);
-                    // replace/ensure SAM as: make(int) -> array
-                    out.methodPlans.add(new MethodStubPlan(
-                            f.Type().createReference(fiErasure),
-                            "make",
-                            arrType.clone(),
-                            java.util.List.of(f.Type().INTEGER_PRIMITIVE),
-                            false, MethodStubPlan.Visibility.PUBLIC,
-                            java.util.Collections.emptyList(),
-                            /* defaultOnIface */ true,
-                            false, false, null
-                    ));
-                }
-                continue; // nothing to add on an owner for array ctor
-            }
-
-            // Normal method/ctor owner
-            CtTypeReference<?> owner = ownerRef != null ? chooseOwnerPackage(ownerRef, mr) : null;
-            if (owner == null || isJdkType(owner)) continue;
-
-            if (isCtor) {
-                // A::new — ensure a no-arg ctor (good enough for the tests you showed)
-                out.ctorPlans.add(new ConstructorStubPlan(owner, java.util.Collections.emptyList()));
-            } else {
-                // A::inc or obj::plus
-                String name = exec.getSimpleName();
-                boolean isStatic = false;
-                try { isStatic = exec.isStatic(); } catch (Throwable ignored) {}
-
-                // Default int->int; if you have better inference, substitute here
-                java.util.List<CtTypeReference<?>> params = java.util.List.of(f.Type().createReference("int"));
-                CtTypeReference<?> ret = f.Type().createReference("int");
-
-                out.methodPlans.add(new MethodStubPlan(
-                        owner, name, ret, params,
-                        isStatic, MethodStubPlan.Visibility.PUBLIC,
-                        java.util.Collections.emptyList(),
-                        /* defaultOnIface */ false,
-                        false, false, null
-                ));
-            }
-        }
-    }
-
-
 
     private void collectTryWithResources(CtModel model, CollectResult out) {
         for (CtTry twr : model.getElements(new spoon.reflect.visitor.filter.TypeFilter<>(CtTry.class))) {
@@ -2824,6 +2759,179 @@ public final class SpoonCollector {
             }
         });
     }
+
+
+    private void addTypePlanIfNonJdk(CollectResult out, String fqn, TypeStubPlan.Kind kind) {
+        if (fqn == null || fqn.isEmpty()) return;
+        if (isJdkFqn(fqn)) return;
+        out.typePlans.add(new TypeStubPlan(fqn, kind));
+    }
+
+
+    private static boolean isJdkFqn(String qn) {
+        return qn != null && (qn.startsWith("java.")
+                || qn.startsWith("javax.")
+                || qn.startsWith("jakarta.")
+                || qn.startsWith("sun.")
+                || qn.startsWith("jdk."));
+    }
+
+    // Return (ret, params) shape from FI type if we have it; otherwise default to (int -> int)
+    // Return (ret, params) from FI if declared; otherwise default to (int -> int)
+    private Map.Entry<CtTypeReference<?>, List<CtTypeReference<?>>> samShapeOrDefault(CtTypeReference<?> fiRef) {
+        try {
+            CtType<?> decl = (fiRef != null ? fiRef.getTypeDeclaration() : null);
+            if (decl instanceof CtInterface) {
+                CtMethod<?> sam = decl.getMethods().stream()
+                        .filter(m -> {
+                            try {
+                                boolean isStatic = m.hasModifier(ModifierKind.STATIC);
+                                boolean isAbstract = m.isAbstract() || m.getBody() == null;
+                                return !isStatic && isAbstract;
+                            } catch (Throwable ignored) {
+                                return m.getBody() == null; // fallback
+                            }
+                        })
+                        .findFirst().orElse(null);
+
+                if (sam != null) {
+                    CtTypeReference<?> ret = (sam.getType() != null ? sam.getType() : f.Type().VOID_PRIMITIVE);
+                    @SuppressWarnings("unchecked")
+                    List<CtTypeReference<?>> ps = (List<CtTypeReference<?>>) (List<?>) sam.getParameters().stream()
+                            .map(CtParameter::getType)
+                            .collect(java.util.stream.Collectors.toList());
+                    return Map.entry(ret, ps);
+                }
+            }
+        } catch (Throwable ignored) {
+            // fall through to default
+        }
+        // default: int -> int
+        return Map.entry(f.Type().INTEGER_PRIMITIVE, java.util.List.of(f.Type().INTEGER_PRIMITIVE));
+    }
+
+
+    private void collectMethodReferences(CtModel model, CollectResult out) {
+        List<CtExecutableReferenceExpression<?, ?>> mrefs =
+                model.getElements(new TypeFilter<>(CtExecutableReferenceExpression.class));
+
+        for (CtExecutableReferenceExpression<?, ?> mref : mrefs) {
+            CtExecutableReference<?> ex = mref.getExecutable();
+            if (ex != null && ex.getDeclaration() != null) continue; // resolved already
+
+            // ---- (0) Determine FI type (prefer LHS local var if Spoon gave unknown) ----
+            CtTypeReference<?> fiType = mref.getType();
+            String fiQn = safeQN(fiType);
+            if (fiType == null || fiQn == null || fiQn.startsWith("unknown.")) {
+                CtLocalVariable<?> lv = mref.getParent(CtLocalVariable.class);
+                if (lv != null && lv.getType() != null) {
+                    fiType = chooseOwnerPackage(lv.getType(), mref);
+                    fiQn = safeQN(fiType);
+                }
+            }
+            // If still unknown, keep going; we’ll at least fix the owner of the reference.
+
+            // ---- (1) Ensure FI exists as an INTERFACE (never a class) + stub SAM ----
+            if (fiQn != null
+                    && !(fiQn.startsWith("java.") || fiQn.startsWith("javax.") ||
+                    fiQn.startsWith("jakarta.") || fiQn.startsWith("sun.")  ||
+                    fiQn.startsWith("jdk."))) {
+                out.typePlans.add(new TypeStubPlan(fiQn, TypeStubPlan.Kind.INTERFACE));
+
+                // Figure out SAM (return + params) with your helper
+                var shape = samShapeOrDefault(fiType); // Pair<ret, List<params>>
+                CtTypeReference<?> samRet = shape.getKey();
+                List<CtTypeReference<?>> samParams = shape.getValue();
+
+                // Stub abstract SAM: apply(...)
+                out.methodPlans.add(new MethodStubPlan(
+                        fiType,
+                        "apply",
+                        samRet,
+                        samParams,
+                        /*isStatic*/ false,
+                        MethodStubPlan.Visibility.PUBLIC,
+                        java.util.Collections.emptyList(),
+                        /*defaultOnInterface*/ false,  // abstract
+                        /*varargs*/ false,
+                        /*mirror*/ false,
+                        /*mirrorOwnerRef*/ null
+                ));
+            }
+
+            // ---- (2) Determine the referenced method name ----
+            String name = (ex != null ? ex.getSimpleName() : null);
+            if (name == null || name.isEmpty()) name = "m";
+
+// ---- (3) Choose owner correctly: static Type::m vs instance obj::m ----
+            CtExpression<?> target = mref.getTarget();
+            CtTypeReference<?> ownerRef = null;
+            boolean isStatic = false;
+
+            if (target instanceof CtTypeAccess<?>) {
+                // STATIC METHOD REF: Type::method
+                // -> force owner from the literal text to avoid Spoon pointing at the enclosing type.
+                String mrText = String.valueOf(mref);           // e.g., "A::inc" or "fixtures.mref2.A::inc"
+                int idx = (mrText != null ? mrText.indexOf("::") : -1);
+                if (idx > 0) {
+                    String left = mrText.substring(0, idx).trim();  // "A" or "fixtures.mref2.A"
+                    String curPkg = java.util.Optional.ofNullable(mref.getParent(CtType.class))
+                            .map(CtType::getPackage)
+                            .map(spoon.reflect.declaration.CtPackage::getQualifiedName)
+                            .orElse("");
+
+                    String forcedQN = left.contains(".") ? left : (curPkg.isEmpty() ? left : (curPkg + "." + left));
+                    ownerRef = f.Type().createReference(forcedQN);
+                    isStatic = true;
+
+                    // ensure the owner type exists (never generate JDK)
+                    if (!(forcedQN.startsWith("java.") || forcedQN.startsWith("javax.")
+                            || forcedQN.startsWith("jakarta.") || forcedQN.startsWith("sun.")
+                            || forcedQN.startsWith("jdk."))) {
+                        out.typePlans.add(new TypeStubPlan(forcedQN, TypeStubPlan.Kind.CLASS));
+                    }
+                    System.out.println("[mref] static forced owner = " + forcedQN + "  (text=" + mrText + ")");
+                }
+            } else {
+                // INSTANCE METHOD REF: obj::method
+                // -> use the TYPE of the target expression (e.g., for 'b::plus', target type is B)
+                CtTypeReference<?> objT = (target != null ? target.getType() : null);
+                ownerRef = chooseOwnerPackage(objT, mref); // resolves to fixtures.mref2.B
+                isStatic = false;
+
+                // Make sure the owner type exists if it’s not JDK
+                String ownerQn = safeQN(ownerRef);
+                if (ownerQn != null && !(ownerQn.startsWith("java.") || ownerQn.startsWith("javax.")
+                        || ownerQn.startsWith("jakarta.") || ownerQn.startsWith("sun.")
+                        || ownerQn.startsWith("jdk."))) {
+                    out.typePlans.add(new TypeStubPlan(ownerQn, TypeStubPlan.Kind.CLASS));
+                }
+            }
+
+            if (ownerRef == null || isJdkType(ownerRef)) continue;
+
+// ---- (4) SAM shape (ret + params) and plan the referenced method on the owner ----
+            var shape2 = samShapeOrDefault(fiType);
+            CtTypeReference<?> samRet2 = shape2.getKey();
+            List<CtTypeReference<?>> samParams2 = shape2.getValue();
+
+            out.methodPlans.add(new MethodStubPlan(
+                    ownerRef,
+                    name,
+                    samRet2,
+                    samParams2,
+                    isStatic,                                 // <-- instance for obj::, static for Type::
+                    MethodStubPlan.Visibility.PUBLIC,
+                    java.util.Collections.emptyList(),
+                    /*defaultOnInterface*/ false,
+                    /*varargs*/ false,
+                    /*mirror*/ false,
+                    /*mirrorOwnerRef*/ null
+            ));
+
+        }
+    }
+
 
 
 
