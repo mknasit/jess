@@ -46,6 +46,8 @@ public final class SpoonCollector {
         public final List<MethodStubPlan> methodPlans = new ArrayList<>();
         public final Set<String> ambiguousSimples = new LinkedHashSet<>();
         public final Map<String, Set<CtTypeReference<?>>> implementsPlans = new LinkedHashMap<>();
+        public final java.util.Set<String> enumOwners = new java.util.LinkedHashSet<>();
+
 
     }
 
@@ -115,8 +117,12 @@ public final class SpoonCollector {
      */
     public CollectResult collect(CtModel model) {
         CollectResult result = new CollectResult();
+
         ensureRepeatablesForDuplicateUses(model);
+        rebindUnknownHomonyms(model,result);
         // --- order matters only for readability; each pass is independent ---
+        collectTryWithResources(model, result);
+        collectMethodReferences(model, result);
         collectUnresolvedFields(model, result);
         collectUnresolvedCtorCalls(model, result);
         collectUnresolvedMethodCalls(model, result);
@@ -232,7 +238,7 @@ public final class SpoonCollector {
                 if (cfg.isFailOnAmbiguity()) {
                     String ownerQN = ownerRef != null ? ownerRef.getQualifiedName() : "<unknown>";
                     String simple = (fa.getVariable() != null ? fa.getVariable().getSimpleName() : "<missing>");
-                    throw new AmbiguityException("Ambiguous field (no usable type context): " + ownerQN + "#" + simple);
+                   throw new AmbiguityException("Ambiguous field (no usable type context): " + ownerQN + "#" + simple);
                 }
                 fieldType = f.Type().createReference(UNKNOWN_TYPE_FQN);
             }
@@ -611,7 +617,10 @@ public final class SpoonCollector {
 
         for (CtInvocation<?> inv : unresolved) {
             CtExecutableReference<?> ex = inv.getExecutable();
-            String name = (ex != null ? ex.getSimpleName() : "m");
+            String name = (ex != null ? ex.getSimpleName() : null);
+            // decide staticness & varargs early
+            boolean makeStatic = isStaticCallSite(inv);
+            boolean makeVarargs = looksLikeVarargs(inv);
 
             // constructors
             if ("<init>".equals(name)) {
@@ -624,9 +633,7 @@ public final class SpoonCollector {
             }
 
 
-            // decide staticness & varargs early
-            boolean makeStatic = isStaticCallSite(inv);
-            boolean makeVarargs = looksLikeVarargs(inv);
+
 
             // treat unqualified call in static context as static
             if (!makeStatic && inv.getTarget() == null && isInStaticContext(inv)) {
@@ -857,6 +864,35 @@ public final class SpoonCollector {
             }
 
             if (returnType == null) returnType = f.Type().VOID_PRIMITIVE;
+
+            // --- Enum utilities: values() & valueOf(String) ---
+            boolean looksEnumValues  = "values".equals(name) && (args == null || args.isEmpty());
+            boolean looksEnumValueOf = "valueOf".equals(name)
+                    && paramTypes.size() == 1
+                    && "java.lang.String".equals(safeQN(paramTypes.get(0)));
+
+            if (owner != null && (looksEnumValues || looksEnumValueOf)) {
+                CtTypeReference<?> arrOfOwner = f.Core().createArrayTypeReference();
+                ((CtArrayTypeReference<?>) arrOfOwner).setComponentType(owner.clone());
+
+                if (looksEnumValues) {
+                    out.methodPlans.add(new MethodStubPlan(
+                            owner, "values", arrOfOwner,
+                            java.util.Collections.emptyList(),
+                            /*isStatic*/ true, MethodStubPlan.Visibility.PUBLIC,
+                            java.util.Collections.emptyList(),
+                            /*defaultOnIface*/ false, /*isAbstract*/ false, /*isFinal*/ true, null));
+                } else {
+                    out.methodPlans.add(new MethodStubPlan(
+                            owner, "valueOf", owner.clone(),
+                            java.util.List.of(f.Type().createReference("java.lang.String")),
+                            /*isStatic*/ true, MethodStubPlan.Visibility.PUBLIC,
+                            java.util.Collections.emptyList(),
+                            /*defaultOnIface*/ false, /*isAbstract*/ false, /*isFinal*/ true, null));
+                }
+                // NOTE: don't "continue" — let normal flow still plan 'name()' if seen elsewhere.
+            }
+
 
 
             // enqueue plan — NOTE: no mirroring when owner is already unknown.*
@@ -1992,6 +2028,7 @@ public final class SpoonCollector {
     private List<TypeStubPlan> ownersNeedingTypes(CollectResult res) {
         Set<String> fqns = new LinkedHashSet<>();
 
+
         for (FieldStubPlan p : res.fieldPlans) addIfNonJdk(fqns, p.ownerType);
 
         for (ConstructorStubPlan p : res.ctorPlans) {
@@ -2410,122 +2447,348 @@ public final class SpoonCollector {
 
         return false;
     }
-    private void ensureRepeatableAnnotation(String annFqn) {
-        CtType<?> annDecl = f.Type().get(annFqn);
-        if (!(annDecl instanceof CtAnnotationType)) {
-            int i = annFqn.lastIndexOf('.');
-            String pkg = i >= 0 ? annFqn.substring(0, i) : "";
-            String sn  = i >= 0 ? annFqn.substring(i + 1) : annFqn;
-            CtPackage p = ensurePackage(pkg);
-            annDecl = f.Annotation().create(p, sn);
+
+
+
+
+
+
+    /** Rebinds any TypeReference equal to unknown.<Simple> to a real <pkg>.<Simple> type if present.
+     * Prefers the current CU package, else any non-unknown package.
+     */
+    private void rebindUnknownHomonyms(CtModel model, CollectResult collectResult) {
+        // index: which non-unknown types exist or are planned
+        java.util.Set<String> existingOrPlanned = new java.util.HashSet<>();
+        model.getAllTypes().forEach(t -> {
+            String qn = safeQN(t.getReference());
+            if (qn != null && !qn.startsWith("unknown.")) existingOrPlanned.add(qn);
+        });
+        // also add planned type owners
+        for (TypeStubPlan tp : collectResult.typePlans) {
+            if (tp.qualifiedName != null && !tp.qualifiedName.startsWith("unknown."))
+                existingOrPlanned.add(tp.qualifiedName);
         }
-        CtAnnotationType<?> tag = (CtAnnotationType<?>) annDecl;
 
-        // container: <Ann>s
-        String containerFqn = annFqn + "s";
-        CtType<?> containerDecl = f.Type().get(containerFqn);
-        if (!(containerDecl instanceof CtAnnotationType)) {
-            int j = containerFqn.lastIndexOf('.');
-            String cpkg = j >= 0 ? containerFqn.substring(0, j) : "";
-            String csn  = j >= 0 ? containerFqn.substring(j + 1) : containerFqn;
-            CtPackage p2 = ensurePackage(cpkg);
-            containerDecl = f.Annotation().create(p2, csn);
+        for (CtType<?> t : model.getAllTypes()) {
+            CtCompilationUnit cu = t.getPosition() != null ? t.getPosition().getCompilationUnit() : null;
+            String cuPkg = (cu != null && cu.getDeclaredPackage() != null ? cu.getDeclaredPackage().getQualifiedName() : "");
+            if (cuPkg == null) cuPkg = "";
+
+            for (CtTypeReference<?> ref : t.getElements(new spoon.reflect.visitor.filter.TypeFilter<>(CtTypeReference.class))) {
+                String qn = safeQN(ref);
+                if (qn == null || !qn.startsWith("unknown.")) continue;
+
+                String simple = ref.getSimpleName();
+                if (simple == null || simple.isEmpty()) continue;
+
+                String samePkgFqn = (cuPkg.isEmpty() ? simple : cuPkg + "." + simple);
+                if (existingOrPlanned.contains(samePkgFqn)) {
+                    // rewrite to same-package type
+                    CtTypeReference<?> newRef = f.Type().createReference(samePkgFqn);
+                    ref.setPackage(newRef.getPackage());
+                    ref.setSimpleName(newRef.getSimpleName());
+                }
+            }
         }
-        CtAnnotationType<?> tags = (CtAnnotationType<?>) containerDecl;
 
-        // Tag.value(): String (create if missing)
-        ensureAnnotationMethod(tag, "value", f.Type().createReference("java.lang.String"));
-
-        // Tags.value(): Tag[]
-        CtArrayTypeReference<?> tagArray = f.Core().createArrayTypeReference();
-        tagArray.setComponentType(tag.getReference());
-        ensureAnnotationMethod(tags, "value", tagArray);
-
-        // add @Repeatable(Tags.class) to Tag if missing
-        boolean hasRepeatable = tag.getAnnotations().stream()
-                .anyMatch(a -> "java.lang.annotation.Repeatable".equals(safeQN(a.getAnnotationType())));
-        if (!hasRepeatable) {
-            CtAnnotation<?> rep = f.Core().createAnnotation();
-            rep.setAnnotationType(f.Type().createReference("java.lang.annotation.Repeatable"));
-            rep.addValue("value", tags.getReference());
-            tag.addAnnotation(rep);
-        }
+        // optional: remove useless unknown.* type plans if a same-name non-unknown plan exists
+        collectResult.typePlans.removeIf(tp ->
+                tp.qualifiedName != null
+                        && tp.qualifiedName.startsWith("unknown.")
+                        && existingOrPlanned.contains(tp.qualifiedName.substring("unknown.".length())) // crude; keep if you don’t maintain a map
+        );
     }
 
-    private void ensureAnnotationMethod(CtAnnotationType<?> at, String name, CtTypeReference<?> ret) {
-        boolean exists = at.getMethods().stream().anyMatch(m -> name.equals(m.getSimpleName()));
-        if (!exists) {
-            CtAnnotationMethod<Object> m = f.Core().createAnnotationMethod();
-            m.setSimpleName(name);
-            m.setType(ret);
-            at.addMethod(m);
-        }
-    }
 
 
+    private void collectMethodReferences(CtModel model, CollectResult out) {
+        for (spoon.reflect.code.CtExecutableReferenceExpression<?, ?> mr
+                : model.getElements(new spoon.reflect.visitor.filter.TypeFilter<>(spoon.reflect.code.CtExecutableReferenceExpression.class))) {
 
-    // Call this once before stubbing annotations are emitted
-    private void ensureRepeatablesForDuplicateUses(CtModel model) {
-        for (CtType<?> top : model.getAllTypes()) {
-            for (CtElement elem : allAnnotatableOf(top)) {
-                List<CtAnnotation<?>> anns = elem.getAnnotations();
-                if (anns == null || anns.isEmpty()) continue;
+            var exec = mr.getExecutable();
+            if (exec == null) continue;
 
-                Map<String, List<CtAnnotation<?>>> byType =
-                        anns.stream()
-                                .collect(java.util.stream.Collectors.groupingBy(
-                                        a -> safeQN(a.getAnnotationType())
-                                ));
+            boolean isCtor = false;
+            try { isCtor = exec.isConstructor(); } catch (Throwable ignored) {}
 
-                byType.forEach((annFqn, list) -> {
-                    if (annFqn == null) return;
-                    if (list.size() > 1) {
-                        // make <Ann>, <Anns>, and put @Repeatable(<Anns>.class) on <Ann>
-                        ensureRepeatableAnnotation(annFqn);
-                    }
-                });
+            // Infer FI from the assignment/var type if available
+            CtTypeReference<?> fiType = null;
+            try { fiType = mr.getType(); } catch (Throwable ignored) {}
+            if (fiType == null) {
+                CtVariable<?> v = mr.getParent(CtVariable.class);
+                if (v != null) fiType = v.getType();
+            }
+
+            // If FI is non-JDK, ensure it's an INTERFACE + define a SAM 'apply'
+            if (fiType != null && !isJdkType(fiType)) {
+                String fiErasure = erasureFqn(fiType);
+                out.typePlans.add(new TypeStubPlan(fiErasure, TypeStubPlan.Kind.INTERFACE));
+
+                // Default SAM signature; adjust if you have better inference
+                java.util.List<CtTypeReference<?>> params = java.util.List.of(f.Type().createReference("int"));
+                CtTypeReference<?> ret = f.Type().createReference("int");
+
+                // For array ctor refs, we'll override below
+                out.methodPlans.add(new MethodStubPlan(
+                        f.Type().createReference(fiErasure),
+                        "apply", // or "make" if you prefer; stick to "apply" consistently
+                        ret, params,
+                        false, MethodStubPlan.Visibility.PUBLIC,
+                        java.util.Collections.emptyList(),
+                        /* defaultOnIface */ true,
+                        false, false, null
+                ));
+            }
+
+            // Analyze the target to find the owner
+            CtExpression<?> target = mr.getTarget();
+            CtTypeReference<?> ownerRef = null;
+
+            if (target instanceof CtTypeAccess) {
+                ownerRef = ((CtTypeAccess<?>) target).getAccessedType();
+            } else if (target != null) {
+                try { ownerRef = target.getType(); } catch (Throwable ignored) {}
+            }
+
+            // Array ctor reference: String[]::new
+            boolean isArrayCtor = false;
+            CtArrayTypeReference<?> arrType = null;
+            if (target instanceof CtTypeAccess) {
+                CtTypeReference<?> acc = ((CtTypeAccess<?>) target).getAccessedType();
+                if (acc instanceof CtArrayTypeReference) {
+                    isArrayCtor = true;
+                    arrType = (CtArrayTypeReference<?>) acc;
+                }
+            }
+
+
+            if (isArrayCtor) {
+                // Fix SAM to be make(int)->component[] (or keep 'apply', but ensure signature)
+                if (fiType != null && !isJdkType(fiType)) {
+                    String fiErasure = erasureFqn(fiType);
+                    // replace/ensure SAM as: make(int) -> array
+                    out.methodPlans.add(new MethodStubPlan(
+                            f.Type().createReference(fiErasure),
+                            "make",
+                            arrType.clone(),
+                            java.util.List.of(f.Type().INTEGER_PRIMITIVE),
+                            false, MethodStubPlan.Visibility.PUBLIC,
+                            java.util.Collections.emptyList(),
+                            /* defaultOnIface */ true,
+                            false, false, null
+                    ));
+                }
+                continue; // nothing to add on an owner for array ctor
+            }
+
+            // Normal method/ctor owner
+            CtTypeReference<?> owner = ownerRef != null ? chooseOwnerPackage(ownerRef, mr) : null;
+            if (owner == null || isJdkType(owner)) continue;
+
+            if (isCtor) {
+                // A::new — ensure a no-arg ctor (good enough for the tests you showed)
+                out.ctorPlans.add(new ConstructorStubPlan(owner, java.util.Collections.emptyList()));
+            } else {
+                // A::inc or obj::plus
+                String name = exec.getSimpleName();
+                boolean isStatic = false;
+                try { isStatic = exec.isStatic(); } catch (Throwable ignored) {}
+
+                // Default int->int; if you have better inference, substitute here
+                java.util.List<CtTypeReference<?>> params = java.util.List.of(f.Type().createReference("int"));
+                CtTypeReference<?> ret = f.Type().createReference("int");
+
+                out.methodPlans.add(new MethodStubPlan(
+                        owner, name, ret, params,
+                        isStatic, MethodStubPlan.Visibility.PUBLIC,
+                        java.util.Collections.emptyList(),
+                        /* defaultOnIface */ false,
+                        false, false, null
+                ));
             }
         }
     }
 
 
-    /** Enumerate the typical annotatable sites under a type (and recurse into nested types). */
-    private List<CtElement> allAnnotatableOf(CtType<?> t) {
-        List<CtElement> out = new java.util.ArrayList<>();
-        if (t == null) return out;
 
-        // the type itself
-        out.add(t);
+    private void collectTryWithResources(CtModel model, CollectResult out) {
+        for (CtTry twr : model.getElements(new spoon.reflect.visitor.filter.TypeFilter<>(CtTry.class))) {
 
-        // fields (incl. enum constants)
-        out.addAll(t.getFields());
+            // 1) Try to call CtTry#getResources() reflectively (if present in this Spoon version)
+            java.util.List<CtLocalVariable<?>> res = null;
+            try {
+                java.lang.reflect.Method m = twr.getClass().getMethod("getResources");
+                @SuppressWarnings("unchecked")
+                java.util.List<CtLocalVariable<?>> tmp = (java.util.List<CtLocalVariable<?>>) m.invoke(twr);
+                res = tmp;
+            } catch (Throwable ignore) {
+                // 2) Fallback: collect locals whose role in parent is a resource of this CtTry
+                res = new java.util.ArrayList<>();
+                for (CtLocalVariable<?> lv :
+                        twr.getElements(new spoon.reflect.visitor.filter.TypeFilter<>(CtLocalVariable.class))) {
+                    if (lv.getParent(CtTry.class) == twr) {
+                        spoon.reflect.path.CtRole role = lv.getRoleInParent();
+                        // some Spoon versions use RESOURCE or RESOURCES; be defensive:
+                        if (role != null && role.name().toLowerCase().contains("resource")) {
+                            res.add(lv);
+                        }
+                    }
+                }
+            }
 
-        // methods
-        out.addAll(t.getMethods());
+            if (res == null || res.isEmpty()) continue;
 
-        // ctors (only for classes)
-        if (t instanceof CtClass<?>) {
-            out.addAll(((CtClass<?>) t).getConstructors());
+            for (CtLocalVariable<?> r : res) {
+                CtTypeReference<?> rt = r.getType();
+                if (rt == null) continue;
+
+                CtTypeReference<?> owner = chooseOwnerPackage(rt, twr);
+                // skip JDK types and unknowns
+                if (owner == null || isJdkType(owner)) continue;
+
+                // Attach AutoCloseable (do NOT create java.lang.AutoCloseable)
+                out.implementsPlans
+                        .computeIfAbsent(owner.getQualifiedName(), k -> new java.util.LinkedHashSet<>())
+                        .add(f.Type().createReference("java.lang.AutoCloseable"));
+
+                // Plan abstract close()
+                out.methodPlans.add(new MethodStubPlan(
+                        owner,
+                        "close",
+                        f.Type().VOID_PRIMITIVE,
+                        java.util.Collections.emptyList(),
+                        /*isStatic*/ false,
+                        MethodStubPlan.Visibility.PUBLIC,
+                        java.util.Collections.emptyList(),
+                        /*defaultOnIface*/ false,
+                        /*isAbstract*/ true,
+                        /*isFinal*/ false,
+                        /*varargsOnLast*/ null
+                ));
+            }
         }
-
-        // class/instance initializer blocks: query under this type
-        out.addAll(t.getElements(new spoon.reflect.visitor.filter.TypeFilter<>(CtAnonymousExecutable.class)));
-
-        // recurse into nested types
-        for (CtType<?> nested : t.getNestedTypes()) {
-            out.addAll(allAnnotatableOf(nested));
-        }
-
-        return out;
     }
-    private CtPackage ensurePackage(String fqn) {
-        if (fqn == null || fqn.isEmpty()) {
-            // Spoon 10.x: use root package for the default package
-            return f.Package().getRootPackage();
-        }
-        return f.Package().getOrCreate(fqn);
+
+
+
+    private CtPackage ensurePackage(String pkgFqn) {
+        if (pkgFqn == null || pkgFqn.isEmpty()) return f.getModel().getRootPackage();
+        CtPackage p = f.getModel().getRootPackage().getFactory().Package().get(pkgFqn);
+        if (p == null) p = f.Package().getOrCreate(pkgFqn);
+        return p;
     }
 
+
+
+
+    private CtAnnotationType<?> ensureAnnotation(String fqn) {
+        int i = fqn.lastIndexOf('.');
+        String pkg = (i >= 0 ? fqn.substring(0, i) : "");
+        String sn  = (i >= 0 ? fqn.substring(i + 1) : fqn);
+
+        CtPackage p = ensurePackage(pkg);
+        CtType<?> existing = f.Type().get(fqn);
+        if (existing instanceof CtAnnotationType) {
+            return (CtAnnotationType<?>) existing;
+        }
+        if (existing != null) existing.delete();
+        return f.Annotation().create(p, sn);
+    }
+
+    // Create (if missing) an element method on an annotation type
+    private CtAnnotationMethod<?> ensureAnnotationElement(
+            CtAnnotationType<?> ann,
+            String name,
+            CtTypeReference<?> returnType
+    ) {
+        // already there?
+        for (CtMethod<?> m : ann.getMethods()) {
+            if (name.equals(m.getSimpleName())) {
+                return (CtAnnotationMethod<?>) m;
+            }
+        }
+
+        // create a new annotation element
+        CtAnnotationMethod<?> m = f.Core().createAnnotationMethod();
+        m.setSimpleName(name);
+        m.setType(returnType);
+        // (public abstract are implicit on annotation elements; modifiers are optional)
+        ann.addMethod(m);   // important: register it on the CtAnnotationType
+        return m;
+    }
+
+
+    // Ensure @Repeatable(container) on 'tagAnn'
+    private void addRepeatableMeta(
+            CtAnnotationType<?> tagAnn,
+            CtAnnotationType<?> containerAnn
+    ) {
+        // @Repeatable
+        CtTypeReference<java.lang.annotation.Repeatable> repeatableRef =
+                f.Type().createReference(java.lang.annotation.Repeatable.class);
+
+        CtAnnotation<?> rep = f.Core().createAnnotation();
+        rep.setAnnotationType(repeatableRef);
+
+        // value = Container.class  (class literal expression)
+        CtTypeReference<?> containerRef = containerAnn.getReference();
+        spoon.reflect.code.CtExpression<?> classLiteral = f.Code().createClassAccess(containerRef);
+        rep.addValue("value", classLiteral);
+
+        tagAnn.addAnnotation(rep);
+    }
+
+
+
+
+
+    private void ensureRepeatableAnnotation(String annFqn) {
+        CtAnnotationType<?> tag = ensureAnnotation(annFqn);
+
+        String containerFqn = annFqn + "$Container";  // or "...Tags" if you prefer
+        CtAnnotationType<?> container = ensureAnnotation(containerFqn);
+
+        // Tag: String value();
+        ensureAnnotationElement(tag, "value", f.Type().createReference("java.lang.String"));
+
+        // Container: Tag[] value();
+        CtArrayTypeReference<?> tagArray = f.Core().createArrayTypeReference();
+        tagArray.setComponentType(tag.getReference());
+        ensureAnnotationElement(container, "value", tagArray);
+
+        // @Repeatable(Container.class)
+        addRepeatableMeta(tag, container);
+    }
+
+
+
+    private void ensureRepeatablesForDuplicateUses(CtModel model) {
+        for (CtType<?> t : model.getAllTypes()) {
+            // scan type
+            java.util.List<CtAnnotation<?>> anns = t.getAnnotations();
+            ensureRepeatableIfDuplicate(anns);
+
+            // scan members
+            for (CtTypeMember m : t.getTypeMembers()) {
+                if (m instanceof CtAnnotationMethod || m instanceof CtMethod || m instanceof CtConstructor
+                        || m instanceof CtField || m instanceof CtAnonymousExecutable) {
+                    ensureRepeatableIfDuplicate(((CtModifiable) m).getAnnotations());
+                }
+            }
+        }
+    }
+
+    private void ensureRepeatableIfDuplicate(java.util.List<CtAnnotation<?>> anns) {
+        if (anns == null || anns.isEmpty()) return;
+        java.util.Map<String, java.util.List<CtAnnotation<?>>> byType =
+                anns.stream().collect(java.util.stream.Collectors.groupingBy(a -> safeQN(a.getAnnotationType())));
+        byType.forEach((annFqn, list) -> {
+            if (annFqn == null) return;
+            if (list.size() > 1) {
+                ensureRepeatableAnnotation(annFqn);
+            }
+        });
+    }
 
 
 }

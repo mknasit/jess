@@ -538,6 +538,8 @@ public final class SpoonStubber {
     }
 
 
+
+
     private CtType<?> ensurePublicOwnerForMethod(MethodStubPlan p) {
         CtTypeReference<?> ref = p.ownerType;
         String qn = safeQN(ref);
@@ -1160,64 +1162,54 @@ public final class SpoonStubber {
 
 
     public void applyImplementsPlans(Map<String, Set<CtTypeReference<?>>> plans) {
-        if (plans == null || plans.isEmpty()) return;
+        if (plans == null) return;
 
         for (var e : plans.entrySet()) {
-            final String ownerFqn = e.getKey();
+            String ownerFqn = e.getKey();
             CtType<?> owner = f.Type().get(ownerFqn);
-            if (owner == null) {
-                // create an empty public class owner if it does not exist yet
-                int i = ownerFqn.lastIndexOf('.');
-                String pkg = i >= 0 ? ownerFqn.substring(0, i) : "";
-                String sn  = i >= 0 ? ownerFqn.substring(i + 1) : ownerFqn;
-                CtPackage p = ensurePackage(pkg);
-                owner = f.Class().create(p, sn);
-                owner.addModifier(ModifierKind.PUBLIC);
-            }
+            if (owner == null) continue;
 
-            for (CtTypeReference<?> t : e.getValue()) {
-                if (t == null) continue;
+            for (CtTypeReference<?> si : e.getValue()) {
+                if (si == null) continue;
 
-                // erasure FQN of target
-                String tErasureFqn = erasureFqn(t);
+                String tErasure = erasureFqn(si); // your existing erasure helper
 
-                // skip self: SomeObject implements SomeObject
-                if (ownerFqn.equals(tErasureFqn)) continue;
+                CtType<?> target = f.Type().get(tErasure);
+                if (target == null) {
+                    // create interface stub (NEVER a class)
+                    int dot = tErasure.lastIndexOf('.');
+                    String pkg = (dot >= 0 ? tErasure.substring(0, dot) : "");
+                    String sn  = (dot >= 0 ? tErasure.substring(dot + 1) : tErasure);
 
-                // ensure target exists and is an INTERFACE (never a class)
-                CtType<?> targetDecl = f.Type().get(tErasureFqn);
-                if (targetDecl == null) {
-                    int j = tErasureFqn.lastIndexOf('.');
-                    String tpkg = j >= 0 ? tErasureFqn.substring(0, j) : "";
-                    String tsn  = j >= 0 ? tErasureFqn.substring(j + 1) : tErasureFqn;
-                    CtPackage p = ensurePackage(tpkg);
-                    targetDecl = f.Interface().create(p, tsn); // <-- create interface, not class
-                    targetDecl.addModifier(ModifierKind.PUBLIC);
-                }
-                if (!(targetDecl instanceof CtInterface)) {
-                    // don't add implements to a concrete class; skip
-                    continue;
+                    CtPackage p = ensurePackage(pkg); // your existing ensurePackage; if not, see minimal impl below
+                    target = f.Interface().create(p, sn);
+                } else if (target instanceof CtClass) {
+                    // upgrade: replace the class with an interface of the same FQN
+                    String tErasureFqn = target.getQualifiedName();
+                    int dot = tErasureFqn.lastIndexOf('.');
+                    String pkg = (dot >= 0 ? tErasureFqn.substring(0, dot) : "");
+                    String sn  = (dot >= 0 ? tErasureFqn.substring(dot + 1) : tErasureFqn);
+
+                    CtPackage p = (target.getParent() instanceof CtPackage)
+                            ? (CtPackage) target.getParent()
+                            : ensurePackage(pkg);
+                    target.delete();
+                    target = f.Interface().create(p, sn);
                 }
 
-                // avoid duplicates (by erasure), optionally upgrade raw -> parameterized
-                CtTypeReference<?> targetIfaceRef = targetDecl.getReference();
-                CtTypeReference<?> existing = owner.getSuperInterfaces().stream()
-                        .filter(x -> erasureFqn(x).equals(tErasureFqn))
-                        .findFirst().orElse(null);
-
-                if (existing == null) {
-                    // add (prefer the parameterized shape you collected)
-                    owner.addSuperInterface(t.clone());
-                } else {
-                    // upgrade raw -> parameterized if you found a better one
-                    if (existing.getActualTypeArguments().isEmpty() && !t.getActualTypeArguments().isEmpty()) {
-                        owner.getSuperInterfaces().remove(existing);
-                        owner.addSuperInterface(t.clone());
-                    }
+                // Attach if not already present (dedupe by erasure)
+                String tErasureFqn = target.getQualifiedName();
+                boolean exists = owner.getSuperInterfaces().stream()
+                        .anyMatch(cur -> erasureFqn(cur).equals(tErasureFqn));
+                if (!exists) {
+                    owner.addSuperInterface(target.getReference());
                 }
             }
         }
     }
+
+
+
 
     private String erasureFqn(CtTypeReference<?> tr) {
         String qn = safeQN(tr);
@@ -1228,9 +1220,11 @@ public final class SpoonStubber {
 
     private CtPackage ensurePackage(String fqn) {
         if (fqn == null || fqn.isEmpty()) {
-            // Spoon 10.x: use root package for the default package
-            return f.Package().getRootPackage();
+            // unnamed/default package
+            CtPackage root = f.getModel().getRootPackage();
+            return root.getFactory().Package().getRootPackage(); // or simply root
         }
+        // Spoon will create missing segments as needed:
         return f.Package().getOrCreate(fqn);
     }
 
