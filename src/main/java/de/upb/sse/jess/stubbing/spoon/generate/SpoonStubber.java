@@ -379,10 +379,10 @@ public final class SpoonStubber {
             }
 
             // 1) pick/create the owner type using the *normalized* owner ref
-            CtType<?> owner = ensurePublicOwnerForTypeRef(normalizedOwnerRef);
+            CtType<?> owner = p.defaultOnInterface
+                    ? ensurePublicInterfaceForTypeRef(normalizedOwnerRef)
+                    : ensurePublicOwnerForTypeRef(normalizedOwnerRef);
 
-            // 1) pick/create the owner type for the method (your helper)
-         //   CtType<?> owner = ensurePublicOwnerForMethod();
 
             // short-circuit if already present on the owner using your current check
             if (hasMethod(owner, p.name, p.paramTypes)) continue;
@@ -1498,6 +1498,57 @@ public final class SpoonStubber {
             }
         }
     }
+
+    // Create (or fetch) a public interface for the given type ref.
+// If we mistakenly created an empty class earlier with the same FQN, replace it with an interface.
+    private CtType<?> ensurePublicInterfaceForTypeRef(CtTypeReference<?> tr) {
+        if (tr == null) tr = f.Type().createReference("unknown.Missing");
+
+        String qn;
+        try { qn = tr.getQualifiedName(); } catch (Throwable e) { qn = tr.getSimpleName(); }
+        if (qn == null || qn.isEmpty()) qn = "unknown.Missing";
+
+        int dot = qn.lastIndexOf('.');
+        String pkgName = (dot >= 0 ? qn.substring(0, dot) : "");
+        String simple  = (dot >= 0 ? qn.substring(dot + 1) : qn);
+
+        CtPackage pkg = f.Package().getOrCreate(pkgName);
+        CtType<?> existing = pkg.getType(simple);
+        if (existing instanceof CtInterface) {
+            // already correct kind
+            existing.addModifier(ModifierKind.PUBLIC);
+            return existing;
+        }
+        if (existing instanceof CtClass) {
+            // If we created this class in this run and it is still empty, replace it with an interface
+            String fqn = (pkgName.isEmpty() ? simple : pkgName + "." + simple);
+            boolean weCreated = createdTypes.contains(fqn);
+            boolean looksEmpty =
+                    ((CtClass<?>) existing).getFields().isEmpty()
+                            && ((CtClass<?>) existing).getConstructors().isEmpty()
+                            && ((CtClass<?>) existing).getMethods().isEmpty()
+                            && existing.getNestedTypes().isEmpty();
+
+            if (weCreated && looksEmpty) {
+                existing.delete();
+                CtInterface<?> itf = f.Interface().create(pkg, simple);
+                itf.addModifier(ModifierKind.PUBLIC);
+                createdTypes.add(itf.getQualifiedName());
+                return itf;
+            }
+            // Otherwise, keep the class (don’t destruct user code), but compilation would fail if C “implements” it.
+            // Returning the class is safer than exploding here; other passes may fix callers.
+            existing.addModifier(ModifierKind.PUBLIC);
+            return existing;
+        }
+
+        // Not present: create the interface
+        CtInterface<?> itf = f.Interface().create(pkg, simple);
+        itf.addModifier(ModifierKind.PUBLIC);
+        createdTypes.add(itf.getQualifiedName());
+        return itf;
+    }
+
 
 
 
