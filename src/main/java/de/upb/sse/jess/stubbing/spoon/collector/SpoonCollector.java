@@ -1534,11 +1534,18 @@ public final class SpoonCollector {
      * Choose a package for a possibly simple owner reference, honoring star imports and strict mode.
      */
 
+
     private CtTypeReference<?> chooseOwnerPackage(CtTypeReference<?> ownerRef, CtElement ctx) {
         if (ownerRef == null) return f.Type().createReference("unknown.Missing");
         if (ownerRef.isPrimitive() || ownerRef.isArray()) return ownerRef;
 
         String qn = safeQN(ownerRef);
+
+        // NEW: treat 'unknown.*' as a *simple* name so we can rebind it sensibly
+        if (qn != null && qn.startsWith("unknown.")) {
+            ownerRef = f.Type().createReference(ownerRef.getSimpleName());
+            qn = ownerRef.getQualifiedName(); // now simple
+        }
 
         if (qn.contains(".") && !isLocallyAssumedOrSimple(ownerRef, ctx)) return ownerRef;
         if (qn.contains(".") && isLocallyAssumedOrSimple(ownerRef, ctx)) {
@@ -1557,6 +1564,8 @@ public final class SpoonCollector {
         if (isKnownJdkSimple(simple)) {
             return f.Type().createReference(JDK_SIMPLE.get(simple) + "." + simple);
         }
+
+
 
         // (B) star-imports
         java.util.List<String> stars = starImportsInOrder(ctx);
@@ -1578,18 +1587,26 @@ public final class SpoonCollector {
             }
         }
 
-        // (D) current package (skip if default)
-        String currentPkg = java.util.Optional.ofNullable(ctx)
-                .map(c -> c.getParent(CtType.class))
-                .map(CtType::getPackage)
-                .map(spoon.reflect.declaration.CtPackage::getQualifiedName)
-                .orElse("");
-        if (!currentPkg.isEmpty()) return f.Type().createReference(currentPkg + "." + simple);
+        // Prefer current package for simple names (e.g., class C extends P) if ctx is in a package
+        // // (D) current package (skip if default)
+        String currentPkg = null;
+        try {
+            CtType<?> hostType = ctx.getParent(CtType.class);
+            if (hostType != null && hostType.getPackage() != null) {
+                currentPkg = hostType.getPackage().getQualifiedName();
+            }
+        } catch (Throwable ignored) {}
+        if (currentPkg != null && !currentPkg.isEmpty()) {
+            // Choose current package owner
+            return f.Type().createReference(currentPkg + "." + simple);
+        }
+
+
+
 
         // (C) prefer unknown if unknown.* present
         boolean hasUnknownStar = stars.stream().anyMatch("unknown"::equals);
         if (hasUnknownStar) return f.Type().createReference("unknown." + simple);
-
 
         // (E) fallback
         return f.Type().createReference("unknown." + simple);
@@ -1862,10 +1879,18 @@ public final class SpoonCollector {
         for (CtClass<?> c : model.getElements((CtClass<?> cc) -> true)) {
             CtTypeReference<?> sup = null;
             try {
+
+                System.out.println("[collect] " + c.getQualifiedName() + " extends raw=" + safeQN(sup));
+                CtTypeReference<?> owner = chooseOwnerPackage(sup, c);
                 sup = c.getSuperclass();
+                System.out.println("[collect] " + c.getQualifiedName() + " extends chosen=" + safeQN(owner));
             } catch (Throwable ignored) {
             }
             if (sup != null) {
+                String sqn = safeQN(sup);
+                if (sqn != null && sqn.startsWith("unknown.")) {
+                    sup = f.Type().createReference(sup.getSimpleName());
+                }
                 CtTypeReference<?> owner = chooseOwnerPackage(sup, c);
                 if (owner != null && !isJdkType(owner)) {
                     out.typePlans.add(new TypeStubPlan(owner.getQualifiedName(), TypeStubPlan.Kind.CLASS));
@@ -2145,7 +2170,7 @@ public final class SpoonCollector {
     /**
      * Safely obtain qualified name; never returns null (empty string on failure).
      */
-    private static String safeQN(CtTypeReference<?> t) {
+    public static String safeQN(CtTypeReference<?> t) {
         try {
             String s = (t == null ? null : t.getQualifiedName());
             return (s == null ? "" : s);

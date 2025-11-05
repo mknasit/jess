@@ -12,6 +12,9 @@ import spoon.reflect.declaration.CtType;
 import spoon.reflect.declaration.CtPackage;
 
 import java.util.*;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import static de.upb.sse.jess.stubbing.spoon.collector.SpoonCollector.safeQN;
 
 public final class SpoonStubber {
 
@@ -48,13 +51,26 @@ public final class SpoonStubber {
      *
      * @return number of newly created types
      */
+
     public int applyTypePlans(Collection<TypeStubPlan> plans) {
+        List<TypeStubPlan> ordered = new ArrayList<>(plans);
+        ordered.sort((a, b) -> {
+            boolean au = a.qualifiedName != null && a.qualifiedName.startsWith("unknown.");
+            boolean bu = b.qualifiedName != null && b.qualifiedName.startsWith("unknown.");
+            return (au == bu) ? 0 : (au ? 1 : -1);
+        });
+
         int created = 0;
-        for (TypeStubPlan p : plans) {
-            if (ensureTypeExists(p)) created++;
+        for (TypeStubPlan p : ordered) {
+            if (ensureTypeExists(p)) {
+                created++;
+                // optional: debug
+                 System.out.println("[types] created " + p.qualifiedName);
+            }
         }
         return created;
     }
+
 
     /**
      * Ensure a type exists for the given plan (class/interface/annotation).
@@ -64,6 +80,45 @@ public final class SpoonStubber {
      */
     private boolean ensureTypeExists(TypeStubPlan p) {
         String qn = p.qualifiedName;
+        if (qn != null && qn.startsWith("unknown.")) {
+            String simple = qn.substring(qn.lastIndexOf('.') + 1);
+
+            for (String createdFqn : createdTypes) {
+                if (createdFqn == null) continue;
+                String createdSimple = createdFqn.contains("$")
+                        ? createdFqn.substring(createdFqn.lastIndexOf('$') + 1)
+                        : createdFqn.substring(createdFqn.lastIndexOf('.') + 1);
+                if (simple.equals(createdSimple) && !createdFqn.startsWith("unknown.")) {
+                    return false;
+                }
+            }
+            // 2) Already present in model in a non-unknown package?
+            for (CtType<?> t : f.getModel().getAllTypes()) {
+                if (!simple.equals(t.getSimpleName())) continue;
+                CtPackage pkg = t.getPackage();
+                String pkgName = (pkg != null ? pkg.getQualifiedName() : "");
+                if (!"unknown".equals(pkgName)) {
+                    return false;
+                }
+            }
+        }
+
+
+        // === skip creating unknown.* if a concrete same-simple type exists ===
+        if (qn != null && qn.startsWith("unknown.")) {
+            String simple = qn.substring(qn.lastIndexOf('.') + 1); // e.g., "P"
+            for (String createdFqn : createdTypes) {
+                if (createdFqn == null) continue;
+                String createdSimple = createdFqn.contains("$")
+                        ? createdFqn.substring(createdFqn.lastIndexOf('$') + 1)
+                        : createdFqn.substring(createdFqn.lastIndexOf('.') + 1);
+                if (simple.equals(createdSimple) && !createdFqn.startsWith("unknown.")) {
+                    // We already decided to have a concrete owner for this simple name
+                    return false;
+                }
+            }
+        }
+
         // --- member type fast-path: plan says Outer$Inner (or deeper) ---
         if (qn != null && qn.contains("$")) {
             int lastDot = qn.lastIndexOf('.');
@@ -124,6 +179,7 @@ public final class SpoonStubber {
 
         String pkg = "";
         String name = "Missing";
+
         int i = qn.lastIndexOf('.');
         if (i >= 0) {
             pkg = qn.substring(0, i);
@@ -280,8 +336,53 @@ public final class SpoonStubber {
         int created = 0;
 
         for (MethodStubPlan p : plans) {
+
+            // Start from the plan’s declared owner (immutable in your plan class)
+            CtTypeReference<?> oref = p.ownerType;
+            CtTypeReference<?> normalizedOwnerRef = oref;
+
+            String oqn = null;
+            try { oqn = (oref != null ? oref.getQualifiedName() : null); } catch (Throwable ignored) {}
+
+            if (oqn != null && oqn.startsWith("unknown.")) {
+                String simple = oref.getSimpleName();
+
+                // (1) prefer an already-created concrete owner (same simple name)
+                CtTypeReference<?> concrete = null;
+                for (String createdFqn : createdTypes) {
+                    if (createdFqn == null || createdFqn.startsWith("unknown.")) continue;
+                    String createdSimple = createdFqn.contains("$")
+                            ? createdFqn.substring(createdFqn.lastIndexOf('$') + 1)
+                            : createdFqn.substring(createdFqn.lastIndexOf('.') + 1);
+                    if (simple.equals(createdSimple)) {
+                        concrete = f.Type().createReference(createdFqn);
+                        break;
+                    }
+                }
+
+                // (2) or any concrete owner currently in the model
+                if (concrete == null) {
+                    for (CtType<?> t : f.getModel().getAllTypes()) {
+                        if (!simple.equals(t.getSimpleName())) continue;
+                        CtPackage pkg = t.getPackage();
+                        String pkgName = (pkg != null ? pkg.getQualifiedName() : "");
+                        if (!"unknown".equals(pkgName)) {
+                            concrete = t.getReference();
+                            break;
+                        }
+                    }
+                }
+
+                if (concrete != null) {
+                    normalizedOwnerRef = concrete; // ← use this below
+                }
+            }
+
+            // 1) pick/create the owner type using the *normalized* owner ref
+            CtType<?> owner = ensurePublicOwnerForTypeRef(normalizedOwnerRef);
+
             // 1) pick/create the owner type for the method (your helper)
-            CtType<?> owner = ensurePublicOwnerForMethod(p);
+         //   CtType<?> owner = ensurePublicOwnerForMethod();
 
             // short-circuit if already present on the owner using your current check
             if (hasMethod(owner, p.name, p.paramTypes)) continue;
@@ -350,6 +451,10 @@ public final class SpoonStubber {
             // 7) interface default/abstract body handling
             boolean ownerIsInterface = owner instanceof CtInterface;
             if (ownerIsInterface) {
+                if (p.isStatic) {
+                    m.addModifier(ModifierKind.STATIC);
+                }
+
                 if (p.defaultOnInterface) {
                     m.setDefaultMethod(true);
                     m.addModifier(ModifierKind.PUBLIC);
@@ -371,34 +476,34 @@ public final class SpoonStubber {
                 m.removeModifier(ModifierKind.ABSTRACT);
             }
 
-            // 8) foreach glue: Iterable if iterator() is created (keep your logic)
-            if ("iterator".equals(p.name) && p.paramTypes.isEmpty()) {
-                CtTypeReference<?> rtForIterable = rt0;
-                String rtQN = safeQN(rtForIterable);
-                if (rtQN.startsWith("java.util.Iterator")) {
-                    CtTypeReference<?> iterableRef = f.Type().createReference("java.lang.Iterable");
-                    try {
-                        List<CtTypeReference<?>> args = rtForIterable.getActualTypeArguments();
-                        if (args != null && !args.isEmpty() && args.get(0) != null) {
-                            iterableRef.addActualTypeArgument(args.get(0));
-                        }
-                    } catch (Throwable ignored) {
-                    }
-                    boolean already = false;
-                    try {
-                        for (CtTypeReference<?> si : owner.getSuperInterfaces()) {
-                            if (safeQN(si).startsWith("java.lang.Iterable")) {
-                                already = true;
-                                break;
-                            }
-                        }
-                    } catch (Throwable ignored) {
-                    }
-                    if (!already) owner.addSuperInterface(iterableRef);
-                    ensureImport(owner, iterableRef);
-                    ensureImport(owner, rt0);
-                }
-            }
+//            // 8) foreach glue: Iterable if iterator() is created (keep your logic)
+//            if ("iterator".equals(p.name) && p.paramTypes.isEmpty()) {
+//                CtTypeReference<?> rtForIterable = rt0;
+//                String rtQN = safeQN(rtForIterable);
+//                if (rtQN.startsWith("java.util.Iterator")) {
+//                    CtTypeReference<?> iterableRef = f.Type().createReference("java.lang.Iterable");
+//                    try {
+//                        List<CtTypeReference<?>> args = rtForIterable.getActualTypeArguments();
+//                        if (args != null && !args.isEmpty() && args.get(0) != null) {
+//                            iterableRef.addActualTypeArgument(args.get(0));
+//                        }
+//                    } catch (Throwable ignored) {
+//                    }
+//                    boolean already = false;
+//                    try {
+//                        for (CtTypeReference<?> si : owner.getSuperInterfaces()) {
+//                            if (safeQN(si).startsWith("java.lang.Iterable")) {
+//                                already = true;
+//                                break;
+//                            }
+//                        }
+//                    } catch (Throwable ignored) {
+//                    }
+//                    if (!already) owner.addSuperInterface(iterableRef);
+//                    ensureImport(owner, iterableRef);
+//                    ensureImport(owner, rt0);
+//                }
+//            }
 
             // 9) imports for owner
             boolean usesUnknown =
@@ -416,122 +521,133 @@ public final class SpoonStubber {
             createdMethods.add(sig(owner.getQualifiedName(), p.name, normParams) + " : " + readable(rt0));
             created++;
 
-            // 10) MIRROR into unknown.* if requested (so calls like unknown.T.m(...) compile)
+
             // 10) MIRROR into unknown.* if requested (so calls like unknown.T.m(...) compile)
             if (p.mirror && p.mirrorOwnerRef != null) {
-                CtType<?> mirrorOwner = ensurePublicOwnerForTypeRef(p.mirrorOwnerRef);
-
-                // --- build mirror return & params adapted to the MIRROR owner ---
-                CtTypeReference<?> mirrorRt = rt; // default: same as real
-                List<CtTypeReference<?>> mirrorParamRefs = new ArrayList<>(normParams);
-
-                // Special-case enum helpers to mirror to the mirror-owner type:
-                String mn = p.name;
-                String mirrorOwnerQN = safeQN(p.mirrorOwnerRef);
-
-                boolean isEnumValues = "values".equals(mn) && mirrorParamRefs.isEmpty();
-                boolean isEnumValueOf = "valueOf".equals(mn) && mirrorParamRefs.size() == 1;
-                boolean isEnumName = "name".equals(mn) && mirrorParamRefs.isEmpty();
-
-                if (isEnumValues || isEnumValueOf || isEnumName) {
-                    // mirrorOwnerRef element type
-                    CtTypeReference<?> mirrorElem = f.Type().createReference(mirrorOwnerQN);
-
-                    if (isEnumValues) {
-                        CtArrayTypeReference<?> arr = f.Core().createArrayTypeReference();
-                        arr.setComponentType(mirrorElem);
-                        mirrorRt = arr;
-                        mirrorParamRefs = java.util.Collections.emptyList();
-                    } else if (isEnumValueOf) {
-                        mirrorRt = mirrorElem;
-                        mirrorParamRefs = java.util.List.of(f.Type().createReference("java.lang.String"));
-                    } else { // name()
-                        mirrorRt = f.Type().createReference("java.lang.String");
-                        mirrorParamRefs = java.util.Collections.emptyList();
-                    }
-                }
-
-                // Create parameters for mirror
-                List<CtParameter<?>> mirrorParams = makeParams(mirrorParamRefs);
-
-                // --- compute mirror modifiers independently (don't reuse owner's blindly) ---
-                Set<ModifierKind> mirrorMods = new HashSet<>();
-                if (isEnumValues || isEnumValueOf) {
-                    // static enum helpers
-                    mirrorMods.add(ModifierKind.PUBLIC);
-                    mirrorMods.add(ModifierKind.STATIC);
-                } else if (isEnumName) {
-                    // instance
-                    mirrorMods.add(ModifierKind.PUBLIC);
+                String moqn = safeQN(p.mirrorOwnerRef);
+                if (moqn == null || !moqn.startsWith("unknown.")) {
+                    // do nothing; we only mirror into unknown.*
                 } else {
-                    // non-helper: mirror what the plan says
-                    if (p.isStatic) mirrorMods.add(ModifierKind.STATIC);
-                    switch (p.visibility) {
-                        case PRIVATE:
-                            mirrorMods.add(ModifierKind.PRIVATE);
-                            break;
-                        case PROTECTED:
-                            mirrorMods.add(ModifierKind.PROTECTED);
-                            break;
-                        case PUBLIC:
-                            mirrorMods.add(ModifierKind.PUBLIC);
-                            break;
-                        case PACKAGE:   /* none */
-                            break;
-                    }
-                }
-
-                // Avoid duplicates on mirror using mirrorParamRefs
-                if (!hasMethod(mirrorOwner, p.name, mirrorParamRefs)) {
-                    CtMethod<?> um = f.Method().create(mirrorOwner, mirrorMods, mirrorRt, p.name, mirrorParams, thrown);
-
-                    // varargs on mirror (non-helper case only; helpers don’t use varargs)
-                    if (p.varargs && !(isEnumValues || isEnumValueOf || isEnumName) && !um.getParameters().isEmpty()) {
-                        CtParameter<?> last = um.getParameters().get(um.getParameters().size() - 1);
-                        CtTypeReference<?> lt = last.getType();
-                        if (lt != null && !lt.isArray()) {
-                            CtArrayTypeReference<?> arr = f.Core().createArrayTypeReference();
-                            arr.setComponentType(lt);
-                            last.setType(arr);
-                        }
-                        last.setVarArgs(true);
-                    }
-
-                    // body rules (same as owner)
-                    boolean mirrorIsInterface = mirrorOwner instanceof CtInterface;
-                    if (mirrorIsInterface) {
-                        if (p.defaultOnInterface) {
-                            um.setDefaultMethod(true);
-                            um.addModifier(ModifierKind.PUBLIC);
-                            CtBlock<?> body = f.Core().createBlock();
-                            CtReturn<?> r = defaultReturn(mirrorRt);
-                            if (r != null) body.addStatement(r);
-                            um.setBody(body);
-                            um.removeModifier(ModifierKind.ABSTRACT);
-                        } else {
-                            um.setBody(null);
-                            um.addModifier(ModifierKind.PUBLIC);
-                            um.addModifier(ModifierKind.ABSTRACT);
-                        }
+                    CtType<?> mirrorOwner = ensurePublicOwnerForTypeRef(p.mirrorOwnerRef);
+// Skip mirroring for enum helper names; Collector should have scheduled an ENUM type plan
+                    if (("values".equals(p.name) && p.paramTypes.isEmpty())
+                            || ("valueOf".equals(p.name) && p.paramTypes.size() == 1)
+                            || ("name".equals(p.name) && p.paramTypes.isEmpty())) {
+                        // do not mirror; rely on TypeStubPlan.Kind.ENUM to satisfy these calls
+                        // (no-op here)
                     } else {
-                        CtBlock<?> body = f.Core().createBlock();
-                        CtReturn<?> r = defaultReturn(mirrorRt);
-                        if (r != null) body.addStatement(r);
-                        um.setBody(body);
-                        um.removeModifier(ModifierKind.ABSTRACT);
+                        // --- build mirror return & params adapted to the MIRROR owner ---
+                        CtTypeReference<?> mirrorRt = rt; // default: same as real
+                        List<CtTypeReference<?>> mirrorParamRefs = new ArrayList<>(normParams);
+
+                        // Special-case enum helpers to mirror to the mirror-owner type:
+                        String mn = p.name;
+                        String mirrorOwnerQN = safeQN(p.mirrorOwnerRef);
+
+                        boolean isEnumValues = "values".equals(mn) && mirrorParamRefs.isEmpty();
+                        boolean isEnumValueOf = "valueOf".equals(mn) && mirrorParamRefs.size() == 1;
+                        boolean isEnumName = "name".equals(mn) && mirrorParamRefs.isEmpty();
+
+                        if (isEnumValues || isEnumValueOf || isEnumName) {
+                            // mirrorOwnerRef element type
+                            CtTypeReference<?> mirrorElem = f.Type().createReference(mirrorOwnerQN);
+
+                            if (isEnumValues) {
+                                CtArrayTypeReference<?> arr = f.Core().createArrayTypeReference();
+                                arr.setComponentType(mirrorElem);
+                                mirrorRt = arr;
+                                mirrorParamRefs = java.util.Collections.emptyList();
+                            } else if (isEnumValueOf) {
+                                mirrorRt = mirrorElem;
+                                mirrorParamRefs = java.util.List.of(f.Type().createReference("java.lang.String"));
+                            } else { // name()
+                                mirrorRt = f.Type().createReference("java.lang.String");
+                                mirrorParamRefs = java.util.Collections.emptyList();
+                            }
+                        }
+
+                        // Create parameters for mirror
+                        List<CtParameter<?>> mirrorParams = makeParams(mirrorParamRefs);
+
+                        // --- compute mirror modifiers independently (don't reuse owner's blindly) ---
+                        Set<ModifierKind> mirrorMods = new HashSet<>();
+                        if (isEnumValues || isEnumValueOf) {
+                            // static enum helpers
+                            mirrorMods.add(ModifierKind.PUBLIC);
+                            mirrorMods.add(ModifierKind.STATIC);
+                        } else if (isEnumName) {
+                            // instance
+                            mirrorMods.add(ModifierKind.PUBLIC);
+                        } else {
+                            // non-helper: mirror what the plan says
+                            if (p.isStatic) mirrorMods.add(ModifierKind.STATIC);
+                            switch (p.visibility) {
+                                case PRIVATE:
+                                    mirrorMods.add(ModifierKind.PRIVATE);
+                                    break;
+                                case PROTECTED:
+                                    mirrorMods.add(ModifierKind.PROTECTED);
+                                    break;
+                                case PUBLIC:
+                                    mirrorMods.add(ModifierKind.PUBLIC);
+                                    break;
+                                case PACKAGE:   /* none */
+                                    break;
+                            }
+                        }
+
+                        // Avoid duplicates on mirror using mirrorParamRefs
+                        if (!hasMethod(mirrorOwner, p.name, mirrorParamRefs)) {
+                            CtMethod<?> um = f.Method().create(mirrorOwner, mirrorMods, mirrorRt, p.name, mirrorParams, thrown);
+
+                            // varargs on mirror (non-helper case only; helpers don’t use varargs)
+                            if (p.varargs && !(isEnumValues || isEnumValueOf || isEnumName) && !um.getParameters().isEmpty()) {
+                                CtParameter<?> last = um.getParameters().get(um.getParameters().size() - 1);
+                                CtTypeReference<?> lt = last.getType();
+                                if (lt != null && !lt.isArray()) {
+                                    CtArrayTypeReference<?> arr = f.Core().createArrayTypeReference();
+                                    arr.setComponentType(lt);
+                                    last.setType(arr);
+                                }
+                                last.setVarArgs(true);
+                            }
+
+                            // body rules (same as owner)
+                            boolean mirrorIsInterface = mirrorOwner instanceof CtInterface;
+                            if (mirrorIsInterface) {
+                                if (p.defaultOnInterface) {
+                                    um.setDefaultMethod(true);
+                                    um.addModifier(ModifierKind.PUBLIC);
+                                    CtBlock<?> body = f.Core().createBlock();
+                                    CtReturn<?> r = defaultReturn(mirrorRt);
+                                    if (r != null) body.addStatement(r);
+                                    um.setBody(body);
+                                    um.removeModifier(ModifierKind.ABSTRACT);
+                                } else {
+                                    um.setBody(null);
+                                    um.addModifier(ModifierKind.PUBLIC);
+                                    um.addModifier(ModifierKind.ABSTRACT);
+                                }
+                            } else {
+                                CtBlock<?> body = f.Core().createBlock();
+                                CtReturn<?> r = defaultReturn(mirrorRt);
+                                if (r != null) body.addStatement(r);
+                                um.setBody(body);
+                                um.removeModifier(ModifierKind.ABSTRACT);
+                            }
+
+                            // imports for mirror
+                            ensureImport(mirrorOwner, mirrorRt);
+                            for (CtParameter<?> par : um.getParameters()) ensureImport(mirrorOwner, par.getType());
+                            for (CtTypeReference<?> t : thrown) ensureImport(mirrorOwner, t);
+
+                            createdMethods.add(sig(mirrorOwner.getQualifiedName(), p.name, mirrorParamRefs) + " : " + readable(mirrorRt));
+                            created++;
+                        }
                     }
-
-                    // imports for mirror
-                    ensureImport(mirrorOwner, mirrorRt);
-                    for (CtParameter<?> par : um.getParameters()) ensureImport(mirrorOwner, par.getType());
-                    for (CtTypeReference<?> t : thrown) ensureImport(mirrorOwner, t);
-
-                    createdMethods.add(sig(mirrorOwner.getQualifiedName(), p.name, mirrorParamRefs) + " : " + readable(mirrorRt));
-                    created++;
                 }
+
             }
-
-
         }
 
         return created;
@@ -750,6 +866,8 @@ public final class SpoonStubber {
             String pkg = Optional.ofNullable(t.getPackage())
                     .map(CtPackage::getQualifiedName)
                     .orElse("");
+            // Skip de-qualification if a type with that simple name exists in *another* package we generated this run.
+
             t.getElements(e -> e instanceof CtTypeReference<?>).forEach(refEl -> {
                 CtTypeReference<?> ref = (CtTypeReference<?>) refEl;
                 String qn = null;
@@ -757,6 +875,7 @@ public final class SpoonStubber {
                     qn = ref.getQualifiedName();
                 } catch (Throwable ignored) {
                 }
+
                 boolean looksCurrentPkg = qn != null && !qn.isEmpty()
                         && pkg.length() > 0 && qn.startsWith(pkg + ".");
                 if (looksCurrentPkg && ref.getDeclaration() == null) {
@@ -1226,6 +1345,158 @@ public final class SpoonStubber {
         }
         // Spoon will create missing segments as needed:
         return f.Package().getOrCreate(fqn);
+    }
+
+    // After generation, rebind superclasses that still point at unknown.* to a concrete owner we created,
+// preferring the current package if available; otherwise keep as-is.
+    public void rebindUnknownSupertypesToConcrete() {
+        CtModel model = f.getModel();
+
+        // Build a quick lookup: simpleName -> non-unknown FQNs we created
+        Map<String, String> concreteBySimple = new HashMap<>();
+        for (String fq : createdTypes) {
+            if (fq == null || fq.startsWith("unknown.")) continue;
+            String simple = fq.contains("$") ? fq.substring(fq.lastIndexOf('$') + 1) : fq.substring(fq.lastIndexOf('.') + 1);
+            // Prefer first concrete occurrence; that's enough for our rebinding rule
+            concreteBySimple.putIfAbsent(simple, fq);
+        }
+
+        for (CtType<?> t : model.getAllTypes()) {
+            if (!(t instanceof CtClass)) continue;
+
+            CtClass<?> cls = (CtClass<?>) t;
+            CtTypeReference<?> sup = null;
+            try { sup = cls.getSuperclass(); } catch (Throwable ignored) {}
+            if (sup == null) continue;
+
+            String qn = null;
+            try { qn = sup.getQualifiedName(); } catch (Throwable ignored) {}
+            if (qn == null || !qn.startsWith("unknown.")) continue;
+
+            String simple = sup.getSimpleName();
+
+            // 1) Prefer current package (like fixtures.sup.P)
+            String pkg = Optional.ofNullable(cls.getPackage()).map(CtPackage::getQualifiedName).orElse("");
+            if (!pkg.isEmpty()) {
+                CtTypeReference<?> candidate = f.Type().createReference(pkg + "." + simple);
+                // We can just rebind to this ref; Stubber already creates types by plan.
+                cls.setSuperclass(candidate);
+                continue;
+            }
+
+            // 2) Otherwise, if we created a concrete owner with same simple name, bind to that
+            String concreteFqn = concreteBySimple.get(simple);
+            if (concreteFqn != null) {
+                cls.setSuperclass(f.Type().createReference(concreteFqn));
+            }
+        }
+    }
+
+
+    public void rebindUnknownTypeReferencesToConcrete() {
+        CtModel model = f.getModel();
+
+        // simple -> one concrete FQN we created this run
+        java.util.Map<String, String> concreteBySimple = new java.util.HashMap<>();
+        for (String fq : createdTypes) {
+            if (fq == null || fq.startsWith("unknown.")) continue;
+            String simple = fq.contains("$")
+                    ? fq.substring(fq.lastIndexOf('$') + 1)
+                    : fq.substring(fq.lastIndexOf('.') + 1);
+            concreteBySimple.putIfAbsent(simple, fq);
+        }
+        System.out.println("[rebind] concrete map = " + concreteBySimple);
+
+        AtomicInteger changes = new AtomicInteger();
+
+        for (CtType<?> owner : model.getAllTypes()) {
+            final String ownerPkg = java.util.Optional.ofNullable(owner.getPackage())
+                    .map(CtPackage::getQualifiedName)
+                    .orElse("");
+
+            owner.getElements(e -> e instanceof CtTypeReference<?>).forEach(el -> {
+                CtTypeReference<?> ref = (CtTypeReference<?>) el;
+
+                // Drill down to the *base component type* if this is an array
+                CtTypeReference<?> base = ref;
+                while (base instanceof spoon.reflect.reference.CtArrayTypeReference) {
+                    base = ((spoon.reflect.reference.CtArrayTypeReference<?>) base).getComponentType();
+                }
+
+                String qn;
+                try { qn = base.getQualifiedName(); } catch (Throwable t) { qn = null; }
+                if (qn == null || !qn.startsWith("unknown.")) return;
+
+                String simple = base.getSimpleName();
+
+                // 1) Prefer a concrete we generated (e.g., from star-import owner choice)
+                String concreteFqn = concreteBySimple.get(simple);
+                if (concreteFqn != null) {
+                    CtTypeReference<?> newRef = f.Type().createReference(concreteFqn);
+                    base.setPackage(newRef.getPackage());    // CtPackageReference
+                    base.setSimpleName(newRef.getSimpleName());
+                    changes.getAndIncrement();
+                    return;
+                }
+
+                // 2) Otherwise, fall back to current CU package
+                if (!ownerPkg.isEmpty()) {
+                    CtTypeReference<?> newRef = f.Type().createReference(ownerPkg + "." + simple);
+                    base.setPackage(newRef.getPackage());
+                    base.setSimpleName(newRef.getSimpleName());
+                    changes.getAndIncrement();
+                }
+            });
+        }
+
+        if (changes.get() > 0) {
+            System.out.println("[rebind] replaced " + changes + " unknown.* type refs (arrays supported)");
+        }
+    }
+
+
+
+    public void removeUnknownStarImportsIfUnused() {
+        CtModel model = f.getModel();
+
+        for (CtType<?> t : model.getAllTypes()) {
+            CtCompilationUnit cu;
+            try {
+                cu = f.CompilationUnit().getOrCreate(t);
+            } catch (Throwable ignored) {
+                continue;
+            }
+            if (cu == null) continue;
+
+            boolean hasUnknownRefs = t.getElements(e -> e instanceof CtTypeReference<?>)
+                    .stream()
+                    .map(e -> (CtTypeReference<?>) e)
+                    .anyMatch(ref -> {
+                        try {
+                            String qn = ref.getQualifiedName();
+                            return qn != null && qn.startsWith("unknown.");
+                        } catch (Throwable ex) {
+                            return false;
+                        }
+                    });
+
+            if (hasUnknownRefs) continue;
+
+            boolean removed = cu.getImports().removeIf(imp -> {
+                try {
+                    spoon.reflect.reference.CtReference r = imp.getReference();
+                    if (r == null) return false;
+                    String s = r.toString(); // robust across CtReference subclasses
+                    return "unknown.*".equals(s) || (s != null && s.startsWith("unknown."));
+                } catch (Throwable ex) {
+                    return false;
+                }
+            });
+
+            if (removed) {
+                System.out.println("[imports] removed unknown.* import from CU of " + t.getQualifiedName());
+            }
+        }
     }
 
 

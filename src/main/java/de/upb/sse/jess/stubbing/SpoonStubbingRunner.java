@@ -68,10 +68,18 @@ public final class SpoonStubbingRunner implements Stubber {
 
         int created = 0;
         created += stubber.applyTypePlans(plans.typePlans);       // types (classes/interfaces/annotations)
-        stubber.applyImplementsPlans(plans.implementsPlans);
+
         created += stubber.applyFieldPlans(plans.fieldPlans);     // fields
         created += stubber.applyConstructorPlans(plans.ctorPlans);// constructors
         created += stubber.applyMethodPlans(plans.methodPlans);   // methods
+        stubber.applyImplementsPlans(plans.implementsPlans);
+
+
+        stubber.rebindUnknownTypeReferencesToConcrete();
+        stubber.removeUnknownStarImportsIfUnused();
+       stubber.rebindUnknownSupertypesToConcrete();
+        stubber.dequalifyCurrentPackageUnresolvedRefs();
+
 
         // Qualify ONLY the ambiguous names we actually touched (scoped)
         stubber.qualifyAmbiguousSimpleTypes(plans.ambiguousSimples);
@@ -83,8 +91,6 @@ public final class SpoonStubbingRunner implements Stubber {
             stubber.canonicalizeAllMetaAnnotations();
         }
 
-        // Keep this if you still rely on import binding for same-package unresolved refs
-        stubber.dequalifyCurrentPackageUnresolvedRefs();
 
         stubber.report(); // summary
 
