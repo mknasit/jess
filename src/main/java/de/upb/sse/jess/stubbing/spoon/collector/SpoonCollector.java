@@ -619,7 +619,14 @@ public final class SpoonCollector {
             CtExecutableReference<?> ex = inv.getExecutable();
             String name = (ex != null ? ex.getSimpleName() : null);
             // decide staticness & varargs early
-            boolean makeStatic = isStaticCallSite(inv);
+
+            boolean makeStatic =
+                    // 1) static context (static field init, static block, static method)
+                    isInStaticContext(inv)
+                            // 2) explicit Type::call (receiver is a type)
+                            || (inv.getTarget() instanceof CtTypeAccess<?>)
+                            // 3) static import call: method() with no target but resolved from a static import owner
+                            || (inv.getTarget() == null && resolveOwnerFromStaticImports(inv, name) != null);
             boolean makeVarargs = looksLikeVarargs(inv);
 
             // constructors
@@ -632,13 +639,6 @@ public final class SpoonCollector {
                 continue;
             }
 
-
-
-
-            // treat unqualified call in static context as static
-            if (!makeStatic && inv.getTarget() == null && isInStaticContext(inv)) {
-                makeStatic = true;
-            }
 
             // --- owner from call-site -------------------------------------------
             CtExpression<?> tgt = inv.getTarget();
@@ -679,7 +679,7 @@ public final class SpoonCollector {
 
                 // implicit this + single non-JDK interface => default method on that iface
                 boolean implicitThis = (tgt == null) || (tgt instanceof spoon.reflect.code.CtThisAccess<?>);
-                if (implicitThis) {
+                if (implicitThis && !makeStatic) {
                     CtClass<?> encl = inv.getParent(CtClass.class);
                     if (encl != null) {
                         List<CtTypeReference<?>> nonJdkIfaces = encl.getSuperInterfaces().stream()
@@ -894,7 +894,7 @@ public final class SpoonCollector {
             }
 
 
-
+            boolean staticCtx = isInStaticContext(inv);
             // enqueue plan — NOTE: no mirroring when owner is already unknown.*
             out.methodPlans.add(new MethodStubPlan(
                     owner, name,
@@ -2458,22 +2458,32 @@ public final class SpoonCollector {
 
 
     private boolean isInStaticContext(CtInvocation<?> inv) {
-        // static field initializer
-        CtField<?> fld = inv.getParent(CtField.class);
-        if (fld != null && fld.hasModifier(ModifierKind.STATIC)) {
-            return true;
-        }
-
-        // class initializer blocks are CtAnonymousExecutable in Spoon 10.x
-        CtAnonymousExecutable init = inv.getParent(CtAnonymousExecutable.class);
-        if (init != null && init.hasModifier(ModifierKind.STATIC)) {
-            return true;
-        }
-
-        return false;
+        return isInStaticContext((CtElement) inv);
     }
 
 
+
+    // Canonical helper: works for invocations, field init exprs, static blocks, static methods
+    private boolean isInStaticContext(CtElement e) {
+        CtElement cur = e;
+        while (cur != null) {
+            if (cur instanceof spoon.reflect.declaration.CtMethod<?>) {
+                return ((spoon.reflect.declaration.CtMethod<?>) cur)
+                        .hasModifier(spoon.reflect.declaration.ModifierKind.STATIC);
+            }
+            if (cur instanceof spoon.reflect.declaration.CtField<?>) {
+                return ((spoon.reflect.declaration.CtField<?>) cur)
+                        .hasModifier(spoon.reflect.declaration.ModifierKind.STATIC);
+            }
+            if (cur instanceof spoon.reflect.declaration.CtAnonymousExecutable) {
+                return ((spoon.reflect.declaration.CtAnonymousExecutable) cur)
+                        .hasModifier(spoon.reflect.declaration.ModifierKind.STATIC);
+            }
+            if (cur instanceof spoon.reflect.declaration.CtType<?>) break; // stop at type boundary
+            cur = cur.getParent();
+        }
+        return false;
+    }
 
 
 
@@ -2814,6 +2824,8 @@ public final class SpoonCollector {
             }
         });
     }
+
+
 
 
 }
