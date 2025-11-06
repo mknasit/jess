@@ -46,7 +46,6 @@ public final class SpoonCollector {
         public final List<MethodStubPlan> methodPlans = new ArrayList<>();
         public final Set<String> ambiguousSimples = new LinkedHashSet<>();
         public final Map<String, Set<CtTypeReference<?>>> implementsPlans = new LinkedHashMap<>();
-        public final java.util.Set<String> enumOwners = new java.util.LinkedHashSet<>();
         // de.upb.sse.jess.stubbing.spoon.collector.CollectResult
         public Map<String, String> unknownToConcrete = new java.util.HashMap<>();
 
@@ -128,6 +127,7 @@ public final class SpoonCollector {
         collectUnresolvedFields(model, result);
         collectUnresolvedCtorCalls(model, result);
         collectUnresolvedMethodCalls(model, result);
+        collectForEachLoops(model, result);
         collectMethodReferences(model, result);
         collectUnresolvedAnnotations(model, result);
 
@@ -2952,6 +2952,65 @@ public final class SpoonCollector {
             out.unknownToConcrete.put("unknown." + e.getKey(), e.getValue());
         }
     }
+
+
+
+    // import spoon.reflect.code.CtForEach;
+// import spoon.reflect.visitor.filter.TypeFilter;
+
+    private void collectForEachLoops(CtModel model, CollectResult out) {
+        for (CtForEach fe : model.getElements(new TypeFilter<>(CtForEach.class))) {
+            try {
+                // Skip arrays – they’re already iterable without interface
+                CtExpression<?> expr = fe.getExpression();
+                if (expr == null) continue;
+                CtTypeReference<?> ownerRef = expr.getType();
+                if (ownerRef == null) continue;
+                try { if (ownerRef.isArray()) continue; } catch (Throwable ignored) {}
+
+                // Don’t stub JDK types
+                if (isJdkType(ownerRef)) continue;
+
+                // Owner FQN (respect your owner-picking heuristic)
+                ownerRef = chooseOwnerPackage(ownerRef, fe);
+                String ownerQn = safeQN(ownerRef);
+                if (ownerQn == null) continue;
+
+                // Element type = loop variable type (default to Object)
+                CtTypeReference<?> elem = (fe.getVariable() != null ? fe.getVariable().getType() : null);
+                if (elem == null) elem = f.Type().OBJECT;
+
+                CtTypeReference<?> iterableRef = f.Type().createReference("java.lang.Iterable");
+                iterableRef.addActualTypeArgument(elem.clone());
+
+                out.implementsPlans
+                        .computeIfAbsent(ownerQn, k -> new java.util.LinkedHashSet<>())
+                        .add(iterableRef);
+
+                CtTypeReference<?> iteratorRef = f.Type().createReference("java.util.Iterator");
+                iteratorRef.addActualTypeArgument(elem.clone());
+
+                out.methodPlans.add(new MethodStubPlan(
+                        ownerRef,
+                        "iterator",
+                        iteratorRef,
+                        java.util.Collections.emptyList(),
+                        /*isStatic*/ false,
+                        MethodStubPlan.Visibility.PUBLIC,
+                        java.util.Collections.emptyList(),
+                        /*defaultOnInterface*/ false,
+                        /*varargs*/ false,
+                        /*mirror*/ false,
+                        /*mirrorOwnerRef*/ null
+                ));
+
+                // Ensure the owner type will exist (class by default)
+                addTypePlanIfNonJdk(out, ownerQn, TypeStubPlan.Kind.CLASS);
+
+            } catch (Throwable ignored) { /* be defensive in collector */ }
+        }
+    }
+
 
 
 

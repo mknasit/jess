@@ -1266,7 +1266,7 @@ public final class SpoonStubber {
             String ownerFqn = e.getKey();
             if (ownerFqn == null || ownerFqn.isEmpty()) continue;
 
-            // always create/fetch the owner only (never the interface type)
+            // Always create/fetch the owner only (never the interface type)
             CtType<?> owner = ensurePublicOwnerForFqn(ownerFqn);
             if (owner == null) continue;
 
@@ -1279,24 +1279,36 @@ public final class SpoonStubber {
                 String iqn = safeQN(ifaceRef);
                 if (iqn == null || iqn.isEmpty()) continue;
 
-                // 1) Never create or upgrade JDK/Jakarta/etc. interfaces – just reference them
+                CtTypeReference<?> toAttach = null;
+
+                // --- JDK / Jakarta etc.: do NOT create types; attach reference but keep <T> ---
                 if (isJdkFqn(iqn)) {
-                    CtTypeReference<?> jref = f.Type().createReference(iqn);
-                    // dedupe by erasure/simple name
-                    boolean exists = owner.getSuperInterfaces().stream()
-                            .anyMatch(cur -> cur != null && cur.getSimpleName().equals(jref.getSimpleName()));
-                    if (!exists) owner.addSuperInterface(jref);
-                    continue;
+                    CtTypeReference<?> withArgs = cloneIntoFactoryWithTypeArgs(ifaceRef, owner.getFactory());
+
+                    // If a raw superinterface with same erasure exists, remove it; if exact parameterized exists, skip
+                    CtTypeReference<?> rawExisting = null;
+                    boolean exactExists = false;
+                    for (CtTypeReference<?> cur : new java.util.ArrayList<>(owner.getSuperInterfaces())) {
+                        if (cur == null) continue;
+                        if (cur.getQualifiedName().equals(withArgs.getQualifiedName())) {
+                            if (cur.getActualTypeArguments().isEmpty()) {
+                                rawExisting = cur;
+                            } else if (cur.toString().equals(withArgs.toString())) {
+                                exactExists = true;
+                            }
+                        }
+                    }
+                    if (rawExisting != null) owner.getSuperInterfaces().remove(rawExisting);
+                    if (!exactExists) owner.addSuperInterface(withArgs);
+                    continue; // done with this iface
                 }
 
-                // 2) Non-JDK: prefer an existing interface if present
+                // --- Non-JDK: reuse existing interface if present, preserving <T> from ifaceRef ---
                 CtType<?> existing = f.Type().get(iqn);
-                CtTypeReference<?> toAttach;
-
                 if (existing instanceof CtInterface) {
-                    toAttach = existing.getReference();
+                    toAttach = cloneIntoFactoryWithTypeArgs(ifaceRef, owner.getFactory());
                 } else if (existing instanceof CtClass) {
-                    // Only convert if it’s one of OUR fresh empty stubs
+                    // Only convert if it's one of OUR fresh empty stubs
                     boolean weCreated = createdTypes.contains(existing.getQualifiedName());
                     boolean looksEmpty =
                             ((CtClass<?>) existing).getFields().isEmpty()
@@ -1317,13 +1329,14 @@ public final class SpoonStubber {
                         CtInterface<?> itf = f.Interface().create(p, sn);
                         itf.addModifier(ModifierKind.PUBLIC);
                         createdTypes.add(itf.getQualifiedName());
-                        toAttach = itf.getReference();
+                        // again, preserve type args from ifaceRef on the reference we attach
+                        toAttach = cloneIntoFactoryWithTypeArgs(ifaceRef, owner.getFactory());
                     } else {
-                        // don’t mutate user code – just attach a reference (javac will complain if needed)
-                        toAttach = existing.getReference();
+                        // don't mutate user code – just attach a reference with the type args from ifaceRef
+                        toAttach = cloneIntoFactoryWithTypeArgs(ifaceRef, owner.getFactory());
                     }
                 } else {
-                    // 3) Not present → create a new interface (non-JDK)
+                    // Not present → create a new interface (non-JDK)
                     int dot = iqn.lastIndexOf('.');
                     String pkg = (dot >= 0 ? iqn.substring(0, dot) : "");
                     String sn  = (dot >= 0 ? iqn.substring(dot + 1) : iqn);
@@ -1331,15 +1344,47 @@ public final class SpoonStubber {
                     CtInterface<?> itf = f.Interface().create(p, sn);
                     itf.addModifier(ModifierKind.PUBLIC);
                     createdTypes.add(itf.getQualifiedName());
-                    toAttach = itf.getReference();
+                    toAttach = cloneIntoFactoryWithTypeArgs(ifaceRef, owner.getFactory());
                 }
 
-                // 4) attach if not already present (dedupe by erasure/simple)
-                boolean exists = owner.getSuperInterfaces().stream()
-                        .anyMatch(cur -> cur != null && cur.getSimpleName().equals(toAttach.getSimpleName()));
-                if (!exists) owner.addSuperInterface(toAttach);
+                // --- Attach if not already present; upgrade raw to parameterized when needed ---
+                if (toAttach != null) {
+                    CtTypeReference<?> rawExisting = null;
+                    boolean exactExists = false;
+                    for (CtTypeReference<?> cur : new java.util.ArrayList<>(owner.getSuperInterfaces())) {
+                        if (cur == null) continue;
+                        if (cur.getQualifiedName().equals(toAttach.getQualifiedName())) {
+                            if (cur.getActualTypeArguments().isEmpty()) {
+                                rawExisting = cur; // we'll upgrade it
+                            } else if (cur.toString().equals(toAttach.toString())) {
+                                exactExists = true; // exact parameterization already present
+                            }
+                        }
+                    }
+                    if (rawExisting != null) owner.getSuperInterfaces().remove(rawExisting);
+                    if (!exactExists) owner.addSuperInterface(toAttach);
+                }
             }
         }
+    }
+
+
+
+
+    private CtTypeReference<?> cloneIntoFactoryWithTypeArgs(CtTypeReference<?> src, Factory targetFactory) {
+        if (src == null) return null;
+
+        // Create a reference in the target factory with the same erasure (qualified name)
+        CtTypeReference<?> dst = targetFactory.Type().createReference(src.getQualifiedName());
+
+        // Clear any default args (usually empty) and copy actual type arguments recursively
+        dst.getActualTypeArguments().clear();
+        for (CtTypeReference<?> a : src.getActualTypeArguments()) {
+            // Recursively preserve nested arguments/wildcards/etc.
+            CtTypeReference<?> aCopy = a.clone(); // cloning is OK; Spoon will accept it on dst
+            dst.addActualTypeArgument(aCopy);
+        }
+        return dst;
     }
 
 
