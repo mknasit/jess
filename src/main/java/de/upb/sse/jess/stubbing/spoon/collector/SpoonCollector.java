@@ -13,6 +13,7 @@ import spoon.reflect.path.CtRole;
 import spoon.reflect.reference.CtArrayTypeReference;
 import spoon.reflect.reference.CtExecutableReference;
 import spoon.reflect.reference.CtTypeReference;
+import spoon.reflect.reference.CtVariableReference;
 import spoon.reflect.visitor.filter.TypeFilter;
 
 import java.util.*;
@@ -126,9 +127,10 @@ public final class SpoonCollector {
         collectTryWithResources(model, result);
         collectUnresolvedFields(model, result);
         collectUnresolvedCtorCalls(model, result);
-        collectUnresolvedMethodCalls(model, result);
         collectForEachLoops(model, result);
-        collectMethodReferences(model, result);
+        collectMethodReferences(model, result);  // Collect method references FIRST (creates functional interface SAM methods)
+        collectUnresolvedMethodCalls(model, result);  // Collect method calls (may create SAM methods from calls like f.apply(1))
+        collectLambdas(model, result);  // Collect lambdas LAST and remove/replace any existing SAM methods with correct signature from lambda
         collectUnresolvedAnnotations(model, result);
 
         collectExceptionTypes(model, result);
@@ -137,11 +139,16 @@ public final class SpoonCollector {
         collectFromInstanceofCastsClassLiteralsAndForEach(model, result);
         collectUnresolvedDeclaredTypes(model, result);
         collectAnnotationTypeUsages(model, result);
-        collectOverloadGaps(model, result);
+        collectOverloadGaps(model, result);  // This runs AFTER collectLambdas, so it might re-add methods - need to prevent duplicates
 
         seedOnDemandImportAnchors(model, result);
         seedExplicitTypeImports(model, result);
 
+        // Final cleanup: Remove duplicate SAM methods from functional interfaces
+        // This ensures that functional interfaces have only ONE abstract method
+        // Even if different collection phases added methods with different parameter types (int vs Integer)
+        removeDuplicateSamMethods(result);
+        
         // Ensure owners exist for any planned members / references discovered above.
         result.typePlans.addAll(ownersNeedingTypes(result));
 
@@ -534,8 +541,12 @@ public final class SpoonCollector {
                     }
 
                     // plan types + ctor
+                    // Mark inner class as non-static since it's used with o.new Inner() syntax
                     addTypePlanIfNonJdk(out, outerFqn, TypeStubPlan.Kind.CLASS);
-                    addTypePlanIfNonJdk(out, outerFqn + "$" + innerSimple, TypeStubPlan.Kind.CLASS);
+                    String innerFqn = outerFqn + "$" + innerSimple;
+                    if (!isJdkFqn(innerFqn)) {
+                        out.typePlans.add(new TypeStubPlan(innerFqn, TypeStubPlan.Kind.CLASS, true)); // non-static inner
+                    }
 
                     out.ctorPlans.add(new ConstructorStubPlan(memberOwner, ps));
                     // do NOT fall through to generic path
@@ -1772,6 +1783,7 @@ public final class SpoonCollector {
      * the given argument types. Emit a plan to create a matching overload.
      */
     private void collectOverloadGaps(CtModel model, CollectResult out) {
+        System.err.println("[collectOverloadGaps] Starting, current method plans: " + out.methodPlans.size());
         List<CtInvocation<?>> invocations = model.getElements((CtInvocation<?> inv) -> {
             CtExecutableReference<?> ex = inv.getExecutable();
             String name = (ex != null ? ex.getSimpleName() : null);
@@ -1810,6 +1822,37 @@ public final class SpoonCollector {
 
             CtTypeReference<?> returnType = inferReturnTypeFromContext(inv);
             if (returnType == null) returnType = f.Type().VOID_PRIMITIVE;
+            
+            // For method calls on functional interfaces, check if this is the SAM method
+            // If the owner is a functional interface and this is "make" or "apply", 
+            // ensure we use the correct return type from the functional interface
+            String ownerQn = safeQN(owner);
+            if (ownerQn != null && ("make".equals(name) || "apply".equals(name))) {
+                // Check if this owner is a functional interface (has a method plan with make/apply)
+                boolean isFunctionalInterface = out.methodPlans.stream()
+                        .anyMatch(p -> {
+                            try {
+                                String pOwnerQn = safeQN(p.ownerType);
+                                return ownerQn.equals(pOwnerQn) && 
+                                       ("make".equals(p.name) || "apply".equals(p.name));
+                            } catch (Throwable ignored) {
+                                return false;
+                            }
+                        });
+                if (isFunctionalInterface) {
+                    // Use the return type from the functional interface SAM, not from context
+                    // This prevents wrong return types like "unknown.A" instead of "fixtures.lambda2.A"
+                    for (MethodStubPlan plan : out.methodPlans) {
+                        try {
+                            String pOwnerQn = safeQN(plan.ownerType);
+                            if (ownerQn.equals(pOwnerQn) && name.equals(plan.name)) {
+                                returnType = plan.returnType;
+                                break;
+                            }
+                        } catch (Throwable ignored) {}
+                    }
+                }
+            }
 
 //            List<CtTypeReference<?>> paramTypes = inv.getArguments().stream()
 //                    .map(this::paramTypeOrObject)
@@ -1860,8 +1903,52 @@ public final class SpoonCollector {
                 );
             }
 
+            // Check if this is a method call on a functional interface
+            // Functional interfaces should only have ONE abstract method (the SAM)
+            // If the owner already has a SAM method plan (make/apply), skip adding any other SAM method
+            // This prevents creating multiple abstract methods which would make it non-functional
+            // Note: Even if parameter types differ (e.g., apply(int) vs apply(Integer)), we should only have one
+            // because Java autoboxing allows apply(1) to call apply(Integer)
+            boolean isFunctionalInterfaceMethod = ("make".equals(name) || "apply".equals(name));
+            if (isFunctionalInterfaceMethod) {
+                String finalOwnerQn = ownerQn;
+                // Also check erased FQN to handle generics (F vs F<Integer>)
+                String finalOwnerQnErased = erasureFqn(owner);
+                boolean alreadyHasSam = out.methodPlans.stream()
+                        .anyMatch(p -> {
+                            try {
+                                String pOwnerQn = safeQN(p.ownerType);
+                                // Check if owner already has ANY make/apply method (functional interface can only have one)
+                                // Must be abstract (not default, not static) to count as SAM
+                                boolean ownerMatches = finalOwnerQn != null && finalOwnerQn.equals(pOwnerQn);
+                                if (!ownerMatches && finalOwnerQnErased != null) {
+                                    String pOwnerQnErased = erasureFqn(p.ownerType);
+                                    ownerMatches = finalOwnerQnErased.equals(pOwnerQnErased);
+                                }
+                                return ownerMatches && 
+                                       ("make".equals(p.name) || "apply".equals(p.name)) &&
+                                       !p.defaultOnInterface && !p.isStatic;
+                            } catch (Throwable ignored) {
+                                return false;
+                            }
+                        });
+                if (alreadyHasSam) {
+                    // Functional interface already has a SAM method - skip adding another one
+                    // This prevents errors like "multiple non-overriding abstract methods found"
+                    // Even if the parameter types are different (int vs Integer), we can only have one SAM
+                    System.err.println("[collectOverloadGaps] Skipping duplicate SAM method: " + finalOwnerQn + "#" + name + 
+                        " (already exists)");
+                    continue;
+                }
+            }
+
             out.methodPlans.add(new MethodStubPlan(owner, name, returnType, paramTypes, isStatic, vis, thrown));
+            if (("apply".equals(name) || "make".equals(name))) {
+                System.err.println("[collectOverloadGaps] Added SAM method: " + ownerQn + "#" + name + "(" + 
+                    paramTypes.stream().map(t -> safeQN(t)).collect(java.util.stream.Collectors.joining(", ")) + ")");
+            }
         }
+        System.err.println("[collectOverloadGaps] Finished, total method plans: " + out.methodPlans.size());
     }
 
     /**
@@ -2807,7 +2894,16 @@ public final class SpoonCollector {
             }
             // If still unknown, keep going; we’ll at least fix the owner of the reference.
 
-            // ---- (1) Ensure FI exists as an INTERFACE (never a class) + stub SAM ----
+            // ---- (1) Determine the referenced method name early (needed for constructor detection) ----
+            String name = (ex != null ? ex.getSimpleName() : null);
+            String mrefText = String.valueOf(mref);
+
+// --- NEW: detect constructor method refs robustly ---
+            boolean isCtorRef =
+                    (name == null && mrefText != null && mrefText.contains("::new"))   // textual fallback
+                            || "new".equals(name) || "<init>".equals(name);
+
+            // ---- (2) Ensure FI exists as an INTERFACE (never a class) + stub SAM ----
             if (fiQn != null
                     && !(fiQn.startsWith("java.") || fiQn.startsWith("javax.") ||
                     fiQn.startsWith("jakarta.") || fiQn.startsWith("sun.")  ||
@@ -2819,10 +2915,71 @@ public final class SpoonCollector {
                 CtTypeReference<?> samRet = shape.getKey();
                 List<CtTypeReference<?>> samParams = shape.getValue();
 
-                // Stub abstract SAM: apply(...)
+                // For constructor references, infer SAM from the constructor signature
+                if (isCtorRef) {
+                    CtExpression<?> target = mref.getTarget();
+                    CtTypeReference<?> constructedType = null;
+                    
+                    if (target instanceof CtTypeAccess<?>) {
+                        constructedType = ((CtTypeAccess<?>) target).getAccessedType();
+                    }
+                    
+                    // Also try to infer from method reference text (e.g., "String[]::new")
+                    if (constructedType == null) {
+                        String mrText = String.valueOf(mref);
+                        if (mrText != null && mrText.contains("::new")) {
+                            int newIdx = mrText.indexOf("::new");
+                            if (newIdx > 0) {
+                                String typePart = mrText.substring(0, newIdx).trim();
+                                // Check if it's an array type
+                                if (typePart.endsWith("[]")) {
+                                    // Array constructor - create array type reference
+                                    String elementType = typePart.substring(0, typePart.length() - 2);
+                                    try {
+                                        CtTypeReference<?> elemRef = f.Type().createReference(elementType);
+                                        constructedType = f.Type().createArrayReference(elemRef);
+                                    } catch (Throwable ignored) {
+                                        // Fallback: try to create from full string
+                                        try {
+                                            constructedType = f.Type().createReference(typePart);
+                                        } catch (Throwable ignored2) {}
+                                    }
+                                } else {
+                                    // Non-array type
+                                    try {
+                                        constructedType = f.Type().createReference(typePart);
+                                    } catch (Throwable ignored) {}
+                                }
+                            }
+                        }
+                    }
+                    
+                    if (constructedType != null) {
+                        // Constructor reference: Type::new takes params and returns Type
+                        samRet = constructedType.clone();
+                        // For array constructors like String[]::new, default to int parameter
+                        boolean isArray = false;
+                        try {
+                            isArray = constructedType.isArray();
+                        } catch (Throwable ignored) {}
+                        String typeQn = safeQN(constructedType);
+                        if (!isArray && typeQn != null && typeQn.endsWith("[]")) {
+                            isArray = true;
+                        }
+                        if (isArray && samParams.isEmpty()) {
+                            samParams = java.util.Collections.singletonList(f.Type().createReference("int"));
+                        }
+                        // Note: For non-array constructors, we'll infer params from constructor plans below
+                    }
+                }
+
+                // Stub abstract SAM: use "make" for constructor references, "apply" for others
+                String samMethodName = isCtorRef ? "make" : "apply";
+                // For constructor references, we'll infer params from the constructor below
+                // Don't set default params here - let the constructor reference handling do it
                 out.methodPlans.add(new MethodStubPlan(
                         fiType,
-                        "apply",
+                        samMethodName,
                         samRet,
                         samParams,
                         /*isStatic*/ false,
@@ -2835,15 +2992,6 @@ public final class SpoonCollector {
                 ));
             }
 
-            // ---- (2) Determine the referenced method name ----
-            String name = (ex != null ? ex.getSimpleName() : null);
-            String mrefText = String.valueOf(mref);
-
-// --- NEW: detect constructor method refs robustly ---
-            boolean isCtorRef =
-                    (name == null && mrefText != null && mrefText.contains("::new"))   // textual fallback
-                            || "new".equals(name) || "<init>".equals(name);
-
 // ---- (3) Choose owner correctly: static Type::m vs instance obj::m ----
             CtExpression<?> target = mref.getTarget();
             CtTypeReference<?> ownerRef = null;
@@ -2854,7 +3002,20 @@ public final class SpoonCollector {
                 String forcedQN = null;
                 if (isCtorRef) {
                     CtTypeReference<?> lhs = ((CtTypeAccess<?>) target).getAccessedType();
+                    // For array types, ensure we keep the array type (not just element type)
+                    if (lhs != null) {
+                        boolean isArray = false;
+                        try {
+                            isArray = lhs.isArray();
+                        } catch (Throwable ignored) {}
+                        if (isArray) {
+                            ownerRef = lhs.clone(); // Keep array type as-is
+                        } else {
                     ownerRef = chooseOwnerPackage(lhs, mref);
+                        }
+                    } else {
+                        ownerRef = chooseOwnerPackage(lhs, mref);
+                    }
                     isStatic = false; // ctors are never static
                 } else {
                     // existing logic for static Type::method ...
@@ -2864,16 +3025,128 @@ public final class SpoonCollector {
                         String left = mrText.substring(0, idx).trim();
                         String curPkg = java.util.Optional.ofNullable(mref.getParent(CtType.class))
                                 .map(CtType::getPackage).map(CtPackage::getQualifiedName).orElse(null);
-                        forcedQN = (left.indexOf('.') >= 0 || curPkg == null ? left : curPkg + "." + left);
+                        // If left has no dots and we have a current package, use it
+                        if (left.indexOf('.') < 0 && curPkg != null && !curPkg.isEmpty()) {
+                            forcedQN = curPkg + "." + left;
+                        } else {
+                            forcedQN = left;
+                        }
                         ownerRef = f.Type().createReference(forcedQN);
                         isStatic = true;
+                        
+                        // Ensure the owner type is stubbed (e.g., "A" in "A::inc")
+                        if (forcedQN != null && !isJdkFqn(forcedQN)) {
+                            out.typePlans.add(new TypeStubPlan(forcedQN, TypeStubPlan.Kind.CLASS));
+                        }
+                    } else if (target instanceof CtTypeAccess<?>) {
+                        // Fallback: try to get the type from the target directly
+                        try {
+                            CtTypeReference<?> targetType = ((CtTypeAccess<?>) target).getAccessedType();
+                            ownerRef = chooseOwnerPackage(targetType, mref);
+                            String ownerQn = safeQN(ownerRef);
+                            if (ownerQn != null && !ownerQn.isEmpty() && !isJdkFqn(ownerQn)) {
+                                out.typePlans.add(new TypeStubPlan(ownerQn, TypeStubPlan.Kind.CLASS));
+                            }
+                        } catch (Throwable ignored) {
+                            // If that fails, try to create a reference from the text directly
+                            if (forcedQN == null && mrText != null) {
+                                int idx2 = mrText.indexOf("::");
+                                if (idx2 > 0) {
+                                    String left2 = mrText.substring(0, idx2).trim();
+                                    String curPkg2 = java.util.Optional.ofNullable(mref.getParent(CtType.class))
+                                            .map(CtType::getPackage).map(CtPackage::getQualifiedName).orElse(null);
+                                    if (left2.indexOf('.') < 0 && curPkg2 != null && !curPkg2.isEmpty()) {
+                                        forcedQN = curPkg2 + "." + left2;
+                                    } else if (!left2.isEmpty()) {
+                                        forcedQN = left2;
+                                    }
+                                    if (forcedQN != null && !isJdkFqn(forcedQN)) {
+                                        ownerRef = f.Type().createReference(forcedQN);
+                                        out.typePlans.add(new TypeStubPlan(forcedQN, TypeStubPlan.Kind.CLASS));
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             } else {
-                // INSTANCE METHOD REF: obj::method
+                // INSTANCE METHOD REF: obj::method OR unresolved Type::method
+                // Check if this might be a static method reference with unresolved type
+                String mrText = mrefText;
+                int idx = (mrText != null ? mrText.indexOf("::") : -1);
+                
+                // Check if target is a variable read that might actually be an unresolved type
+                boolean mightBeUnresolvedType = false;
+                if (target != null) {
+                    try {
+                        // If target is a variable read but the variable doesn't exist, it's likely a type
+                        if (target instanceof spoon.reflect.code.CtVariableRead<?>) {
+                            spoon.reflect.code.CtVariableRead<?> vr = (spoon.reflect.code.CtVariableRead<?>) target;
+                            try {
+                                spoon.reflect.reference.CtVariableReference<?> varRef = vr.getVariable();
+                                if (varRef == null || varRef.getDeclaration() == null) {
+                                    mightBeUnresolvedType = true; // Variable doesn't exist, likely a type
+                                }
+                            } catch (Throwable ignored) {
+                                mightBeUnresolvedType = true; // Can't resolve variable, likely a type
+                            }
+                        } else if (target instanceof spoon.reflect.code.CtVariableAccess<?>) {
+                            spoon.reflect.code.CtVariableAccess<?> va = (spoon.reflect.code.CtVariableAccess<?>) target;
+                            try {
+                                spoon.reflect.reference.CtVariableReference<?> varRef = va.getVariable();
+                                if (varRef == null || varRef.getDeclaration() == null) {
+                                    mightBeUnresolvedType = true;
+                                }
+                            } catch (Throwable ignored) {
+                                mightBeUnresolvedType = true;
+                            }
+                        }
+                    } catch (Throwable ignored) {}
+                }
+                
+                if (idx > 0 && (target == null || mightBeUnresolvedType)) {
+                    // Target is null or unresolved variable (likely type) - treat as Type::method
+                    String left = mrText.substring(0, idx).trim();
+                    String curPkg = java.util.Optional.ofNullable(mref.getParent(CtType.class))
+                            .map(CtType::getPackage).map(CtPackage::getQualifiedName).orElse(null);
+                    // If left has no dots and we have a current package, treat as Type::method
+                    if (left.indexOf('.') < 0 && curPkg != null && !curPkg.isEmpty()) {
+                        String forcedQN = curPkg + "." + left;
+                        ownerRef = f.Type().createReference(forcedQN);
+                        isStatic = true;
+                        // Ensure the owner type is stubbed
+                        if (!isJdkFqn(forcedQN)) {
+                            out.typePlans.add(new TypeStubPlan(forcedQN, TypeStubPlan.Kind.CLASS));
+                        }
+                    } else if (!left.isEmpty() && left.indexOf('.') < 0) {
+                        // Simple name without package - try current package first
+                        if (curPkg != null && !curPkg.isEmpty()) {
+                            String forcedQN = curPkg + "." + left;
+                            ownerRef = f.Type().createReference(forcedQN);
+                            isStatic = true;
+                            if (!isJdkFqn(forcedQN)) {
+                                out.typePlans.add(new TypeStubPlan(forcedQN, TypeStubPlan.Kind.CLASS));
+                            }
+                        } else {
+                            // No package info - create as-is (will be in default package or unknown)
+                            ownerRef = f.Type().createReference(left);
+                            isStatic = true;
+                            if (!isJdkFqn(left)) {
+                                out.typePlans.add(new TypeStubPlan(left, TypeStubPlan.Kind.CLASS));
+                            }
+                        }
+                    } else {
+                        // Has dots or empty - treat as instance method ref
                 CtTypeReference<?> objT = (target != null ? target.getType() : null);
                 ownerRef = chooseOwnerPackage(objT, mref);
                 isStatic = false;
+                    }
+                } else {
+                    // INSTANCE METHOD REF: obj::method (target is a valid expression)
+                    CtTypeReference<?> objT = (target != null ? target.getType() : null);
+                    ownerRef = chooseOwnerPackage(objT, mref);
+                    isStatic = false;
+                }
             }
 
 // If owner unresolved or JDK, bail
@@ -2891,7 +3164,136 @@ public final class SpoonCollector {
                 if (ownerQn != null && !isJdkFqn(ownerQn)) {
                     out.typePlans.add(new TypeStubPlan(ownerQn, TypeStubPlan.Kind.CLASS));
                 }
-                out.ctorPlans.add(new ConstructorStubPlan(ownerRef, samParams2));
+                // Before adding constructor plan, check if we already have one for this type
+                // and use its parameters for the SAM method
+                List<CtTypeReference<?>> ctorParams = samParams2;
+                String ownerQnForCtor = safeQN(ownerRef);
+                
+                // Try to infer constructor parameters from call sites
+                // If the functional interface variable is used (e.g., `Maker m = A::new; m.make()`),
+                // use the arguments from `m.make()` to infer the constructor parameters
+                if (fiQn != null) {
+                    CtLocalVariable<?> lv = mref.getParent(CtLocalVariable.class);
+                    System.err.println("[collectMethodReferences] Processing constructor reference for FI: " + fiQn + 
+                        ", local variable: " + (lv != null ? lv.getSimpleName() : "null"));
+                    if (lv != null) {
+                        // Find all invocations on this variable (e.g., `m.make()`)
+                        String varName = lv.getSimpleName();
+                        System.err.println("[collectMethodReferences] Looking for calls on variable: " + varName);
+                        
+                        // Look for method calls on this variable anywhere in the model
+                        List<CtInvocation<?>> callsOnVar = model.getElements((CtInvocation<?> inv) -> {
+                            CtExpression<?> targetinv = inv.getTarget();
+                            if (targetinv instanceof CtVariableRead<?>) {
+                                CtVariableRead<?> vr = (CtVariableRead<?>) targetinv;
+                                try {
+                                    CtVariableReference<?> varRef = vr.getVariable();
+                                    if (varRef != null) {
+                                        String targetVarName = varRef.getSimpleName();
+                                        if (varName.equals(targetVarName)) {
+                                            // Check if this is a call to the SAM method (make/apply)
+                                            CtExecutableReference<?> exexe = inv.getExecutable();
+                                            String methodName = (exexe != null ? exexe.getSimpleName() : null);
+                                            System.err.println("[collectMethodReferences] Found call on variable " + varName + 
+                                                ": " + methodName + " with " + inv.getArguments().size() + " args");
+                                            if ("make".equals(methodName) || "apply".equals(methodName)) {
+                                                return true;
+                                            }
+                                        }
+                                    }
+                                } catch (Throwable t) {
+                                    System.err.println("[collectMethodReferences] Error checking variable: " + t.getMessage());
+                                }
+                            }
+                            return false;
+                        });
+                        
+                        System.err.println("[collectMethodReferences] Found " + callsOnVar.size() + " calls on variable " + varName);
+                        
+                        // If we found calls, use the arguments from the first call to infer constructor params
+                        if (!callsOnVar.isEmpty()) {
+                            CtInvocation<?> firstCall = callsOnVar.get(0);
+                            List<CtExpression<?>> callArgs = firstCall.getArguments();
+                            if (!callArgs.isEmpty()) {
+                                // Infer parameter types from the call arguments
+                                CtExecutableReference<?> callEx = firstCall.getExecutable();
+                                ctorParams = inferParamTypesFromCall(callEx, callArgs);
+                                System.err.println("[collectMethodReferences] Inferred constructor params from call site: " + 
+                                    ctorParams.stream().map(t -> safeQN(t)).collect(java.util.stream.Collectors.joining(", ")));
+                            } else {
+                                // No arguments means no-arg constructor
+                                ctorParams = new ArrayList<>();
+                                System.err.println("[collectMethodReferences] Inferred no-arg constructor from call site (m.make() with no args)");
+                            }
+                        } else {
+                            System.err.println("[collectMethodReferences] No calls found on variable " + varName + ", will use fallback");
+                        }
+                    }
+                }
+                
+                // Track if we inferred from call site
+                boolean inferredFromCallSite = (ctorParams != samParams2);
+                
+                if (ownerQnForCtor != null && !inferredFromCallSite) {
+                    // Look for existing constructor plans for this type (fallback)
+                    System.err.println("[collectMethodReferences] No call site found, checking existing constructor plans for " + ownerQnForCtor);
+                    for (ConstructorStubPlan existingCtor : out.ctorPlans) {
+                        try {
+                            String existingOwnerQn = safeQN(existingCtor.ownerType);
+                            if (ownerQnForCtor.equals(existingOwnerQn) && !existingCtor.parameterTypes.isEmpty()) {
+                                // Use the existing constructor's parameters
+                                ctorParams = new ArrayList<>(existingCtor.parameterTypes);
+                                System.err.println("[collectMethodReferences] Using existing constructor plan: " + 
+                                    ctorParams.stream().map(t -> safeQN(t)).collect(java.util.stream.Collectors.joining(", ")));
+                                break;
+                            }
+                        } catch (Throwable ignored) {}
+                    }
+                    // If still no params, default to empty (no-arg constructor)
+                    if (ctorParams == samParams2 || ctorParams.isEmpty()) {
+                        System.err.println("[collectMethodReferences] No constructor params found, defaulting to no-arg constructor");
+                        ctorParams = new ArrayList<>();
+                    }
+                }
+                
+                System.err.println("[collectMethodReferences] Final constructor params for " + ownerQnForCtor + ": " + 
+                    ctorParams.stream().map(t -> safeQN(t)).collect(java.util.stream.Collectors.joining(", ")) + 
+                    " (size: " + ctorParams.size() + ")");
+                
+                out.ctorPlans.add(new ConstructorStubPlan(ownerRef, ctorParams));
+                
+                // For constructor references, create/update the SAM method plan with correct signature
+                if (fiQn != null && !isJdkFqn(fiQn)) {
+                    // The SAM should return the constructed type (ownerRef) and take constructor params
+                    CtTypeReference<?> ctorReturnType = ownerRef.clone();
+                    
+                    // Remove any existing "make" or "apply" method plan for this functional interface
+                    String finalFiQn = fiQn;
+                    out.methodPlans.removeIf(p -> {
+                        try {
+                            String pOwnerQn = safeQN(p.ownerType);
+                            return finalFiQn.equals(pOwnerQn) &&
+                                   ("make".equals(p.name) || "apply".equals(p.name));
+                        } catch (Throwable ignored) {
+                            return false;
+                        }
+                    });
+                    
+                    // Add the correct "make" method plan with constructor parameters
+                    out.methodPlans.add(new MethodStubPlan(
+                            fiType,
+                            "make",
+                            ctorReturnType,
+                            ctorParams,  // Use constructor parameters (from existing constructor plan or inferred)
+                            /*isStatic*/ false,
+                            MethodStubPlan.Visibility.PUBLIC,
+                            java.util.Collections.emptyList(),
+                            /*defaultOnInterface*/ false,
+                            /*varargs*/ false,
+                            /*mirror*/ false,
+                            /*mirrorOwnerRef*/ null
+                    ));
+                }
                 continue; // do not add a method plan for ::new
             }
 
@@ -2907,6 +3309,415 @@ public final class SpoonCollector {
                     /*mirrorOwnerRef*/ null
             ));
 
+        }
+    }
+
+    /**
+     * Collect lambda expressions and ensure their target types are created as INTERFACES (functional interfaces).
+     */
+    private void collectLambdas(CtModel model, CollectResult out) {
+        List<spoon.reflect.code.CtLambda<?>> lambdas =
+                model.getElements(new TypeFilter<>(spoon.reflect.code.CtLambda.class));
+
+        for (spoon.reflect.code.CtLambda<?> lambda : lambdas) {
+            // Find the variable this lambda is assigned to
+            CtLocalVariable<?> lv = lambda.getParent(CtLocalVariable.class);
+            if (lv != null && lv.getType() != null) {
+                CtTypeReference<?> fiType = chooseOwnerPackage(lv.getType(), lambda);
+                String fiQn = safeQN(fiType);
+                
+                // Debug: log lambda collection
+                System.err.println("[collectLambdas] Processing lambda for functional interface: " + fiQn);
+                
+                if (fiQn != null && !isJdkFqn(fiQn)) {
+                    // Mark this type as an INTERFACE (functional interface)
+                    // Check if it's already planned as a CLASS and update it
+                    boolean found = false;
+                    for (TypeStubPlan plan : new ArrayList<>(out.typePlans)) {
+                        if (fiQn.equals(plan.qualifiedName)) {
+                            if (plan.kind == TypeStubPlan.Kind.CLASS) {
+                                // Replace CLASS plan with INTERFACE plan
+                                out.typePlans.remove(plan);
+                                out.typePlans.add(new TypeStubPlan(fiQn, TypeStubPlan.Kind.INTERFACE));
+                            }
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        // Add new INTERFACE plan
+                        out.typePlans.add(new TypeStubPlan(fiQn, TypeStubPlan.Kind.INTERFACE));
+                    }
+                    
+                    // Infer SAM signature from lambda
+                    try {
+                        List<CtParameter<?>> lambdaParams = lambda.getParameters();
+                        CtTypeReference<?> lambdaReturnType = null;
+                        try {
+                            lambdaReturnType = lambda.getType();
+                        } catch (Throwable ignored) {}
+                        
+                        if (lambdaReturnType == null) {
+                            // Try to infer from lambda body
+                            CtStatement body = lambda.getBody();
+                            CtExpression<?> bodyExpr = null;
+                            
+                            // Extract expression from body (could be return statement or direct expression)
+                            if (body instanceof spoon.reflect.code.CtReturn<?>) {
+                                bodyExpr = ((spoon.reflect.code.CtReturn<?>) body).getReturnedExpression();
+                            } else if (body instanceof CtExpression) {
+                                bodyExpr = (CtExpression<?>) body;
+                            }
+                            
+                            if (bodyExpr != null) {
+                                // For binary expressions like i + 1, check FIRST before trying getType()
+                                // because getType() might return void or null for unresolved expressions
+                                if (bodyExpr instanceof CtBinaryOperator) {
+                                    CtBinaryOperator<?> bin = (CtBinaryOperator<?>) bodyExpr;
+                                    try {
+                                        CtTypeReference<?> leftType = null;
+                                        CtTypeReference<?> rightType = null;
+                                        try {
+                                            leftType = bin.getLeftHandOperand().getType();
+                                        } catch (Throwable ignored) {}
+                                        try {
+                                            rightType = bin.getRightHandOperand().getType();
+                                        } catch (Throwable ignored) {}
+                                        
+                                        // Also check the operands themselves if types are null
+                                        if (leftType == null) {
+                                            try {
+                                                CtExpression<?> left = bin.getLeftHandOperand();
+                                                if (left instanceof CtVariableRead) {
+                                                    CtParameter<?> param = lambda.getParameters().isEmpty() ? null : lambda.getParameters().get(0);
+                                                    if (param != null) {
+                                                        leftType = param.getType();
+                                                    }
+                                                }
+                                            } catch (Throwable ignored) {}
+                                        }
+                                        if (rightType == null) {
+                                            try {
+                                                CtExpression<?> right = bin.getRightHandOperand();
+                                                if (right instanceof CtLiteral) {
+                                                    Object val = ((CtLiteral<?>) right).getValue();
+                                                    if (val instanceof Integer || val instanceof Long || val instanceof Short || val instanceof Byte) {
+                                                        rightType = f.Type().INTEGER_PRIMITIVE;
+                                                    }
+                                                }
+                                            } catch (Throwable ignored) {}
+                                        }
+                                        
+                                        // Check if operands are numeric (int or Integer)
+                                        boolean leftIsInt = false;
+                                        boolean rightIsInt = false;
+                                        if (leftType != null) {
+                                            String leftQn = safeQN(leftType);
+                                            leftIsInt = "int".equals(leftQn) || "java.lang.Integer".equals(leftQn) ||
+                                                       f.Type().INTEGER_PRIMITIVE.equals(leftType);
+                                        }
+                                        if (rightType != null) {
+                                            String rightQn = safeQN(rightType);
+                                            rightIsInt = "int".equals(rightQn) || "java.lang.Integer".equals(rightQn) ||
+                                                        f.Type().INTEGER_PRIMITIVE.equals(rightType);
+                                        }
+                                        
+                                        // For numeric operations (+, -, *, /, etc.), result is int
+                                        if (leftIsInt || rightIsInt) {
+                                            lambdaReturnType = f.Type().INTEGER_PRIMITIVE;
+                                        }
+                                    } catch (Throwable ignored) {}
+                                }
+                                
+                                // If still not set, try to get type directly
+                                if (lambdaReturnType == null) {
+                                    try {
+                                        lambdaReturnType = bodyExpr.getType();
+                                    } catch (Throwable ignored) {}
+                                }
+                                
+                                // If still null or void, try to infer from expression structure
+                                if (lambdaReturnType == null || 
+                                    (lambdaReturnType != null && safeQN(lambdaReturnType) != null && 
+                                     (safeQN(lambdaReturnType).equals("void") || safeQN(lambdaReturnType).equals("java.lang.Void")))) {
+                                    
+                                    // For literals, infer type from literal value
+                                    if (bodyExpr instanceof CtLiteral) {
+                                        CtLiteral<?> lit = (CtLiteral<?>) bodyExpr;
+                                        Object value = lit.getValue();
+                                        if (value instanceof Integer || value instanceof Long || value instanceof Short || value instanceof Byte) {
+                                            lambdaReturnType = f.Type().INTEGER_PRIMITIVE;
+                                        } else if (value instanceof Double || value instanceof Float) {
+                                            lambdaReturnType = f.Type().DOUBLE_PRIMITIVE;
+                                        } else if (value instanceof Boolean) {
+                                            lambdaReturnType = f.Type().BOOLEAN_PRIMITIVE;
+                                        } else if (value instanceof Character) {
+                                            lambdaReturnType = f.Type().CHARACTER_PRIMITIVE;
+                                        } else if (value instanceof String) {
+                                            lambdaReturnType = f.Type().STRING;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Final fallback: if still null or void, try to infer from context
+                        if (lambdaReturnType == null || 
+                            (lambdaReturnType != null && safeQN(lambdaReturnType) != null && 
+                             (safeQN(lambdaReturnType).equals("void") || safeQN(lambdaReturnType).equals("java.lang.Void")))) {
+                            // Check if lambda is assigned to a variable with a generic type
+                            CtLocalVariable<?> lvForType = lambda.getParent(CtLocalVariable.class);
+                            if (lvForType != null && lvForType.getType() != null) {
+                                try {
+                                    // Try to infer from the functional interface's generic type
+                                    // For F<Integer>, the return type might be Integer or int
+                                    // Default to int for numeric operations
+                                    lambdaReturnType = f.Type().INTEGER_PRIMITIVE;
+                                } catch (Throwable ignored) {
+                                    lambdaReturnType = f.Type().VOID_PRIMITIVE;
+                                }
+                            } else {
+                                lambdaReturnType = f.Type().VOID_PRIMITIVE;
+                            }
+                        }
+                        
+                        List<CtTypeReference<?>> samParams = new ArrayList<>();
+                        for (CtParameter<?> param : lambdaParams) {
+                            CtTypeReference<?> paramType = param.getType();
+                            if (paramType != null) {
+                                // Use the exact parameter type from lambda (preserve generics like Integer, not int)
+                                samParams.add(paramType.clone());
+                            } else {
+                                samParams.add(f.Type().createReference("java.lang.Object"));
+                            }
+                        }
+                        
+                        // Remove ALL existing "apply" and "make" method plans for this functional interface
+                        // and replace with the correct one from the lambda
+                        // This ensures functional interfaces have only ONE abstract method
+                        // Note: We remove ALL SAM methods regardless of parameter types (int vs Integer)
+                        // because functional interfaces can only have ONE abstract method
+                        String finalFiQn = fiQn;
+                        // Also get the erased FQN to handle generic types (F vs F<Integer>)
+                        String finalFiQnErased = erasureFqn(fiType);
+                        
+                        // Debug: log existing methods before removal
+                        System.err.println("[collectLambdas] Checking existing method plans for " + finalFiQn + " (erased: " + finalFiQnErased + ")");
+                        System.err.println("[collectLambdas] Total method plans: " + out.methodPlans.size());
+                        for (MethodStubPlan p : out.methodPlans) {
+                            try {
+                                String pOwnerQn = safeQN(p.ownerType);
+                                String pOwnerQnErased = erasureFqn(p.ownerType);
+                                System.err.println("  - Existing: " + pOwnerQn + " (erased: " + pOwnerQnErased + ") #" + p.name + 
+                                    "(" + p.paramTypes.stream().map(t -> safeQN(t)).collect(java.util.stream.Collectors.joining(", ")) + ")");
+                            } catch (Throwable ignored) {}
+                        }
+                        
+                        // Debug: log before removal
+                        java.util.List<MethodStubPlan> toRemove = new java.util.ArrayList<>();
+                        for (MethodStubPlan p : out.methodPlans) {
+                            try {
+                                String pOwnerQn = safeQN(p.ownerType);
+                                // Compare owner qualified names - must match exactly
+                                // Also check if ownerType references match (in case of generics)
+                                boolean ownerMatches = finalFiQn != null && finalFiQn.equals(pOwnerQn);
+                                if (!ownerMatches && p.ownerType != null) {
+                                    // Try comparing the type references directly
+                                    try {
+                                        String pOwnerQn2 = p.ownerType.getQualifiedName();
+                                        String fiQn2 = fiType.getQualifiedName();
+                                        ownerMatches = (pOwnerQn2 != null && fiQn2 != null && pOwnerQn2.equals(fiQn2));
+                                    } catch (Throwable ignored) {}
+                                    // Also try erased FQN comparison (handles F vs F<Integer>)
+                                    if (!ownerMatches && finalFiQnErased != null) {
+                                        String pOwnerQnErased = erasureFqn(p.ownerType);
+                                        ownerMatches = finalFiQnErased.equals(pOwnerQnErased);
+                                    }
+                                }
+                                if (ownerMatches && 
+                                    ("apply".equals(p.name) || "make".equals(p.name)) &&
+                                    !p.defaultOnInterface && !p.isStatic) {
+                                    toRemove.add(p);
+                                }
+                            } catch (Throwable ignored) {}
+                        }
+                        
+                        // Remove all matching methods
+                        out.methodPlans.removeAll(toRemove);
+                        
+                        // Debug log
+                        if (!toRemove.isEmpty()) {
+                            System.err.println("[collectLambdas] Removed " + toRemove.size() + " existing SAM method(s) for " + finalFiQn);
+                            for (MethodStubPlan p : toRemove) {
+                                System.err.println("  - Removed: " + safeQN(p.ownerType) + "#" + p.name + "(" + 
+                                    p.paramTypes.stream().map(t -> safeQN(t)).collect(java.util.stream.Collectors.joining(", ")) + ")");
+                            }
+                        }
+                        
+                        // Add SAM method plan with correct signature from lambda
+                        MethodStubPlan lambdaMethodPlan = new MethodStubPlan(
+                                fiType,
+                                "apply",
+                                lambdaReturnType,
+                                samParams,
+                                /*isStatic*/ false,
+                                MethodStubPlan.Visibility.PUBLIC,
+                                java.util.Collections.emptyList(),
+                                /*defaultOnInterface*/ false,
+                                /*varargs*/ false,
+                                /*mirror*/ false,
+                                /*mirrorOwnerRef*/ null
+                        );
+                        out.methodPlans.add(lambdaMethodPlan);
+                        
+                        // Debug: log what we're adding
+                        System.err.println("[collectLambdas] Added lambda SAM method: " + finalFiQn + "#apply(" + 
+                            samParams.stream().map(t -> safeQN(t)).collect(java.util.stream.Collectors.joining(", ")) + 
+                            ") : " + safeQN(lambdaReturnType));
+                    } catch (Throwable ignored) {
+                        // If we can't infer, use defaults
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Final cleanup: Remove duplicate SAM methods from functional interfaces.
+     * For each functional interface, keep only ONE "apply" or "make" method (prefer the one from lambda if available).
+     */
+    private void removeDuplicateSamMethods(CollectResult out) {
+        System.err.println("[removeDuplicateSamMethods] Starting cleanup, total method plans: " + out.methodPlans.size());
+        
+        // Debug: log all SAM methods before grouping
+        System.err.println("[removeDuplicateSamMethods] All SAM methods before grouping:");
+        for (MethodStubPlan p : out.methodPlans) {
+            if (("apply".equals(p.name) || "make".equals(p.name)) && !p.defaultOnInterface && !p.isStatic) {
+                try {
+                    String ownerQn = safeQN(p.ownerType);
+                    String ownerQnErased = erasureFqn(p.ownerType);
+                    System.err.println("  - " + ownerQn + " (erased: " + ownerQnErased + ") #" + p.name + "(" + 
+                        p.paramTypes.stream().map(t -> safeQN(t)).collect(java.util.stream.Collectors.joining(", ")) + ")");
+                } catch (Throwable ignored) {}
+            }
+        }
+        
+        // Group method plans by owner (using erased FQN to handle generics)
+        java.util.Map<String, java.util.List<MethodStubPlan>> ownerToMethods = new java.util.HashMap<>();
+        
+        for (MethodStubPlan p : out.methodPlans) {
+            if (("apply".equals(p.name) || "make".equals(p.name)) && !p.defaultOnInterface && !p.isStatic) {
+                try {
+                    String ownerQnErased = erasureFqn(p.ownerType);
+                    if (ownerQnErased != null && !isJdkFqn(ownerQnErased)) {
+                        ownerToMethods.computeIfAbsent(ownerQnErased, k -> new java.util.ArrayList<>()).add(p);
+                    }
+                } catch (Throwable ignored) {}
+            }
+        }
+        
+        System.err.println("[removeDuplicateSamMethods] Found " + ownerToMethods.size() + " functional interfaces with SAM methods");
+        
+        // For each functional interface with multiple SAM methods, keep only one
+        for (java.util.Map.Entry<String, java.util.List<MethodStubPlan>> entry : ownerToMethods.entrySet()) {
+            java.util.List<MethodStubPlan> methods = entry.getValue();
+            System.err.println("[removeDuplicateSamMethods] " + entry.getKey() + " has " + methods.size() + " SAM method(s)");
+            if (methods.size() > 1) {
+                String ownerQn = entry.getKey();
+                System.err.println("[removeDuplicateSamMethods] Found " + methods.size() + " SAM methods for " + ownerQn + ", keeping only one");
+                
+                // Prefer the method with non-primitive parameters (Integer over int) as it's more general
+                // This handles the case where we have both apply(int) and apply(Integer)
+                // Also log all methods for debugging
+                System.err.println("[removeDuplicateSamMethods] All methods for " + ownerQn + ":");
+                for (MethodStubPlan p : methods) {
+                    System.err.println("  - " + safeQN(p.ownerType) + "#" + p.name + "(" + 
+                        p.paramTypes.stream().map(t -> safeQN(t)).collect(java.util.stream.Collectors.joining(", ")) + 
+                        ") : " + safeQN(p.returnType));
+                }
+                
+                // Prefer the method that matches actual call sites (fewer parameters = more likely to be called)
+                // Also prefer non-primitive parameters (Integer over int) as it's more general
+                MethodStubPlan toKeep = null;
+                
+                // First, try to find a method that matches actual call sites (prefer methods with fewer parameters)
+                // This handles cases like make() vs make(int) where make() is actually called
+                MethodStubPlan matchingCallSite = null;
+                int minParams = Integer.MAX_VALUE;
+                for (MethodStubPlan candidate : methods) {
+                    if (candidate.paramTypes.size() < minParams) {
+                        minParams = candidate.paramTypes.size();
+                        matchingCallSite = candidate;
+                    }
+                }
+                
+                // If we found a method with fewer parameters, prefer it (likely matches actual call site)
+                if (matchingCallSite != null && minParams < methods.stream().mapToInt(m -> m.paramTypes.size()).max().orElse(Integer.MAX_VALUE)) {
+                    toKeep = matchingCallSite;
+                    System.err.println("[removeDuplicateSamMethods] Preferring method with fewer parameters (matches call site): " + 
+                        safeQN(toKeep.ownerType) + "#" + toKeep.name + "(" + 
+                        toKeep.paramTypes.stream().map(t -> safeQN(t)).collect(java.util.stream.Collectors.joining(", ")) + ")");
+                } else {
+                    // Otherwise, prefer the method with non-primitive parameters (Integer over int)
+                    for (MethodStubPlan candidate : methods) {
+                        // Check if this candidate has non-primitive parameters at any position where others have primitives
+                        boolean candidateIsBetter = false;
+                        for (MethodStubPlan other : methods) {
+                            if (candidate == other) continue;
+                            if (candidate.paramTypes.size() != other.paramTypes.size()) continue;
+                            
+                            // Check if candidate has non-primitive where other has primitive at same position
+                            for (int i = 0; i < candidate.paramTypes.size(); i++) {
+                                try {
+                                    String candidateParamQn = safeQN(candidate.paramTypes.get(i));
+                                    String otherParamQn = safeQN(other.paramTypes.get(i));
+                                    
+                                    boolean candidateIsPrimitive = candidateParamQn != null && 
+                                        (candidateParamQn.equals("int") || candidateParamQn.equals("long") || 
+                                         candidateParamQn.equals("short") || candidateParamQn.equals("byte") || 
+                                         candidateParamQn.equals("char") || candidateParamQn.equals("boolean") ||
+                                         candidateParamQn.equals("float") || candidateParamQn.equals("double"));
+                                    
+                                    boolean otherIsPrimitive = otherParamQn != null && 
+                                        (otherParamQn.equals("int") || otherParamQn.equals("long") || 
+                                         otherParamQn.equals("short") || otherParamQn.equals("byte") || 
+                                         otherParamQn.equals("char") || otherParamQn.equals("boolean") ||
+                                         otherParamQn.equals("float") || otherParamQn.equals("double"));
+                                    
+                                    // If at same position, candidate is non-primitive and other is primitive, candidate is better
+                                    if (!candidateIsPrimitive && otherIsPrimitive) {
+                                        candidateIsBetter = true;
+                                        System.err.println("[removeDuplicateSamMethods] Preferring method with non-primitive param at position " + i + 
+                                            ": " + candidateParamQn + " over " + otherParamQn);
+                                        break;
+                                    }
+                                } catch (Throwable ignored) {}
+                            }
+                            if (candidateIsBetter) break;
+                        }
+                        
+                        if (candidateIsBetter) {
+                            toKeep = candidate;
+                            break;
+                        }
+                    }
+                }
+                
+                // If no better candidate found, use first one
+                if (toKeep == null) {
+                    toKeep = methods.get(0);
+                }
+                
+                // Remove all others
+                for (MethodStubPlan p : methods) {
+                    if (p != toKeep) {
+                        out.methodPlans.remove(p);
+                        System.err.println("  - Removed duplicate: " + safeQN(p.ownerType) + "#" + p.name + "(" + 
+                            p.paramTypes.stream().map(t -> safeQN(t)).collect(java.util.stream.Collectors.joining(", ")) + ")");
+                    }
+                }
+                System.err.println("  - Kept: " + safeQN(toKeep.ownerType) + "#" + toKeep.name + "(" + 
+                    toKeep.paramTypes.stream().map(t -> safeQN(t)).collect(java.util.stream.Collectors.joining(", ")) + ")");
+            }
         }
     }
 

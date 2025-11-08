@@ -23,6 +23,7 @@ public final class SpoonStubber {
     private final CtModel model;
 
     private final Set<String> createdTypes = new LinkedHashSet<>();
+    private final Set<String> functionalInterfaces = new LinkedHashSet<>(); // Track functional interfaces (should only have one abstract method)
     private final List<String> createdFields = new ArrayList<>();
     private final List<String> createdCtors = new ArrayList<>();
     private final List<String> createdMethods = new ArrayList<>();
@@ -75,7 +76,11 @@ public final class SpoonStubber {
                     continue; // do not create unknown.Simple when pkg.Simple is planned
                 }
             }
-            ensureTypeExists(p);
+            boolean wasCreated = ensureTypeExists(p);
+            if (wasCreated && p.kind == TypeStubPlan.Kind.INTERFACE) {
+                // Check if this interface will be used as a functional interface
+                // We'll mark it later when we see method plans with "apply" method
+            }
             created++;// your existing creator
         }
         return created;
@@ -160,24 +165,62 @@ public final class SpoonStubber {
                         // Upgrade/downgrade if the existing kind is wrong
                         if (p.kind == TypeStubPlan.Kind.INTERFACE && existing instanceof CtClass) {
                             existing.delete();
+                            existing = null; // Force creation below
                         } else if (p.kind == TypeStubPlan.Kind.CLASS && existing instanceof CtInterface) {
                             existing.delete();
+                            existing = null; // Force creation below
                         } else if (p.kind == TypeStubPlan.Kind.ANNOTATION && !(existing instanceof CtAnnotationType)) {
                             existing.delete();
+                            existing = null; // Force creation below
                         } else {
-                            return false;
+                            parent = existing;
+                            continue; // Type exists and is correct kind
                         }
-                    } else {
-                        parent = existing;
+                    }
+                    
+                    // Create the nested type if it doesn't exist or was deleted
+                    if (existing == null) {
+                        CtType<?> nested;
+                        if (p.kind == TypeStubPlan.Kind.INTERFACE) {
+                            if (parent instanceof CtClass) {
+                                nested = f.Interface().create((CtClass<?>) parent, simple);
+                            } else {
+                                nested = f.Core().createInterface();
+                                nested.setSimpleName(simple);
+                                ((CtType<?>) parent).addNestedType(nested);
+                            }
+                        } else if (p.kind == TypeStubPlan.Kind.ANNOTATION) {
+                            nested = f.Annotation().create(parent instanceof CtClass ? (CtPackage) parent : null, simple);
+                            if (!(parent instanceof CtClass)) {
+                                ((CtType<?>) parent).addNestedType(nested);
+                            }
+                        } else {
+                            // Default to class
+                            if (parent instanceof CtClass) {
+                                nested = f.Class().create((CtClass<?>) parent, simple);
+                            } else {
+                                nested = f.Core().createClass();
+                                nested.setSimpleName(simple);
+                                ((CtType<?>) parent).addNestedType(nested);
+                            }
+                        }
+                        nested.addModifier(ModifierKind.PUBLIC);
+                        // For nested classes, check if they should be non-static (for o.new Inner() syntax)
+                        if (nested instanceof CtClass && parent instanceof CtClass) {
+                            if (p.isNonStaticInner) {
+                                // Don't add static modifier - it's an instance inner class
+                                nested.removeModifier(ModifierKind.STATIC);
+                            } else {
+                                // Default to static for nested classes
+                                nested.addModifier(ModifierKind.STATIC);
+                            }
+                        }
+                        parent = nested;
+                        createdTypes.add(parent.getQualifiedName());
                     }
                 }
 
-                // Optional: ensure member classes are NON-STATIC by default
-                if (parent instanceof CtClass) {
-                    parent.removeModifier(ModifierKind.STATIC);
-                }
-
-                return false; // we created nested under outer; nothing to add as top-level
+                return true; // We created nested types
             }
         }
 
@@ -344,6 +387,19 @@ public final class SpoonStubber {
     public int applyMethodPlans(Collection<MethodStubPlan> plans) {
         int created = 0;
 
+        // First pass: identify functional interfaces (those with "apply" or "make" method from method references)
+        for (MethodStubPlan p : plans) {
+            if (("apply".equals(p.name) || "make".equals(p.name)) && !p.defaultOnInterface && !p.isStatic) {
+                CtTypeReference<?> normalizedOwnerRef = normalizeOwnerRef(p.ownerType);
+                String ownerQn = safeQN(normalizedOwnerRef);
+                if (ownerQn != null && !ownerQn.isEmpty()) {
+                    // Mark as functional interface - we'll create the type if needed
+                    functionalInterfaces.add(ownerQn);
+                }
+            }
+        }
+
+        // Second pass: apply method plans
         for (MethodStubPlan p : plans) {
 
 
@@ -391,6 +447,83 @@ public final class SpoonStubber {
                     ? ensurePublicInterfaceForTypeRef(normalizedOwnerRef)
                     : ensurePublicOwnerForTypeRef(normalizedOwnerRef);
 
+            // Check if this is a functional interface - if so, only allow the SAM method
+            // Note: We mark functional interfaces when we add the "apply" or "make" method below
+            String ownerQn = safeQN(owner.getReference());
+            if (owner instanceof CtInterface && functionalInterfaces.contains(ownerQn)) {
+                // For functional interfaces, only allow the SAM method ("apply" or "make")
+                // Skip other abstract methods that would make it non-functional
+                if (!"apply".equals(p.name) && !"make".equals(p.name) && !p.defaultOnInterface && !p.isStatic) {
+                    continue; // Skip this abstract method plan (not the SAM)
+                }
+                
+                // For functional interfaces, check if we already have a SAM method (apply/make)
+                // Even if parameter types differ (int vs Integer), we can only have ONE SAM method
+                // Prefer the one with non-primitive parameters (Integer over int) as it's more general
+                java.util.List<CtMethod<?>> existingSamMethods = owner.getMethods().stream()
+                        .filter(m -> {
+                            String mName = m.getSimpleName();
+                            return ("apply".equals(mName) || "make".equals(mName)) && 
+                                   m.getModifiers().contains(spoon.reflect.declaration.ModifierKind.ABSTRACT);
+                        })
+                        .collect(java.util.stream.Collectors.toList());
+                
+                if (!existingSamMethods.isEmpty() && ("apply".equals(p.name) || "make".equals(p.name)) && !p.defaultOnInterface && !p.isStatic) {
+                    // Check if the new method has non-primitive parameters and existing has primitive
+                    // Compare parameter-by-parameter: if new has Integer and existing has int, prefer new
+                    boolean shouldReplace = false;
+                    for (CtMethod<?> existing : existingSamMethods) {
+                        if (existing.getParameters().size() != p.paramTypes.size()) continue;
+                        
+                        boolean newHasNonPrimitive = false;
+                        boolean existingHasPrimitive = false;
+                        
+                        for (int i = 0; i < p.paramTypes.size(); i++) {
+                            try {
+                                String newParamQn = safeQN(p.paramTypes.get(i));
+                                String existingParamQn = safeQN(existing.getParameters().get(i).getType());
+                                
+                                boolean newIsPrimitive = newParamQn != null && 
+                                    (newParamQn.equals("int") || newParamQn.equals("long") || 
+                                     newParamQn.equals("short") || newParamQn.equals("byte") || 
+                                     newParamQn.equals("char") || newParamQn.equals("boolean") ||
+                                     newParamQn.equals("float") || newParamQn.equals("double"));
+                                
+                                boolean existingIsPrimitive = existingParamQn != null && 
+                                    (existingParamQn.equals("int") || existingParamQn.equals("long") || 
+                                     existingParamQn.equals("short") || existingParamQn.equals("byte") || 
+                                     existingParamQn.equals("char") || existingParamQn.equals("boolean") ||
+                                     existingParamQn.equals("float") || existingParamQn.equals("double"));
+                                
+                                // If at same position, new is non-primitive wrapper and existing is primitive, prefer new
+                                if (!newIsPrimitive && existingIsPrimitive) {
+                                    newHasNonPrimitive = true;
+                                    existingHasPrimitive = true;
+                                    break;
+                                }
+                            } catch (Throwable ignored) {}
+                        }
+                        
+                        if (newHasNonPrimitive && existingHasPrimitive) {
+                            shouldReplace = true;
+                            break;
+                        }
+                    }
+                    
+                    // If new method has non-primitive params and existing has primitive, remove existing and add new
+                    if (shouldReplace) {
+                        System.err.println("[applyMethodPlans] Removing primitive SAM method and adding non-primitive for " + ownerQn);
+                        for (CtMethod<?> m : existingSamMethods) {
+                            owner.removeMethod(m);
+                        }
+                        // Continue to create the new method
+                    } else {
+                        System.err.println("[applyMethodPlans] Skipping duplicate SAM method for functional interface " + ownerQn + 
+                            ": " + p.name + " (already exists)");
+                        continue; // Skip - functional interface already has a SAM method
+                    }
+                }
+            }
 
             // short-circuit if already present on the owner using your current check
             if (hasMethod(owner, p.name, p.paramTypes)) continue;
@@ -406,9 +539,16 @@ public final class SpoonStubber {
             List<CtTypeReference<?>> normParams = new ArrayList<>(p.paramTypes.size());
             for (int i = 0; i < p.paramTypes.size(); i++) {
                 CtTypeReference<?> t = normalizeUnknownRef(p.paramTypes.get(i));
+                if (t == null) {
+                    // Fallback to Object if normalization fails
+                    t = f.Type().createReference("java.lang.Object");
+                }
                 if (willBeVarargs && i == p.paramTypes.size() - 1) {
                     // varargs at AST-level is an array on the last parameter
-                    t = f.Type().createArrayReference(t);
+                    // Only create array if not already an array
+                    if (!t.isArray()) {
+                        t = f.Type().createArrayReference(t);
+                    }
                 }
                 normParams.add(t);
             }
@@ -500,7 +640,14 @@ public final class SpoonStubber {
 
             createdMethods.add(sig(owner.getQualifiedName(), p.name, normParams) + " : " + readable(rt0));
             created++;
-
+            
+            // Mark functional interface if this is the SAM method (apply or make) on an interface
+            if (owner instanceof CtInterface && ("apply".equals(p.name) || "make".equals(p.name)) && !p.defaultOnInterface) {
+                String ownerQnnew = safeQN(owner.getReference());
+                if (ownerQnnew != null && !ownerQnnew.isEmpty()) {
+                    functionalInterfaces.add(ownerQnnew);
+                }
+            }
 
             // 10) MIRROR into unknown.* if requested (so calls like unknown.T.m(...) compile)
             if (p.mirror && p.mirrorOwnerRef != null) {
@@ -743,9 +890,19 @@ public final class SpoonStubber {
         for (int i = 0; i < types.size(); i++) {
             CtParameter<?> par = f.Core().createParameter();
             CtTypeReference<?> raw = (i < types.size() ? types.get(i) : null);
-            CtTypeReference<?> safe = (raw == null || isNullish(raw))
-                    ? f.Type().createReference(de.upb.sse.jess.generation.unknown.UnknownType.CLASS)
-                    : normalizeUnknownRef(raw); // ensure normalization survives
+            CtTypeReference<?> safe;
+            try {
+                safe = (raw == null || isNullish(raw))
+                        ? f.Type().createReference(de.upb.sse.jess.generation.unknown.UnknownType.CLASS)
+                        : normalizeUnknownRef(raw); // ensure normalization survives
+                // Additional safety check
+                if (safe == null || isNullish(safe)) {
+                    safe = f.Type().createReference("java.lang.Object");
+                }
+            } catch (Throwable e) {
+                // Fallback to Object on any error
+                safe = f.Type().createReference("java.lang.Object");
+            }
 
             par.setType(safe);
             par.setSimpleName("arg" + i);
@@ -926,25 +1083,40 @@ public final class SpoonStubber {
     /**
      * Normalize a reference to 'unknown.Unknown' when it appears as bare 'Unknown'
      * or inside the 'unknown.' package; makes it rely on an explicit import.
+     * Also tries to resolve to concrete types when available.
      */
     private CtTypeReference<?> normalizeUnknownRef(CtTypeReference<?> t) {
         if (t == null) return null;
-        String qn = safeQN(t);
-        String simple = t.getSimpleName();
+        try {
+            String qn = safeQN(t);
+            String simple = t.getSimpleName();
 
-        if ("Unknown".equals(simple) && (qn.isEmpty() || !qn.contains("."))) {
-            CtTypeReference<?> u = f.Type().createReference(
-                    de.upb.sse.jess.generation.unknown.UnknownType.CLASS
-            );
-            u.setImplicit(false);
-            u.setSimplyQualified(false);   // simple name, rely on the explicit import
-            return u;
+            if ("Unknown".equals(simple) && (qn.isEmpty() || !qn.contains("."))) {
+                CtTypeReference<?> u = f.Type().createReference(
+                        de.upb.sse.jess.generation.unknown.UnknownType.CLASS
+                );
+                u.setImplicit(false);
+                u.setSimplyQualified(false);   // simple name, rely on the explicit import
+                return u;
+            }
+            if (qn != null && qn.startsWith("unknown.")) {
+                // Try to find a concrete type with the same simple name first
+                CtType<?> concrete = findConcreteBySimple(simple);
+                if (concrete != null) {
+                    CtTypeReference<?> concreteRef = concrete.getReference();
+                    concreteRef.setImplicit(false);
+                    concreteRef.setSimplyQualified(false);
+                    return concreteRef;
+                }
+                // No concrete type found, use unknown
+                t.setImplicit(false);
+                t.setSimplyQualified(false);   // simple name, rely on the explicit import
+            }
+            return t;
+        } catch (Throwable e) {
+            // If normalization fails, return the original reference
+            return t;
         }
-        if (qn.startsWith("unknown.")) {
-            t.setImplicit(false);
-            t.setSimplyQualified(false);   // simple name, rely on the explicit import
-        }
-        return t;
     }
 
     /**
@@ -1594,14 +1766,30 @@ public final class SpoonStubber {
 
     private CtTypeReference<?> normalizeOwnerRef(CtTypeReference<?> ownerRef) {
         if (ownerRef == null) return null;
-        String qn = safeQN(ownerRef);
-        if (qn != null && qn.startsWith("unknown.")) {
-            CtType<?> concrete = findConcreteBySimple(ownerRef.getSimpleName());
-            if (concrete != null) {
-                return concrete.getReference();
+        try {
+            String qn = safeQN(ownerRef);
+            if (qn != null && qn.startsWith("unknown.")) {
+                CtType<?> concrete = findConcreteBySimple(ownerRef.getSimpleName());
+                if (concrete != null) {
+                    return concrete.getReference();
+                }
             }
+            return ownerRef;
+        } catch (Throwable e) {
+            // If we can't normalize, try to find by simple name
+            try {
+                String simple = ownerRef.getSimpleName();
+                if (simple != null) {
+                    CtType<?> concrete = findConcreteBySimple(simple);
+                    if (concrete != null) {
+                        return concrete.getReference();
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+            // Last resort: return as-is
+            return ownerRef;
         }
-        return ownerRef;
     }
 
 
