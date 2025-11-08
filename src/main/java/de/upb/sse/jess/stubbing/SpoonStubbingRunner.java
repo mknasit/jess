@@ -6,15 +6,16 @@ import de.upb.sse.jess.stubbing.spoon.collector.SpoonCollector.CollectResult;
 import de.upb.sse.jess.stubbing.spoon.generate.SpoonStubber;
 import spoon.Launcher;
 import spoon.reflect.CtModel;
-import spoon.reflect.code.CtConstructorCall;
-import spoon.reflect.code.CtInvocation;
-import spoon.reflect.code.CtTypeAccess;
+import spoon.reflect.code.*;
 import spoon.reflect.declaration.CtType;
 import spoon.reflect.factory.Factory;
 import spoon.reflect.reference.CtTypeReference;
 import spoon.reflect.visitor.DefaultJavaPrettyPrinter;
 import spoon.reflect.visitor.filter.TypeFilter;
 import spoon.reflect.declaration.CtPackage;
+import spoon.reflect.declaration.CtField;
+import spoon.reflect.declaration.ModifierKind;
+import spoon.reflect.declaration.CtClass;
 
 import java.nio.file.Path;
 import java.util.List;
@@ -94,6 +95,10 @@ public final class SpoonStubbingRunner implements Stubber {
 
 
         stubber.report(); // summary
+
+        // Fix field accesses with null targets (should be implicit this)
+        // This fixes cases like ".logger.logOut()" where the target is lost
+        fixFieldAccessTargets(model, f);
 
         // Remove unknown.Helper if a real Helper exists
         model.getAllTypes().stream()
@@ -200,10 +205,74 @@ public final class SpoonStubbingRunner implements Stubber {
             }
         }
 
+        // Fix field accesses with null/empty targets that should be implicit this
+        // This fixes cases like ".logger.logOut()" where the target is lost
+        fixFieldAccessTargets(model, f);
+
         // 4) Pretty-print (use default printer; safe with Java 11)
         env.setPrettyPrinterCreator(() -> new DefaultJavaPrettyPrinter(env));
         launcher.prettyprint();
 
         return created;
+    }
+
+    /**
+     * Fix field accesses that have problematic targets causing leading dots in output.
+     * When a field access has a null target (implicit this), ensure it's properly handled.
+     * The leading dot issue occurs when Spoon's printer sees a field access with a problematic target.
+     */
+    private static void fixFieldAccessTargets(CtModel model, Factory f) {
+        // Fix method invocations with field access targets
+        for (CtInvocation<?> inv : model.getElements(new TypeFilter<>(CtInvocation.class))) {
+            CtExpression<?> target = inv.getTarget();
+            if (target instanceof CtFieldAccess<?>) {
+                CtFieldAccess<?> fa = (CtFieldAccess<?>) target;
+                CtType<?> enclosingType = inv.getParent(CtType.class);
+                if (enclosingType != null && enclosingType instanceof CtClass) {
+                    try {
+                        CtField<?> field = fa.getVariable().getDeclaration();
+                        if (field != null && !field.hasModifier(ModifierKind.STATIC)) {
+                            // Instance field - target should be null for implicit 'this'
+                            // If target is not null but should be, or if it's causing issues, fix it
+                            CtExpression<?> faTarget = fa.getTarget();
+                            if (faTarget != null) {
+                                // If target exists, check if it's problematic
+                                String targetStr = faTarget.toString();
+                                // If target is empty or just a dot, set it to null for implicit this
+                                if (targetStr == null || targetStr.trim().isEmpty() || ".".equals(targetStr.trim())) {
+                                    fa.setTarget(null);
+                                }
+                            } else {
+                                // Target is null, which is correct for implicit this
+                                // But ensure it's explicitly null (not some other problematic state)
+                                fa.setTarget(null);
+                            }
+                        }
+                    } catch (Throwable ignored) {}
+                }
+            }
+        }
+        
+        // Also fix standalone field accesses
+        for (CtFieldAccess<?> fa : model.getElements(new TypeFilter<>(CtFieldAccess.class))) {
+            CtType<?> enclosingType = fa.getParent(CtType.class);
+            if (enclosingType != null && enclosingType instanceof CtClass) {
+                try {
+                    CtField<?> field = fa.getVariable().getDeclaration();
+                    if (field != null && !field.hasModifier(ModifierKind.STATIC)) {
+                        // Instance field - ensure target is null for implicit this
+                        CtExpression<?> faTarget = fa.getTarget();
+                        if (faTarget != null) {
+                            String targetStr = faTarget.toString();
+                            if (targetStr == null || targetStr.trim().isEmpty() || ".".equals(targetStr.trim())) {
+                                fa.setTarget(null);
+                            }
+                        } else {
+                                fa.setTarget(null);
+                            }
+                    }
+                } catch (Throwable ignored) {}
+            }
+        }
     }
 }

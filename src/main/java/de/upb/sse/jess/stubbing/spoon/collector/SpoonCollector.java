@@ -2,6 +2,7 @@ package de.upb.sse.jess.stubbing.spoon.collector;
 
 import de.upb.sse.jess.configuration.JessConfiguration;
 import de.upb.sse.jess.exceptions.AmbiguityException;
+import de.upb.sse.jess.generation.unknown.UnknownType;
 import de.upb.sse.jess.stubbing.spoon.plan.*;
 import spoon.reflect.CtModel;
 import spoon.reflect.code.*;
@@ -10,16 +11,17 @@ import spoon.reflect.cu.SourcePosition;
 import spoon.reflect.declaration.*;
 import spoon.reflect.factory.Factory;
 import spoon.reflect.path.CtRole;
-import spoon.reflect.reference.CtArrayTypeReference;
-import spoon.reflect.reference.CtExecutableReference;
-import spoon.reflect.reference.CtTypeReference;
-import spoon.reflect.reference.CtVariableReference;
+import spoon.reflect.reference.*;
 import spoon.reflect.visitor.filter.TypeFilter;
 
+import java.lang.annotation.Repeatable;
+import java.lang.reflect.Method;
 import java.util.*;
+import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 
 import spoon.reflect.declaration.CtAnonymousExecutable;
@@ -48,14 +50,14 @@ public final class SpoonCollector {
         public final Set<String> ambiguousSimples = new LinkedHashSet<>();
         public final Map<String, Set<CtTypeReference<?>>> implementsPlans = new LinkedHashMap<>();
         // de.upb.sse.jess.stubbing.spoon.collector.CollectResult
-        public Map<String, String> unknownToConcrete = new java.util.HashMap<>();
+        public Map<String, String> unknownToConcrete = new HashMap<>();
 
 
 
     }
 
     // --- Minimal JDK simple-name → package map (extend as needed) ---
-    private static final java.util.Map<String,String> JDK_SIMPLE = new java.util.HashMap<>();
+    private static final Map<String,String> JDK_SIMPLE = new HashMap<>();
     static {
         // lang
         JDK_SIMPLE.put("String", "java.lang");
@@ -97,7 +99,7 @@ public final class SpoonCollector {
     private final JessConfiguration cfg;
 
     // Centralized unknown type FQN constant. (Do not rename or remove.)
-    private static final String UNKNOWN_TYPE_FQN = de.upb.sse.jess.generation.unknown.UnknownType.CLASS;
+    private static final String UNKNOWN_TYPE_FQN = UnknownType.CLASS;
 
     /* ======================================================================
      *                             CONSTRUCTION
@@ -153,7 +155,7 @@ public final class SpoonCollector {
         result.typePlans.addAll(ownersNeedingTypes(result));
 
         // --- compute scoped ambiguous simple names ---
-        java.util.Map<String, java.util.Set<String>> simpleToPkgs = new java.util.HashMap<>();
+        Map<String, Set<String>> simpleToPkgs = new HashMap<>();
 
 
 // (1) add existing model types
@@ -165,29 +167,29 @@ public final class SpoonCollector {
             String simple = t.getSimpleName();
             if (simple == null) return;
             if (isJdkPackage(pkg)) return;
-            simpleToPkgs.computeIfAbsent(simple, k -> new java.util.LinkedHashSet<>()).add(pkg);
+            simpleToPkgs.computeIfAbsent(simple, k -> new LinkedHashSet<>()).add(pkg);
         });
 
 // (2) add planned owner types (where we will create/mirror)
-        java.util.stream.Stream.concat(
+        Stream.concat(
                 result.typePlans.stream().map(tp -> tp.qualifiedName),
-                java.util.stream.Stream.concat(
+                Stream.concat(
                         result.fieldPlans.stream().map(fp -> fp.ownerType.getQualifiedName()),
-                        java.util.stream.Stream.concat(
+                        Stream.concat(
                                 result.ctorPlans.stream().map(cp -> cp.ownerType.getQualifiedName()),
                                 result.methodPlans.stream().map(mp -> mp.ownerType.getQualifiedName())
                         )
                 )
-        ).filter(java.util.Objects::nonNull).forEach(qn -> {
+        ).filter(Objects::nonNull).forEach(qn -> {
             int lastDot = qn.lastIndexOf('.');
             String pkg = (lastDot >= 0 ? qn.substring(0, lastDot) : "");
             String simple = (lastDot >= 0 ? qn.substring(lastDot + 1) : qn);
             if (isJdkPackage(pkg)) return;
-            simpleToPkgs.computeIfAbsent(simple, k -> new java.util.LinkedHashSet<>()).add(pkg);
+            simpleToPkgs.computeIfAbsent(simple, k -> new LinkedHashSet<>()).add(pkg);
         });
 
 // (3) keep only those simples that are (a) part of our plans and (b) map to >1 pkgs
-        java.util.Set<String> plannedSimples = new java.util.HashSet<>();
+        Set<String> plannedSimples = new HashSet<>();
         result.typePlans.forEach(tp -> { String qn = tp.qualifiedName; if (qn != null) plannedSimples.add(qn.substring(qn.lastIndexOf('.')+1)); });
         result.fieldPlans.forEach(fp -> plannedSimples.add(fp.ownerType.getSimpleName()));
         result.ctorPlans.forEach(cp -> plannedSimples.add(cp.ownerType.getSimpleName()));
@@ -217,7 +219,7 @@ public final class SpoonCollector {
         });
 
         for (CtFieldAccess<?> fa : unresolved) {
-            if (fa.getParent(spoon.reflect.code.CtExecutableReferenceExpression.class) != null) {
+            if (fa.getParent(CtExecutableReferenceExpression.class) != null) {
                 continue; // In A::inc the 'A' token isn't a field; it's a type name
             }
             String simple = null;
@@ -631,7 +633,7 @@ public final class SpoonCollector {
     private void collectUnresolvedMethodCalls(CtModel model, CollectResult out) {
 
         // --- small local helpers -------------------------------------------------
-        java.util.function.Function<CtInvocation<?>, Boolean> targetExplicitlyUnknown = (inv) -> {
+        Function<CtInvocation<?>, Boolean> targetExplicitlyUnknown = (inv) -> {
             CtExpression<?> tgt = inv.getTarget();
             try {
                 if (tgt instanceof CtTypeAccess<?>) {
@@ -658,7 +660,7 @@ public final class SpoonCollector {
             return false;
         };
 
-        java.util.function.Function<CtInvocation<?>, String> typeAccessSimpleName = (inv) -> {
+        Function<CtInvocation<?>, String> typeAccessSimpleName = (inv) -> {
             CtExpression<?> tgt = inv.getTarget();
             if (tgt instanceof CtTypeAccess<?>) {
                 CtTypeReference<?> tr = ((CtTypeAccess<?>) tgt).getAccessedType();
@@ -727,16 +729,111 @@ public final class SpoonCollector {
             boolean ownerIsUnknown = (callOwnerFqn != null && callOwnerFqn.startsWith("unknown."));
 
             // --- force owner when slicer used unknown.* --------------------------
-            CtTypeReference<?> owner;
+            CtTypeReference<?> owner = null;
             boolean defaultOnIface = false;   // never for unknown.*
             if (ownerIsUnknown) {
                 owner = f.Type().createReference(callOwnerFqn);
             } else {
                 CtTypeReference<?> rawOwner = resolveOwnerTypeFromInvocation(inv);
-                owner = chooseOwnerPackage(rawOwner, inv);
+                
+                // Special handling for field access targets: preserve the field's declared type
+                // This prevents cases where logger (org.example.Log) gets changed to inheritance2.Log
+                if (tgt instanceof CtFieldAccess<?>) {
+                    CtFieldAccess<?> fa = (CtFieldAccess<?>) tgt;
+                    try {
+                        // Try multiple ways to get the field's actual declared type
+                        CtTypeReference<?> fieldType = null;
+                        String fieldName = (fa.getVariable() != null ? fa.getVariable().getSimpleName() : null);
+                        System.err.println("[collectUnresolvedMethodCalls] Processing field access: " + fieldName);
+                        
+                        // Priority 1: Try from the field's declaration (most reliable for inherited fields)
+                        if (fa.getVariable() != null) {
+                            try {
+                                CtField<?> fieldDecl = fa.getVariable().getDeclaration();
+                                if (fieldDecl != null && fieldDecl.getType() != null) {
+                                    fieldType = fieldDecl.getType();
+                                    String fieldTypeQn = safeQN(fieldType);
+                                    System.err.println("[collectUnresolvedMethodCalls] Field declaration type (raw): " + fieldTypeQn + 
+                                        " (from field " + fieldDecl.getSimpleName() + " in " + 
+                                        (fieldDecl.getDeclaringType() != null ? safeQN(fieldDecl.getDeclaringType().getReference()) : "?") + ")");
+                                    
+                                    // If the type is not fully qualified, try to resolve it using imports from the declaring class
+                                    if (fieldTypeQn == null || !fieldTypeQn.contains(".") || fieldTypeQn.startsWith("unknown.")) {
+                                        String simpleName = fieldType.getSimpleName();
+                                        if (simpleName != null && fieldDecl.getDeclaringType() != null) {
+                                            // Try to resolve using imports from the field's declaring class
+                                            CtTypeReference<?> resolved = resolveFromExplicitTypeImports(fieldDecl, simpleName);
+                                            if (resolved != null) {
+                                                fieldType = resolved;
+                                                fieldTypeQn = safeQN(resolved);
+                                                System.err.println("[collectUnresolvedMethodCalls] Resolved field type from imports: " + fieldTypeQn);
+                                            }
+                                        }
+                                    }
+                                    
+                                    if (fieldTypeQn != null && fieldTypeQn.contains(".") && !fieldTypeQn.startsWith("unknown.")) {
+                                        owner = fieldType.clone();
+                                        System.err.println("[collectUnresolvedMethodCalls] Using field declaration type: " + fieldTypeQn);
+                                    } else {
+                                        System.err.println("[collectUnresolvedMethodCalls] Field declaration type not fully qualified: " + fieldTypeQn);
+                                        fieldType = null; // Not fully qualified, try other methods
+                                    }
+                                } else {
+                                    System.err.println("[collectUnresolvedMethodCalls] Field declaration is null or has no type");
+                                }
+                            } catch (Throwable t) {
+                                System.err.println("[collectUnresolvedMethodCalls] Error getting field declaration: " + t.getMessage());
+                                t.printStackTrace();
+                            }
+                        }
+                        
+                        // Priority 2: Try from the field variable's type (if declaration didn't work)
+                        if (owner == null && fa.getVariable() != null) {
+                            try {
+                                fieldType = fa.getVariable().getType();
+                                String fieldTypeQn = safeQN(fieldType);
+                                System.err.println("[collectUnresolvedMethodCalls] Field variable type: " + fieldTypeQn);
+                                if (fieldTypeQn != null && fieldTypeQn.contains(".") && !fieldTypeQn.startsWith("unknown.")) {
+                                    owner = fieldType.clone();
+                                    System.err.println("[collectUnresolvedMethodCalls] Using field variable type: " + fieldTypeQn);
+                                } else {
+                                    fieldType = null; // Not fully qualified, try expression type
+                                }
+                            } catch (Throwable ignored) {}
+                        }
+                        
+                        // Priority 3: Try from the field access expression type (least reliable - may be inferred from context)
+                        if (owner == null) {
+                            try {
+                                fieldType = fa.getType();
+                                String fieldTypeQn = safeQN(fieldType);
+                                System.err.println("[collectUnresolvedMethodCalls] Field access expression type: " + fieldTypeQn);
+                                // Only use if fully qualified and not unknown
+                                if (fieldTypeQn != null && fieldTypeQn.contains(".") && !fieldTypeQn.startsWith("unknown.")) {
+                                    owner = fieldType.clone();
+                                    System.err.println("[collectUnresolvedMethodCalls] Using field access type: " + fieldTypeQn);
+                                } else {
+                                    System.err.println("[collectUnresolvedMethodCalls] Field access type not fully qualified, will fall back");
+                                }
+                            } catch (Throwable ignored) {}
+                        }
+                        
+                        // If we still don't have a fully qualified type, fall back to chooseOwnerPackage
+                        if (owner == null) {
+                            owner = chooseOwnerPackage(rawOwner, inv);
+                            System.err.println("[collectUnresolvedMethodCalls] Falling back to chooseOwnerPackage: " + safeQN(owner));
+                        }
+                    } catch (Throwable t) {
+                        System.err.println("[collectUnresolvedMethodCalls] Error getting field type: " + t.getMessage());
+                        t.printStackTrace();
+                        owner = chooseOwnerPackage(rawOwner, inv);
+                    }
+                } else {
+                    owner = chooseOwnerPackage(rawOwner, inv);
+                }
 
                 // implicit this + single non-JDK interface => default method on that iface
-                boolean implicitThis = (tgt == null) || (tgt instanceof spoon.reflect.code.CtThisAccess<?>);
+                boolean implicitThis = (tgt == null) || (tgt instanceof CtThisAccess<?>);
                 if (implicitThis && !makeStatic) {
                     CtClass<?> encl = inv.getParent(CtClass.class);
                     if (encl != null) {
@@ -748,7 +845,7 @@ public final class SpoonCollector {
                                             || qn.startsWith("jakarta.") || qn.startsWith("sun.")
                                             || qn.startsWith("jdk."));
                                 })
-                                .collect(java.util.stream.Collectors.toList());
+                                .collect(Collectors.toList());
                         if (nonJdkIfaces.size() == 1) {
                             owner = chooseOwnerPackage(nonJdkIfaces.get(0), inv);
                             defaultOnIface = true;
@@ -847,8 +944,8 @@ public final class SpoonCollector {
                 CtExpression<?> a = args.get(i);
 
                 // --- anonymous class -> interface/superclass ---
-                if (a instanceof spoon.reflect.code.CtNewClass) {
-                    var nc = (spoon.reflect.code.CtNewClass<?>) a;
+                if (a instanceof CtNewClass) {
+                    var nc = (CtNewClass<?>) a;
                     CtClass<?> anon = nc.getAnonymousClass();
                     if (anon != null) {
                         CtTypeReference<?> pick = null;
@@ -878,7 +975,7 @@ public final class SpoonCollector {
             if (makeVarargs && !paramTypes.isEmpty()) {
                 int varargIndex = paramTypes.size() - 1;
                 CtTypeReference<?> currentElem = paramTypes.get(varargIndex);
-                java.util.List<CtTypeReference<?>> coerced =
+                List<CtTypeReference<?>> coerced =
                         coerceVarargs(args, varargIndex, currentElem);
                 // last param represents the vararg element type (SpoonStubber will turn it into array)
                 if (!coerced.isEmpty() && coerced.get(0) != null) {
@@ -888,7 +985,7 @@ public final class SpoonCollector {
 
 
             // ambiguity guard
-            List<CtTypeReference<?>> fromRef = (ex != null ? ex.getParameters() : java.util.Collections.emptyList());
+            List<CtTypeReference<?>> fromRef = (ex != null ? ex.getParameters() : Collections.emptyList());
             boolean refSane = fromRef != null && !fromRef.isEmpty() && fromRef.stream().allMatch(this::isSaneType);
             if (!refSane && argsContainNullLiteral(inv.getArguments()) && cfg.isFailOnAmbiguity()) {
                 String ownerQN = (owner != null ? owner.getQualifiedName() : "<unknown>");
@@ -903,8 +1000,8 @@ public final class SpoonCollector {
                     isSuperCall
                             ? new ArrayList<>(Optional.ofNullable(inv.getParent(CtMethod.class))
                             .map(CtMethod::getThrownTypes)
-                            .orElse(java.util.Collections.emptySet()))
-                            : java.util.Collections.emptyList();
+                            .orElse(Collections.emptySet()))
+                            : Collections.emptyList();
 
             // enum helpers normalized on the chosen owner (unknown.* or concrete)
             if ("values".equals(name) && args.isEmpty()) {
@@ -912,11 +1009,11 @@ public final class SpoonCollector {
                 CtArrayTypeReference<?> arr = f.Core().createArrayTypeReference();
                 arr.setComponentType(owner);
                 returnType = arr;
-                paramTypes = java.util.Collections.emptyList();
+                paramTypes = Collections.emptyList();
             } else if ("valueOf".equals(name) && args.size() == 1) {
                 makeStatic = true;
                 returnType = owner;
-                paramTypes = java.util.List.of(f.Type().createReference("java.lang.String"));
+                paramTypes = List.of(f.Type().createReference("java.lang.String"));
             } else if ("name".equals(name) && args.isEmpty()) {
                 if (returnType == null) returnType = f.Type().createReference("java.lang.String");
             }
@@ -936,16 +1033,16 @@ public final class SpoonCollector {
                 if (looksEnumValues) {
                     out.methodPlans.add(new MethodStubPlan(
                             owner, "values", arrOfOwner,
-                            java.util.Collections.emptyList(),
+                            Collections.emptyList(),
                             /*isStatic*/ true, MethodStubPlan.Visibility.PUBLIC,
-                            java.util.Collections.emptyList(),
+                            Collections.emptyList(),
                             /*defaultOnIface*/ false, /*isAbstract*/ false, /*isFinal*/ true, null));
                 } else {
                     out.methodPlans.add(new MethodStubPlan(
                             owner, "valueOf", owner.clone(),
-                            java.util.List.of(f.Type().createReference("java.lang.String")),
+                            List.of(f.Type().createReference("java.lang.String")),
                             /*isStatic*/ true, MethodStubPlan.Visibility.PUBLIC,
-                            java.util.Collections.emptyList(),
+                            Collections.emptyList(),
                             /*defaultOnIface*/ false, /*isAbstract*/ false, /*isFinal*/ true, null));
                 }
                 // NOTE: don't "continue" — let normal flow still plan 'name()' if seen elsewhere.
@@ -986,7 +1083,7 @@ public final class SpoonCollector {
     private CtTypeReference<?> resolveOwnerTypeFromInvocation(CtInvocation<?> inv) {
         // 1) Static call: TypeName.m(...)
         if (inv.getTarget() instanceof CtTypeAccess) {
-            CtTypeReference<?> at = ((spoon.reflect.code.CtTypeAccess<?>) inv.getTarget()).getAccessedType();
+            CtTypeReference<?> at = ((CtTypeAccess<?>) inv.getTarget()).getAccessedType();
             if (at != null) return at;
             // return ((CtTypeAccess<?>) inv.getTarget()).getAccessedType();
         }
@@ -998,14 +1095,40 @@ public final class SpoonCollector {
             // Best: the type of the field access expression itself
             try {
                 CtTypeReference<?> t = fa.getType();
-                if (t != null) return t;
+                if (t != null) {
+                    String tQn = safeQN(t);
+                    // If it's fully qualified and not unknown, use it
+                    if (tQn != null && tQn.contains(".") && !tQn.startsWith("unknown.")) {
+                        return t;
+                    }
+                }
             } catch (Throwable ignored) {
             }
 
-            // Fallback: field reference’s declared type
+            // Fallback: field reference's declared type
             try {
-                if (fa.getVariable() != null && fa.getVariable().getType() != null)
-                    return fa.getVariable().getType();
+                if (fa.getVariable() != null) {
+                    // Try variable's type
+                    CtTypeReference<?> varType = fa.getVariable().getType();
+                    if (varType != null) {
+                        String varTypeQn = safeQN(varType);
+                        // If it's fully qualified and not unknown, use it
+                        if (varTypeQn != null && varTypeQn.contains(".") && !varTypeQn.startsWith("unknown.")) {
+                            return varType;
+                        }
+                    }
+                    
+                    // Try field's declaration (might be in superclass)
+                    CtField<?> fieldDecl = fa.getVariable().getDeclaration();
+                    if (fieldDecl != null && fieldDecl.getType() != null) {
+                        CtTypeReference<?> declType = fieldDecl.getType();
+                        String declTypeQn = safeQN(declType);
+                        // If it's fully qualified and not unknown, use it
+                        if (declTypeQn != null && declTypeQn.contains(".") && !declTypeQn.startsWith("unknown.")) {
+                            return declType;
+                        }
+                    }
+                }
             } catch (Throwable ignored) {
             }
 
@@ -1087,13 +1210,13 @@ public final class SpoonCollector {
                 List<CtTypeReference<?>> inferred =
                         inferParamTypesFromCall(outer.getExecutable(), outer.getArguments());
                 if (idx < inferred.size() && inferred.get(idx) != null) return inferred.get(idx);
-                return f.Type().createReference(de.upb.sse.jess.generation.unknown.UnknownType.CLASS);
+                return f.Type().createReference(UnknownType.CLASS);
             }
         }
 
         // --- FOREACH: for (E x : call()) { ... } ---
-        if (p instanceof spoon.reflect.code.CtForEach) {
-            var fe = (spoon.reflect.code.CtForEach) p;
+        if (p instanceof CtForEach) {
+            var fe = (CtForEach) p;
             try {
                 CtTypeReference<?> varT = fe.getVariable().getType();
                 if (isSaneType(varT)) {
@@ -1110,13 +1233,13 @@ public final class SpoonCollector {
         }
 
 // --- ARRAY CONTEXT: call()[i] or assigned to E[] ---
-        if (p instanceof spoon.reflect.code.CtArrayAccess) {
+        if (p instanceof CtArrayAccess) {
             CtTypeReference<?> component = null;
             try {
-                var aa = (spoon.reflect.code.CtArrayAccess<?, ?>) p;
+                var aa = (CtArrayAccess<?, ?>) p;
                 CtTypeReference<?> at = aa.getType();
-                if (at instanceof spoon.reflect.reference.CtArrayTypeReference) {
-                    component = ((spoon.reflect.reference.CtArrayTypeReference<?>) at).getComponentType();
+                if (at instanceof CtArrayTypeReference) {
+                    component = ((CtArrayTypeReference<?>) at).getComponentType();
                 }
             } catch (Throwable ignored) {}
 
@@ -1132,9 +1255,9 @@ public final class SpoonCollector {
 
 
 // --- STRING CONCAT: "x" + call() or call() + "x" ---
-        if (p instanceof spoon.reflect.code.CtBinaryOperator) {
-            var bo = (spoon.reflect.code.CtBinaryOperator<?>) p;
-            if (bo.getKind() == spoon.reflect.code.BinaryOperatorKind.PLUS) {
+        if (p instanceof CtBinaryOperator) {
+            var bo = (CtBinaryOperator<?>) p;
+            if (bo.getKind() == BinaryOperatorKind.PLUS) {
                 try {
                     CtTypeReference<?> lt = bo.getLeftHandOperand() != null ? bo.getLeftHandOperand().getType() : null;
                     CtTypeReference<?> rt = bo.getRightHandOperand() != null ? bo.getRightHandOperand().getType() : null;
@@ -1148,8 +1271,8 @@ public final class SpoonCollector {
 
 // --- TERNARY: cond ? call() : other (or vice versa) ---
         // --- TERNARY: cond ? call() : other (or vice versa) ---
-        if (p instanceof spoon.reflect.code.CtConditional) {
-            var ce = (spoon.reflect.code.CtConditional<?>) p;
+        if (p instanceof CtConditional) {
+            var ce = (CtConditional<?>) p;
             var thenExp = ce.getThenExpression();
             var elseExp = ce.getElseExpression();
 
@@ -1599,7 +1722,7 @@ public final class SpoonCollector {
         try {
             String src = cu.getOriginalSourceCode();
             if (src != null) {
-                java.util.regex.Matcher m = java.util.regex.Pattern
+                Matcher m = Pattern
                         .compile("\\bimport\\s+([a-zA-Z_][\\w\\.]*)\\.\\*\\s*;")
                         .matcher(src);
                 while (m.find()) {
@@ -1636,7 +1759,7 @@ public final class SpoonCollector {
         }
         if (qn.contains(".")) return ownerRef;
 
-        String simple = java.util.Optional.ofNullable(ownerRef.getSimpleName()).orElse("Missing");
+        String simple = Optional.ofNullable(ownerRef.getSimpleName()).orElse("Missing");
 
         // (A) explicit single-type import wins
         CtTypeReference<?> explicit = resolveFromExplicitTypeImports(ctx, simple);
@@ -1650,13 +1773,13 @@ public final class SpoonCollector {
 
 
         // (B) star-imports
-        java.util.List<String> stars = starImportsInOrder(ctx);
+        List<String> stars = starImportsInOrder(ctx);
 
-        java.util.List<String> nonJdkNonUnknown = stars.stream()
+        List<String> nonJdkNonUnknown = stars.stream()
                 .map(String::trim)
                 .filter(p -> !"unknown".equals(p))
                 .filter(p -> !isJdkPackage(p))
-                .collect(java.util.stream.Collectors.toList());
+                .collect(Collectors.toList());
 
         if (nonJdkNonUnknown.size() == 1) {
             return f.Type().createReference(nonJdkNonUnknown.get(0) + "." + simple);
@@ -1732,8 +1855,8 @@ public final class SpoonCollector {
      * Seed types that appear only as explicit (single-type) imports.
      */
     private void seedExplicitTypeImports(CtModel model, CollectResult out) {
-        final java.util.regex.Pattern SINGLE_IMPORT =
-                java.util.regex.Pattern.compile("\\bimport\\s+([a-zA-Z_][\\w\\.]*)\\s*;");
+        final Pattern SINGLE_IMPORT =
+                Pattern.compile("\\bimport\\s+([a-zA-Z_][\\w\\.]*)\\s*;");
 
         model.getAllTypes().forEach(t -> {
             SourcePosition pos = t.getPosition();
@@ -1803,7 +1926,7 @@ public final class SpoonCollector {
 
             List<CtMethod<?>> sameName = ((CtClass<?>) ownerDecl).getMethods().stream()
                     .filter(m -> name.equals(m.getSimpleName()))
-                    .collect(java.util.stream.Collectors.toList());
+                    .collect(Collectors.toList());
             if (sameName.isEmpty()) return false;
 
             return !hasApplicableOverload(sameName, inv.getArguments());
@@ -1945,7 +2068,7 @@ public final class SpoonCollector {
             out.methodPlans.add(new MethodStubPlan(owner, name, returnType, paramTypes, isStatic, vis, thrown));
             if (("apply".equals(name) || "make".equals(name))) {
                 System.err.println("[collectOverloadGaps] Added SAM method: " + ownerQn + "#" + name + "(" + 
-                    paramTypes.stream().map(t -> safeQN(t)).collect(java.util.stream.Collectors.joining(", ")) + ")");
+                    paramTypes.stream().map(t -> safeQN(t)).collect(Collectors.joining(", ")) + ")");
             }
         }
         System.err.println("[collectOverloadGaps] Finished, total method plans: " + out.methodPlans.size());
@@ -2013,8 +2136,8 @@ public final class SpoonCollector {
         try {
             for (CtTypeReference<?> arg : t.getActualTypeArguments()) {
                 if (arg == null) continue;
-                if (arg instanceof spoon.reflect.reference.CtWildcardReference) {
-                    var w = (spoon.reflect.reference.CtWildcardReference) arg;
+                if (arg instanceof CtWildcardReference) {
+                    var w = (CtWildcardReference) arg;
                     CtTypeReference<?> bound = w.getBoundingType();
                     if (bound != null) collectTypeRefDeep(ctx, bound, out);
                 } else {
@@ -2261,8 +2384,8 @@ public final class SpoonCollector {
         if (arg == null) return f.Type().createReference(UNKNOWN_TYPE_FQN);
 
         // collapse anonymous classes to nominal supertype (first interface, else superclass)
-        if (arg instanceof spoon.reflect.code.CtNewClass) {
-            var nc = (spoon.reflect.code.CtNewClass<?>) arg;
+        if (arg instanceof CtNewClass) {
+            var nc = (CtNewClass<?>) arg;
             CtClass<?> anon = nc.getAnonymousClass();
             if (anon != null) {
                 CtTypeReference<?> pick = null;
@@ -2392,7 +2515,7 @@ public final class SpoonCollector {
         try {
             String src = cu.getOriginalSourceCode();
             if (src != null) {
-                var m = java.util.regex.Pattern
+                var m = Pattern
                         .compile("\\bimport\\s+static\\s+([\\w\\.]+)\\.(\\*|[A-Za-z_][\\w_]*)\\s*;")
                         .matcher(src);
                 while (m.find()) {
@@ -2527,8 +2650,8 @@ public final class SpoonCollector {
 // if target type is unknown, prefer raw Object (legal & robust) over <Unknown>.
     private CtTypeReference<?> coerceFunctionalToTarget(CtExpression<?> arg, CtTypeReference<?> expected) {
         if (arg == null) return expected;
-        boolean isFunc = (arg instanceof spoon.reflect.code.CtLambda)
-                || (arg instanceof spoon.reflect.code.CtExecutableReferenceExpression);
+        boolean isFunc = (arg instanceof CtLambda)
+                || (arg instanceof CtExecutableReferenceExpression);
         if (!isFunc) return expected;
         if (isSaneType(expected)) return expected; // target FI known → mirror it
         // no target type → raw/erased target to avoid illegal generics
@@ -2536,24 +2659,24 @@ public final class SpoonCollector {
     }
 
     // If varargs: pick a concrete element type from non-null args; else keep current/Unknown.
-    private java.util.List<CtTypeReference<?>> coerceVarargs(java.util.List<CtExpression<?>> args,
-                                                             int varargIndex,
-                                                             CtTypeReference<?> currentElem) {
+    private List<CtTypeReference<?>> coerceVarargs(List<CtExpression<?>> args,
+                                                   int varargIndex,
+                                                   CtTypeReference<?> currentElem) {
         if (varargIndex < 0 || varargIndex >= args.size()) {
-            return java.util.Collections.singletonList(currentElem);
+            return Collections.singletonList(currentElem);
         }
         CtTypeReference<?> chosen = null;
         for (int i = varargIndex; i < args.size(); i++) {
             CtExpression<?> a = args.get(i);
             if (a == null) continue;
-            if (a instanceof spoon.reflect.code.CtLiteral && ((spoon.reflect.code.CtLiteral<?>) a).getValue() == null) continue;
+            if (a instanceof CtLiteral && ((CtLiteral<?>) a).getValue() == null) continue;
             try {
                 CtTypeReference<?> t = a.getType();
                 if (isSaneType(t)) { chosen = t; break; }
             } catch (Throwable ignored) {}
         }
         if (chosen == null) chosen = (currentElem != null ? currentElem : f.Type().createReference("unknown.Unknown"));
-        return java.util.Collections.singletonList(chosen);
+        return Collections.singletonList(chosen);
     }
 
     private String erasureFqn(CtTypeReference<?> tr) {
@@ -2574,19 +2697,19 @@ public final class SpoonCollector {
     private boolean isInStaticContext(CtElement e) {
         CtElement cur = e;
         while (cur != null) {
-            if (cur instanceof spoon.reflect.declaration.CtMethod<?>) {
-                return ((spoon.reflect.declaration.CtMethod<?>) cur)
-                        .hasModifier(spoon.reflect.declaration.ModifierKind.STATIC);
+            if (cur instanceof CtMethod<?>) {
+                return ((CtMethod<?>) cur)
+                        .hasModifier(ModifierKind.STATIC);
             }
-            if (cur instanceof spoon.reflect.declaration.CtField<?>) {
-                return ((spoon.reflect.declaration.CtField<?>) cur)
-                        .hasModifier(spoon.reflect.declaration.ModifierKind.STATIC);
+            if (cur instanceof CtField<?>) {
+                return ((CtField<?>) cur)
+                        .hasModifier(ModifierKind.STATIC);
             }
-            if (cur instanceof spoon.reflect.declaration.CtAnonymousExecutable) {
-                return ((spoon.reflect.declaration.CtAnonymousExecutable) cur)
-                        .hasModifier(spoon.reflect.declaration.ModifierKind.STATIC);
+            if (cur instanceof CtAnonymousExecutable) {
+                return ((CtAnonymousExecutable) cur)
+                        .hasModifier(ModifierKind.STATIC);
             }
-            if (cur instanceof spoon.reflect.declaration.CtType<?>) break; // stop at type boundary
+            if (cur instanceof CtType<?>) break; // stop at type boundary
             cur = cur.getParent();
         }
         return false;
@@ -2600,7 +2723,7 @@ public final class SpoonCollector {
      */
     private void rebindUnknownHomonyms(CtModel model, CollectResult collectResult) {
         // index: which non-unknown types exist or are planned
-        java.util.Set<String> existingOrPlanned = new java.util.HashSet<>();
+        Set<String> existingOrPlanned = new HashSet<>();
         model.getAllTypes().forEach(t -> {
             String qn = safeQN(t.getReference());
             if (qn != null && !qn.startsWith("unknown.")) existingOrPlanned.add(qn);
@@ -2616,7 +2739,7 @@ public final class SpoonCollector {
             String cuPkg = (cu != null && cu.getDeclaredPackage() != null ? cu.getDeclaredPackage().getQualifiedName() : "");
             if (cuPkg == null) cuPkg = "";
 
-            for (CtTypeReference<?> ref : t.getElements(new spoon.reflect.visitor.filter.TypeFilter<>(CtTypeReference.class))) {
+            for (CtTypeReference<?> ref : t.getElements(new TypeFilter<>(CtTypeReference.class))) {
                 String qn = safeQN(ref);
                 if (qn == null || !qn.startsWith("unknown.")) continue;
 
@@ -2645,22 +2768,22 @@ public final class SpoonCollector {
 
 
     private void collectTryWithResources(CtModel model, CollectResult out) {
-        for (CtTry twr : model.getElements(new spoon.reflect.visitor.filter.TypeFilter<>(CtTry.class))) {
+        for (CtTry twr : model.getElements(new TypeFilter<>(CtTry.class))) {
 
             // 1) Try to call CtTry#getResources() reflectively (if present in this Spoon version)
-            java.util.List<CtLocalVariable<?>> res = null;
+            List<CtLocalVariable<?>> res = null;
             try {
-                java.lang.reflect.Method m = twr.getClass().getMethod("getResources");
+                Method m = twr.getClass().getMethod("getResources");
                 @SuppressWarnings("unchecked")
-                java.util.List<CtLocalVariable<?>> tmp = (java.util.List<CtLocalVariable<?>>) m.invoke(twr);
+                List<CtLocalVariable<?>> tmp = (List<CtLocalVariable<?>>) m.invoke(twr);
                 res = tmp;
             } catch (Throwable ignore) {
                 // 2) Fallback: collect locals whose role in parent is a resource of this CtTry
-                res = new java.util.ArrayList<>();
+                res = new ArrayList<>();
                 for (CtLocalVariable<?> lv :
-                        twr.getElements(new spoon.reflect.visitor.filter.TypeFilter<>(CtLocalVariable.class))) {
+                        twr.getElements(new TypeFilter<>(CtLocalVariable.class))) {
                     if (lv.getParent(CtTry.class) == twr) {
-                        spoon.reflect.path.CtRole role = lv.getRoleInParent();
+                        CtRole role = lv.getRoleInParent();
                         // some Spoon versions use RESOURCE or RESOURCES; be defensive:
                         if (role != null && role.name().toLowerCase().contains("resource")) {
                             res.add(lv);
@@ -2681,7 +2804,7 @@ public final class SpoonCollector {
 
                 // Attach AutoCloseable (do NOT create java.lang.AutoCloseable)
                 out.implementsPlans
-                        .computeIfAbsent(owner.getQualifiedName(), k -> new java.util.LinkedHashSet<>())
+                        .computeIfAbsent(owner.getQualifiedName(), k -> new LinkedHashSet<>())
                         .add(f.Type().createReference("java.lang.AutoCloseable"));
 
                 // Plan abstract close()
@@ -2689,10 +2812,10 @@ public final class SpoonCollector {
                         owner,
                         "close",
                         f.Type().VOID_PRIMITIVE,
-                        java.util.Collections.emptyList(),
+                        Collections.emptyList(),
                         /*isStatic*/ false,
                         MethodStubPlan.Visibility.PUBLIC,
-                        java.util.Collections.emptyList(),
+                        Collections.emptyList(),
                         /*defaultOnIface*/ false,
                         /*isAbstract*/ true,
                         /*isFinal*/ false,
@@ -2757,15 +2880,15 @@ public final class SpoonCollector {
             CtAnnotationType<?> containerAnn
     ) {
         // @Repeatable
-        CtTypeReference<java.lang.annotation.Repeatable> repeatableRef =
-                f.Type().createReference(java.lang.annotation.Repeatable.class);
+        CtTypeReference<Repeatable> repeatableRef =
+                f.Type().createReference(Repeatable.class);
 
         CtAnnotation<?> rep = f.Core().createAnnotation();
         rep.setAnnotationType(repeatableRef);
 
         // value = Container.class  (class literal expression)
         CtTypeReference<?> containerRef = containerAnn.getReference();
-        spoon.reflect.code.CtExpression<?> classLiteral = f.Code().createClassAccess(containerRef);
+        CtExpression<?> classLiteral = f.Code().createClassAccess(containerRef);
         rep.addValue("value", classLiteral);
 
         tagAnn.addAnnotation(rep);
@@ -2798,7 +2921,7 @@ public final class SpoonCollector {
     private void ensureRepeatablesForDuplicateUses(CtModel model) {
         for (CtType<?> t : model.getAllTypes()) {
             // scan type
-            java.util.List<CtAnnotation<?>> anns = t.getAnnotations();
+            List<CtAnnotation<?>> anns = t.getAnnotations();
             ensureRepeatableIfDuplicate(anns);
 
             // scan members
@@ -2811,10 +2934,10 @@ public final class SpoonCollector {
         }
     }
 
-    private void ensureRepeatableIfDuplicate(java.util.List<CtAnnotation<?>> anns) {
+    private void ensureRepeatableIfDuplicate(List<CtAnnotation<?>> anns) {
         if (anns == null || anns.isEmpty()) return;
-        java.util.Map<String, java.util.List<CtAnnotation<?>>> byType =
-                anns.stream().collect(java.util.stream.Collectors.groupingBy(a -> safeQN(a.getAnnotationType())));
+        Map<String, List<CtAnnotation<?>>> byType =
+                anns.stream().collect(Collectors.groupingBy(a -> safeQN(a.getAnnotationType())));
         byType.forEach((annFqn, list) -> {
             if (annFqn == null) return;
             if (list.size() > 1) {
@@ -2862,7 +2985,7 @@ public final class SpoonCollector {
                     @SuppressWarnings("unchecked")
                     List<CtTypeReference<?>> ps = (List<CtTypeReference<?>>) (List<?>) sam.getParameters().stream()
                             .map(CtParameter::getType)
-                            .collect(java.util.stream.Collectors.toList());
+                            .collect(Collectors.toList());
                     return Map.entry(ret, ps);
                 }
             }
@@ -2870,7 +2993,7 @@ public final class SpoonCollector {
             // fall through to default
         }
         // default: int -> int
-        return Map.entry(f.Type().INTEGER_PRIMITIVE, java.util.List.of(f.Type().INTEGER_PRIMITIVE));
+        return Map.entry(f.Type().INTEGER_PRIMITIVE, List.of(f.Type().INTEGER_PRIMITIVE));
     }
 
 
@@ -2967,7 +3090,7 @@ public final class SpoonCollector {
                             isArray = true;
                         }
                         if (isArray && samParams.isEmpty()) {
-                            samParams = java.util.Collections.singletonList(f.Type().createReference("int"));
+                            samParams = Collections.singletonList(f.Type().createReference("int"));
                         }
                         // Note: For non-array constructors, we'll infer params from constructor plans below
                     }
@@ -2984,7 +3107,7 @@ public final class SpoonCollector {
                         samParams,
                         /*isStatic*/ false,
                         MethodStubPlan.Visibility.PUBLIC,
-                        java.util.Collections.emptyList(),
+                        Collections.emptyList(),
                         /*defaultOnInterface*/ false,  // abstract
                         /*varargs*/ false,
                         /*mirror*/ false,
@@ -3023,7 +3146,7 @@ public final class SpoonCollector {
                     int idx = (mrText != null ? mrText.indexOf("::") : -1);
                     if (idx > 0) {
                         String left = mrText.substring(0, idx).trim();
-                        String curPkg = java.util.Optional.ofNullable(mref.getParent(CtType.class))
+                        String curPkg = Optional.ofNullable(mref.getParent(CtType.class))
                                 .map(CtType::getPackage).map(CtPackage::getQualifiedName).orElse(null);
                         // If left has no dots and we have a current package, use it
                         if (left.indexOf('.') < 0 && curPkg != null && !curPkg.isEmpty()) {
@@ -3053,7 +3176,7 @@ public final class SpoonCollector {
                                 int idx2 = mrText.indexOf("::");
                                 if (idx2 > 0) {
                                     String left2 = mrText.substring(0, idx2).trim();
-                                    String curPkg2 = java.util.Optional.ofNullable(mref.getParent(CtType.class))
+                                    String curPkg2 = Optional.ofNullable(mref.getParent(CtType.class))
                                             .map(CtType::getPackage).map(CtPackage::getQualifiedName).orElse(null);
                                     if (left2.indexOf('.') < 0 && curPkg2 != null && !curPkg2.isEmpty()) {
                                         forcedQN = curPkg2 + "." + left2;
@@ -3080,20 +3203,20 @@ public final class SpoonCollector {
                 if (target != null) {
                     try {
                         // If target is a variable read but the variable doesn't exist, it's likely a type
-                        if (target instanceof spoon.reflect.code.CtVariableRead<?>) {
-                            spoon.reflect.code.CtVariableRead<?> vr = (spoon.reflect.code.CtVariableRead<?>) target;
+                        if (target instanceof CtVariableRead<?>) {
+                            CtVariableRead<?> vr = (CtVariableRead<?>) target;
                             try {
-                                spoon.reflect.reference.CtVariableReference<?> varRef = vr.getVariable();
+                                CtVariableReference<?> varRef = vr.getVariable();
                                 if (varRef == null || varRef.getDeclaration() == null) {
                                     mightBeUnresolvedType = true; // Variable doesn't exist, likely a type
                                 }
                             } catch (Throwable ignored) {
                                 mightBeUnresolvedType = true; // Can't resolve variable, likely a type
                             }
-                        } else if (target instanceof spoon.reflect.code.CtVariableAccess<?>) {
-                            spoon.reflect.code.CtVariableAccess<?> va = (spoon.reflect.code.CtVariableAccess<?>) target;
+                        } else if (target instanceof CtVariableAccess<?>) {
+                            CtVariableAccess<?> va = (CtVariableAccess<?>) target;
                             try {
-                                spoon.reflect.reference.CtVariableReference<?> varRef = va.getVariable();
+                                CtVariableReference<?> varRef = va.getVariable();
                                 if (varRef == null || varRef.getDeclaration() == null) {
                                     mightBeUnresolvedType = true;
                                 }
@@ -3107,7 +3230,7 @@ public final class SpoonCollector {
                 if (idx > 0 && (target == null || mightBeUnresolvedType)) {
                     // Target is null or unresolved variable (likely type) - treat as Type::method
                     String left = mrText.substring(0, idx).trim();
-                    String curPkg = java.util.Optional.ofNullable(mref.getParent(CtType.class))
+                    String curPkg = Optional.ofNullable(mref.getParent(CtType.class))
                             .map(CtType::getPackage).map(CtPackage::getQualifiedName).orElse(null);
                     // If left has no dots and we have a current package, treat as Type::method
                     if (left.indexOf('.') < 0 && curPkg != null && !curPkg.isEmpty()) {
@@ -3219,7 +3342,7 @@ public final class SpoonCollector {
                                 CtExecutableReference<?> callEx = firstCall.getExecutable();
                                 ctorParams = inferParamTypesFromCall(callEx, callArgs);
                                 System.err.println("[collectMethodReferences] Inferred constructor params from call site: " + 
-                                    ctorParams.stream().map(t -> safeQN(t)).collect(java.util.stream.Collectors.joining(", ")));
+                                    ctorParams.stream().map(t -> safeQN(t)).collect(Collectors.joining(", ")));
                             } else {
                                 // No arguments means no-arg constructor
                                 ctorParams = new ArrayList<>();
@@ -3244,7 +3367,7 @@ public final class SpoonCollector {
                                 // Use the existing constructor's parameters
                                 ctorParams = new ArrayList<>(existingCtor.parameterTypes);
                                 System.err.println("[collectMethodReferences] Using existing constructor plan: " + 
-                                    ctorParams.stream().map(t -> safeQN(t)).collect(java.util.stream.Collectors.joining(", ")));
+                                    ctorParams.stream().map(t -> safeQN(t)).collect(Collectors.joining(", ")));
                                 break;
                             }
                         } catch (Throwable ignored) {}
@@ -3257,7 +3380,7 @@ public final class SpoonCollector {
                 }
                 
                 System.err.println("[collectMethodReferences] Final constructor params for " + ownerQnForCtor + ": " + 
-                    ctorParams.stream().map(t -> safeQN(t)).collect(java.util.stream.Collectors.joining(", ")) + 
+                    ctorParams.stream().map(t -> safeQN(t)).collect(Collectors.joining(", ")) + 
                     " (size: " + ctorParams.size() + ")");
                 
                 out.ctorPlans.add(new ConstructorStubPlan(ownerRef, ctorParams));
@@ -3287,7 +3410,7 @@ public final class SpoonCollector {
                             ctorParams,  // Use constructor parameters (from existing constructor plan or inferred)
                             /*isStatic*/ false,
                             MethodStubPlan.Visibility.PUBLIC,
-                            java.util.Collections.emptyList(),
+                            Collections.emptyList(),
                             /*defaultOnInterface*/ false,
                             /*varargs*/ false,
                             /*mirror*/ false,
@@ -3302,7 +3425,7 @@ public final class SpoonCollector {
                     ownerRef, name, samRet2, samParams2,
                     /*isStatic*/ isStatic,
                     MethodStubPlan.Visibility.PUBLIC,
-                    java.util.Collections.emptyList(),
+                    Collections.emptyList(),
                     /*defaultOnInterface*/ false,
                     /*varargs*/ false,
                     /*mirror*/ false,
@@ -3316,10 +3439,10 @@ public final class SpoonCollector {
      * Collect lambda expressions and ensure their target types are created as INTERFACES (functional interfaces).
      */
     private void collectLambdas(CtModel model, CollectResult out) {
-        List<spoon.reflect.code.CtLambda<?>> lambdas =
-                model.getElements(new TypeFilter<>(spoon.reflect.code.CtLambda.class));
+        List<CtLambda<?>> lambdas =
+                model.getElements(new TypeFilter<>(CtLambda.class));
 
-        for (spoon.reflect.code.CtLambda<?> lambda : lambdas) {
+        for (CtLambda<?> lambda : lambdas) {
             // Find the variable this lambda is assigned to
             CtLocalVariable<?> lv = lambda.getParent(CtLocalVariable.class);
             if (lv != null && lv.getType() != null) {
@@ -3363,8 +3486,8 @@ public final class SpoonCollector {
                             CtExpression<?> bodyExpr = null;
                             
                             // Extract expression from body (could be return statement or direct expression)
-                            if (body instanceof spoon.reflect.code.CtReturn<?>) {
-                                bodyExpr = ((spoon.reflect.code.CtReturn<?>) body).getReturnedExpression();
+                            if (body instanceof CtReturn<?>) {
+                                bodyExpr = ((CtReturn<?>) body).getReturnedExpression();
                             } else if (body instanceof CtExpression) {
                                 bodyExpr = (CtExpression<?>) body;
                             }
@@ -3508,12 +3631,12 @@ public final class SpoonCollector {
                                 String pOwnerQn = safeQN(p.ownerType);
                                 String pOwnerQnErased = erasureFqn(p.ownerType);
                                 System.err.println("  - Existing: " + pOwnerQn + " (erased: " + pOwnerQnErased + ") #" + p.name + 
-                                    "(" + p.paramTypes.stream().map(t -> safeQN(t)).collect(java.util.stream.Collectors.joining(", ")) + ")");
+                                    "(" + p.paramTypes.stream().map(t -> safeQN(t)).collect(Collectors.joining(", ")) + ")");
                             } catch (Throwable ignored) {}
                         }
                         
                         // Debug: log before removal
-                        java.util.List<MethodStubPlan> toRemove = new java.util.ArrayList<>();
+                        List<MethodStubPlan> toRemove = new ArrayList<>();
                         for (MethodStubPlan p : out.methodPlans) {
                             try {
                                 String pOwnerQn = safeQN(p.ownerType);
@@ -3549,7 +3672,7 @@ public final class SpoonCollector {
                             System.err.println("[collectLambdas] Removed " + toRemove.size() + " existing SAM method(s) for " + finalFiQn);
                             for (MethodStubPlan p : toRemove) {
                                 System.err.println("  - Removed: " + safeQN(p.ownerType) + "#" + p.name + "(" + 
-                                    p.paramTypes.stream().map(t -> safeQN(t)).collect(java.util.stream.Collectors.joining(", ")) + ")");
+                                    p.paramTypes.stream().map(t -> safeQN(t)).collect(Collectors.joining(", ")) + ")");
                             }
                         }
                         
@@ -3561,7 +3684,7 @@ public final class SpoonCollector {
                                 samParams,
                                 /*isStatic*/ false,
                                 MethodStubPlan.Visibility.PUBLIC,
-                                java.util.Collections.emptyList(),
+                                Collections.emptyList(),
                                 /*defaultOnInterface*/ false,
                                 /*varargs*/ false,
                                 /*mirror*/ false,
@@ -3571,7 +3694,7 @@ public final class SpoonCollector {
                         
                         // Debug: log what we're adding
                         System.err.println("[collectLambdas] Added lambda SAM method: " + finalFiQn + "#apply(" + 
-                            samParams.stream().map(t -> safeQN(t)).collect(java.util.stream.Collectors.joining(", ")) + 
+                            samParams.stream().map(t -> safeQN(t)).collect(Collectors.joining(", ")) + 
                             ") : " + safeQN(lambdaReturnType));
                     } catch (Throwable ignored) {
                         // If we can't infer, use defaults
@@ -3596,20 +3719,20 @@ public final class SpoonCollector {
                     String ownerQn = safeQN(p.ownerType);
                     String ownerQnErased = erasureFqn(p.ownerType);
                     System.err.println("  - " + ownerQn + " (erased: " + ownerQnErased + ") #" + p.name + "(" + 
-                        p.paramTypes.stream().map(t -> safeQN(t)).collect(java.util.stream.Collectors.joining(", ")) + ")");
+                        p.paramTypes.stream().map(t -> safeQN(t)).collect(Collectors.joining(", ")) + ")");
                 } catch (Throwable ignored) {}
             }
         }
         
         // Group method plans by owner (using erased FQN to handle generics)
-        java.util.Map<String, java.util.List<MethodStubPlan>> ownerToMethods = new java.util.HashMap<>();
+        Map<String, List<MethodStubPlan>> ownerToMethods = new HashMap<>();
         
         for (MethodStubPlan p : out.methodPlans) {
             if (("apply".equals(p.name) || "make".equals(p.name)) && !p.defaultOnInterface && !p.isStatic) {
                 try {
                     String ownerQnErased = erasureFqn(p.ownerType);
                     if (ownerQnErased != null && !isJdkFqn(ownerQnErased)) {
-                        ownerToMethods.computeIfAbsent(ownerQnErased, k -> new java.util.ArrayList<>()).add(p);
+                        ownerToMethods.computeIfAbsent(ownerQnErased, k -> new ArrayList<>()).add(p);
                     }
                 } catch (Throwable ignored) {}
             }
@@ -3618,8 +3741,8 @@ public final class SpoonCollector {
         System.err.println("[removeDuplicateSamMethods] Found " + ownerToMethods.size() + " functional interfaces with SAM methods");
         
         // For each functional interface with multiple SAM methods, keep only one
-        for (java.util.Map.Entry<String, java.util.List<MethodStubPlan>> entry : ownerToMethods.entrySet()) {
-            java.util.List<MethodStubPlan> methods = entry.getValue();
+        for (Map.Entry<String, List<MethodStubPlan>> entry : ownerToMethods.entrySet()) {
+            List<MethodStubPlan> methods = entry.getValue();
             System.err.println("[removeDuplicateSamMethods] " + entry.getKey() + " has " + methods.size() + " SAM method(s)");
             if (methods.size() > 1) {
                 String ownerQn = entry.getKey();
@@ -3631,7 +3754,7 @@ public final class SpoonCollector {
                 System.err.println("[removeDuplicateSamMethods] All methods for " + ownerQn + ":");
                 for (MethodStubPlan p : methods) {
                     System.err.println("  - " + safeQN(p.ownerType) + "#" + p.name + "(" + 
-                        p.paramTypes.stream().map(t -> safeQN(t)).collect(java.util.stream.Collectors.joining(", ")) + 
+                        p.paramTypes.stream().map(t -> safeQN(t)).collect(Collectors.joining(", ")) + 
                         ") : " + safeQN(p.returnType));
                 }
                 
@@ -3655,7 +3778,7 @@ public final class SpoonCollector {
                     toKeep = matchingCallSite;
                     System.err.println("[removeDuplicateSamMethods] Preferring method with fewer parameters (matches call site): " + 
                         safeQN(toKeep.ownerType) + "#" + toKeep.name + "(" + 
-                        toKeep.paramTypes.stream().map(t -> safeQN(t)).collect(java.util.stream.Collectors.joining(", ")) + ")");
+                        toKeep.paramTypes.stream().map(t -> safeQN(t)).collect(Collectors.joining(", ")) + ")");
                 } else {
                     // Otherwise, prefer the method with non-primitive parameters (Integer over int)
                     for (MethodStubPlan candidate : methods) {
@@ -3712,11 +3835,11 @@ public final class SpoonCollector {
                     if (p != toKeep) {
                         out.methodPlans.remove(p);
                         System.err.println("  - Removed duplicate: " + safeQN(p.ownerType) + "#" + p.name + "(" + 
-                            p.paramTypes.stream().map(t -> safeQN(t)).collect(java.util.stream.Collectors.joining(", ")) + ")");
+                            p.paramTypes.stream().map(t -> safeQN(t)).collect(Collectors.joining(", ")) + ")");
                     }
                 }
                 System.err.println("  - Kept: " + safeQN(toKeep.ownerType) + "#" + toKeep.name + "(" + 
-                    toKeep.paramTypes.stream().map(t -> safeQN(t)).collect(java.util.stream.Collectors.joining(", ")) + ")");
+                    toKeep.paramTypes.stream().map(t -> safeQN(t)).collect(Collectors.joining(", ")) + ")");
             }
         }
     }
@@ -3736,7 +3859,7 @@ public final class SpoonCollector {
         if (out == null || out.typePlans == null || out.typePlans.isEmpty()) return;
 
         // Find concrete winners keyed by simple name
-        java.util.Map<String, String> concreteBySimple = new java.util.HashMap<>();
+        Map<String, String> concreteBySimple = new HashMap<>();
         for (TypeStubPlan p : out.typePlans) {
             String qn = p.qualifiedName;
             if (qn == null) continue;
@@ -3747,7 +3870,7 @@ public final class SpoonCollector {
         if (concreteBySimple.isEmpty()) return;
 
         // Remove unknown.* twins
-        java.util.Iterator<TypeStubPlan> it = out.typePlans.iterator();
+        Iterator<TypeStubPlan> it = out.typePlans.iterator();
         while (it.hasNext()) {
             TypeStubPlan p = it.next();
             String qn = p.qualifiedName;
@@ -3759,7 +3882,7 @@ public final class SpoonCollector {
         }
 
         // Publish rebind hints
-        for (java.util.Map.Entry<String, String> e : concreteBySimple.entrySet()) {
+        for (Map.Entry<String, String> e : concreteBySimple.entrySet()) {
             out.unknownToConcrete.put("unknown." + e.getKey(), e.getValue());
         }
     }
@@ -3795,7 +3918,7 @@ public final class SpoonCollector {
                 iterableRef.addActualTypeArgument(elem.clone());
 
                 out.implementsPlans
-                        .computeIfAbsent(ownerQn, k -> new java.util.LinkedHashSet<>())
+                        .computeIfAbsent(ownerQn, k -> new LinkedHashSet<>())
                         .add(iterableRef);
 
                 CtTypeReference<?> iteratorRef = f.Type().createReference("java.util.Iterator");
@@ -3805,10 +3928,10 @@ public final class SpoonCollector {
                         ownerRef,
                         "iterator",
                         iteratorRef,
-                        java.util.Collections.emptyList(),
+                        Collections.emptyList(),
                         /*isStatic*/ false,
                         MethodStubPlan.Visibility.PUBLIC,
-                        java.util.Collections.emptyList(),
+                        Collections.emptyList(),
                         /*defaultOnInterface*/ false,
                         /*varargs*/ false,
                         /*mirror*/ false,
