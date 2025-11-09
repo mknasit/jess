@@ -130,6 +130,7 @@ public final class SpoonCollector {
         collectUnresolvedFields(model, result);
         collectUnresolvedCtorCalls(model, result);
         collectForEachLoops(model, result);
+        collectStreamApiMethods(model, result);  // Collect Stream API methods (stream(), forEach, map, filter, etc.)
         collectMethodReferences(model, result);  // Collect method references FIRST (creates functional interface SAM methods)
         collectUnresolvedMethodCalls(model, result);  // Collect method calls (may create SAM methods from calls like f.apply(1))
         collectLambdas(model, result);  // Collect lambdas LAST and remove/replace any existing SAM methods with correct signature from lambda
@@ -150,7 +151,7 @@ public final class SpoonCollector {
         // This ensures that functional interfaces have only ONE abstract method
         // Even if different collection phases added methods with different parameter types (int vs Integer)
         removeDuplicateSamMethods(result);
-        
+
         // Ensure owners exist for any planned members / references discovered above.
         result.typePlans.addAll(ownersNeedingTypes(result));
 
@@ -174,10 +175,10 @@ public final class SpoonCollector {
         Stream.concat(
                 result.typePlans.stream().map(tp -> tp.qualifiedName),
                 Stream.concat(
-                        result.fieldPlans.stream().map(fp -> fp.ownerType.getQualifiedName()),
+                        result.fieldPlans.stream().map(fp -> fp.ownerType != null ? fp.ownerType.getQualifiedName() : null),
                         Stream.concat(
-                                result.ctorPlans.stream().map(cp -> cp.ownerType.getQualifiedName()),
-                                result.methodPlans.stream().map(mp -> mp.ownerType.getQualifiedName())
+                                result.ctorPlans.stream().map(cp -> cp.ownerType != null ? cp.ownerType.getQualifiedName() : null),
+                                result.methodPlans.stream().map(mp -> mp.ownerType != null ? mp.ownerType.getQualifiedName() : null)
                         )
                 )
         ).filter(Objects::nonNull).forEach(qn -> {
@@ -191,9 +192,9 @@ public final class SpoonCollector {
 // (3) keep only those simples that are (a) part of our plans and (b) map to >1 pkgs
         Set<String> plannedSimples = new HashSet<>();
         result.typePlans.forEach(tp -> { String qn = tp.qualifiedName; if (qn != null) plannedSimples.add(qn.substring(qn.lastIndexOf('.')+1)); });
-        result.fieldPlans.forEach(fp -> plannedSimples.add(fp.ownerType.getSimpleName()));
-        result.ctorPlans.forEach(cp -> plannedSimples.add(cp.ownerType.getSimpleName()));
-        result.methodPlans.forEach(mp -> plannedSimples.add(mp.ownerType.getSimpleName()));
+        result.fieldPlans.forEach(fp -> { if (fp.ownerType != null) plannedSimples.add(fp.ownerType.getSimpleName()); });
+        result.ctorPlans.forEach(cp -> { if (cp.ownerType != null) plannedSimples.add(cp.ownerType.getSimpleName()); });
+        result.methodPlans.forEach(mp -> { if (mp.ownerType != null) plannedSimples.add(mp.ownerType.getSimpleName()); });
 
         simpleToPkgs.forEach((simple, pkgs) -> {
             if (pkgs.size() > 1 && plannedSimples.contains(simple)) {
@@ -820,7 +821,7 @@ public final class SpoonCollector {
                         
                         // If we still don't have a fully qualified type, fall back to chooseOwnerPackage
                         if (owner == null) {
-                            owner = chooseOwnerPackage(rawOwner, inv);
+                owner = chooseOwnerPackage(rawOwner, inv);
                             System.err.println("[collectUnresolvedMethodCalls] Falling back to chooseOwnerPackage: " + safeQN(owner));
                         }
                     } catch (Throwable t) {
@@ -1050,6 +1051,25 @@ public final class SpoonCollector {
 
 
             boolean staticCtx = isInStaticContext(inv);
+            
+            // Check if this method was already added by collectStreamApiMethods
+            // (which has better type inference for modern API methods like map, thenApply, etc.)
+            CtTypeReference<?> finalOwner = owner;
+            boolean alreadyExists = out.methodPlans.stream().anyMatch(p -> {
+                try {
+                    String pOwnerQn = safeQN(p.ownerType);
+                    String ownerQn = safeQN(finalOwner);
+                    return ownerQn != null && ownerQn.equals(pOwnerQn) && name.equals(p.name);
+                } catch (Throwable ignored) {
+                    return false;
+                }
+            });
+            
+            if (alreadyExists) {
+                // Skip - method was already added with better type information
+                continue;
+            }
+            
             // enqueue plan — NOTE: no mirroring when owner is already unknown.*
             out.methodPlans.add(new MethodStubPlan(
                     owner, name,
@@ -1376,27 +1396,31 @@ public final class SpoonCollector {
             // Decide the package for this unresolved annotation via your existing heuristic
             CtTypeReference<?> resolved = chooseOwnerPackage(t, ann);
             if (resolved == null) continue;
-            String annFqn = resolved.getQualifiedName();
-            out.typePlans.add(new TypeStubPlan(annFqn, TypeStubPlan.Kind.ANNOTATION));
+            String annFqn = safeQN(resolved);
+            if (annFqn != null && !annFqn.isEmpty()) {
+                addTypePlanFromRef(out, resolved, TypeStubPlan.Kind.ANNOTATION);
+            }
 
             // If the same unresolved annotation appears more than once on the SAME element => repeatable
-            CtElement owner = ann.getAnnotatedElement();
-            if (owner != null) {
-                long sameCount = owner.getAnnotations().stream()
-                        .map(a -> {
-                            CtTypeReference<?> rt = a.getAnnotationType();
-                            return (rt == null ? "" : safeQN(chooseOwnerPackage(rt, a)));
-                        })
-                        .filter(fqn -> annFqn.equals(fqn))
-                        .count();
+            if (annFqn != null && !annFqn.isEmpty()) {
+                CtElement owner = ann.getAnnotatedElement();
+                if (owner != null) {
+                    long sameCount = owner.getAnnotations().stream()
+                            .map(a -> {
+                                CtTypeReference<?> rt = a.getAnnotationType();
+                                return (rt == null ? "" : safeQN(chooseOwnerPackage(rt, a)));
+                            })
+                            .filter(fqn -> annFqn.equals(fqn))
+                            .count();
 
-                if (sameCount >= 2) {
-                    String pkg = annFqn.substring(0, annFqn.lastIndexOf('.'));
-                    String simple = annFqn.substring(annFqn.lastIndexOf('.') + 1);
-                    // container naming: Tag -> Tags
-                    String containerSimple = simple.endsWith("s") ? (simple + "es") : (simple + "s");
-                    String containerFqn = pkg + "." + containerSimple;
-                    out.typePlans.add(new TypeStubPlan(containerFqn, TypeStubPlan.Kind.ANNOTATION));
+                    if (sameCount >= 2) {
+                        String pkg = annFqn.substring(0, annFqn.lastIndexOf('.'));
+                        String simple = annFqn.substring(annFqn.lastIndexOf('.') + 1);
+                        // container naming: Tag -> Tags
+                        String containerSimple = simple.endsWith("s") ? (simple + "es") : (simple + "s");
+                        String containerFqn = pkg + "." + containerSimple;
+                        addTypePlanIfNonJdk(out, containerFqn, TypeStubPlan.Kind.ANNOTATION);
+                    }
                 }
             }
         }
@@ -1412,7 +1436,7 @@ public final class SpoonCollector {
             if (!qn.contains(".")) {
                 CtTypeReference<?> resolved = resolveFromExplicitTypeImports(a, at.getSimpleName());
                 if (resolved != null) {
-                    out.typePlans.add(new TypeStubPlan(resolved.getQualifiedName(), TypeStubPlan.Kind.ANNOTATION));
+                    addTypePlanFromRef(out, resolved, TypeStubPlan.Kind.ANNOTATION);
                     // Also plan container (Tag -> Tags) in same pkg, as annotation
                     String pkg = resolved.getPackage() == null ? "" : resolved.getPackage().getQualifiedName();
                     String simple = resolved.getSimpleName();
@@ -1423,10 +1447,13 @@ public final class SpoonCollector {
                 }
             }
 
-            // Otherwise, keep whatever we have if it’s non-JDK
+            // Otherwise, keep whatever we have if it's non-JDK
             if (!isJdkType(at)) {
-                out.typePlans.add(new TypeStubPlan((qn.isEmpty() ? "unknown." + at.getSimpleName() : qn),
-                        TypeStubPlan.Kind.ANNOTATION));
+                String simpleName = at.getSimpleName();
+                if (simpleName != null && !simpleName.isEmpty()) {
+                    String finalQn = (qn.isEmpty() ? "unknown." + simpleName : qn);
+                    addTypePlanIfNonJdk(out, finalQn, TypeStubPlan.Kind.ANNOTATION);
+                }
                 // Plan container in same package
                 String pkg = at.getPackage() == null ? "" : at.getPackage().getQualifiedName();
                 String simple = at.getSimpleName();
@@ -1452,7 +1479,7 @@ public final class SpoonCollector {
                 if (t == null) continue;
                 CtTypeReference<?> owner = chooseOwnerPackage(t, m);
                 if (isJdkType(owner)) continue;
-                out.typePlans.add(new TypeStubPlan(owner.getQualifiedName(), TypeStubPlan.Kind.CLASS));
+                addTypePlanFromRef(out, owner, TypeStubPlan.Kind.CLASS);
                 out.ctorPlans.add(new ConstructorStubPlan(owner, Collections.emptyList()));
             }
         }
@@ -1464,7 +1491,7 @@ public final class SpoonCollector {
                 if (t == null) continue;
                 CtTypeReference<?> owner = chooseOwnerPackage(t, c);
                 if (isJdkType(owner)) continue;
-                out.typePlans.add(new TypeStubPlan(owner.getQualifiedName(), TypeStubPlan.Kind.CLASS));
+                addTypePlanFromRef(out, owner, TypeStubPlan.Kind.CLASS);
                 out.ctorPlans.add(new ConstructorStubPlan(owner, Collections.emptyList()));
             }
         }
@@ -1486,7 +1513,7 @@ public final class SpoonCollector {
                 if (raw == null) continue;
                 CtTypeReference<?> owner = chooseOwnerPackage(raw, cat);
                 if (isJdkType(owner)) continue;
-                out.typePlans.add(new TypeStubPlan(owner.getQualifiedName(), TypeStubPlan.Kind.CLASS));
+                addTypePlanFromRef(out, owner, TypeStubPlan.Kind.CLASS);
                 out.ctorPlans.add(new ConstructorStubPlan(owner, Collections.emptyList()));
             }
         }
@@ -1499,7 +1526,7 @@ public final class SpoonCollector {
                 CtConstructorCall<?> cc = (CtConstructorCall<?>) ex;
                 CtTypeReference<?> owner = chooseOwnerPackage(cc.getType(), thr);
                 if (!isJdkType(owner)) {
-                    out.typePlans.add(new TypeStubPlan(owner.getQualifiedName(), TypeStubPlan.Kind.CLASS));
+                    addTypePlanFromRef(out, owner, TypeStubPlan.Kind.CLASS);
                     List<CtTypeReference<?>> ps = inferParamTypesFromCall(cc.getExecutable(), cc.getArguments());
                     out.ctorPlans.add(new ConstructorStubPlan(owner, ps));
                 }
@@ -1579,6 +1606,12 @@ public final class SpoonCollector {
         String qn = safeQN(t);
         String simple = t.getSimpleName();
         if (simple == null || simple.isEmpty()) return;
+        
+        // Prevent stubbing primitive types by simple name (byte, int, short, etc.)
+        // These should never be stubbed as classes
+        if (isPrimitiveTypeName(simple)) {
+            return;
+        }
 
         // ---- SIMPLE NAME branch -------------------------------------------------
         if (!qn.contains(".")) {
@@ -1821,6 +1854,17 @@ public final class SpoonCollector {
         return pkg.startsWith("java.") || pkg.startsWith("javax.")
                 || pkg.startsWith("jakarta.") || pkg.startsWith("sun.") || pkg.startsWith("jdk.")
                 || pkg.startsWith("javafx.");
+    }
+    
+    /**
+     * Check if a simple name is a Java primitive type name.
+     * Prevents stubbing primitive types like byte, int, short, etc. as classes.
+     */
+    private boolean isPrimitiveTypeName(String simpleName) {
+        if (simpleName == null) return false;
+        return simpleName.equals("byte") || simpleName.equals("short") || simpleName.equals("int") ||
+               simpleName.equals("long") || simpleName.equals("float") || simpleName.equals("double") ||
+               simpleName.equals("char") || simpleName.equals("boolean") || simpleName.equals("void");
     }
 
 
@@ -2069,7 +2113,7 @@ public final class SpoonCollector {
             if (("apply".equals(name) || "make".equals(name))) {
                 System.err.println("[collectOverloadGaps] Added SAM method: " + ownerQn + "#" + name + "(" + 
                     paramTypes.stream().map(t -> safeQN(t)).collect(Collectors.joining(", ")) + ")");
-            }
+        }
         }
         System.err.println("[collectOverloadGaps] Finished, total method plans: " + out.methodPlans.size());
     }
@@ -2174,14 +2218,14 @@ public final class SpoonCollector {
                 }
                 CtTypeReference<?> owner = chooseOwnerPackage(sup, c);
                 if (owner != null && !isJdkType(owner)) {
-                    out.typePlans.add(new TypeStubPlan(owner.getQualifiedName(), TypeStubPlan.Kind.CLASS));
+                    addTypePlanFromRef(out, owner, TypeStubPlan.Kind.CLASS);
                 }
             }
             for (CtTypeReference<?> si : safe(c.getSuperInterfaces())) {
                 if (si == null) continue;
                 CtTypeReference<?> owner = chooseOwnerPackage(si, c);
                 if (owner != null && !isJdkType(owner)) {
-                    out.typePlans.add(new TypeStubPlan(owner.getQualifiedName(), TypeStubPlan.Kind.INTERFACE));
+                    addTypePlanFromRef(out, owner, TypeStubPlan.Kind.INTERFACE);
                 }
             }
         }
@@ -2192,7 +2236,7 @@ public final class SpoonCollector {
                 if (si == null) continue;
                 CtTypeReference<?> owner = chooseOwnerPackage(si, i);
                 if (owner != null && !isJdkType(owner)) {
-                    out.typePlans.add(new TypeStubPlan(owner.getQualifiedName(), TypeStubPlan.Kind.INTERFACE));
+                    addTypePlanFromRef(out, owner, TypeStubPlan.Kind.INTERFACE);
                 }
             }
         }
@@ -2209,7 +2253,7 @@ public final class SpoonCollector {
                     if (ta == null) continue;
                     CtTypeReference<?> owner = chooseOwnerPackage(ta, t);
                     if (owner != null && !isJdkType(owner) && owner.getDeclaration() == null) {
-                        out.typePlans.add(new TypeStubPlan(owner.getQualifiedName(), TypeStubPlan.Kind.CLASS));
+                        addTypePlanFromRef(out, owner, TypeStubPlan.Kind.CLASS);
                     }
                 }
             }
@@ -2224,7 +2268,7 @@ public final class SpoonCollector {
                     if (ta == null) continue;
                     CtTypeReference<?> owner = chooseOwnerPackage(ta, t);
                     if (owner != null && !isJdkType(owner) && owner.getDeclaration() == null) {
-                        out.typePlans.add(new TypeStubPlan(owner.getQualifiedName(), TypeStubPlan.Kind.CLASS));
+                        addTypePlanFromRef(out, owner, TypeStubPlan.Kind.CLASS);
                     }
                 }
             }
@@ -2368,7 +2412,20 @@ public final class SpoonCollector {
         }
 
         String qn = t.getQualifiedName();
-        if (qn == null || qn.isEmpty()) return;
+        if (qn == null || qn.isEmpty()) {
+            // Check if simple name is a primitive type
+            String simple = t.getSimpleName();
+            if (simple != null && isPrimitiveTypeName(simple)) {
+                return;
+            }
+            return;
+        }
+
+        // Check if the simple name part is a primitive type (e.g., "unknown.byte")
+        String simple = qn.substring(qn.lastIndexOf('.') + 1);
+        if (isPrimitiveTypeName(simple)) {
+            return;
+        }
 
         if (qn.startsWith("java.") || qn.startsWith("javax.")
                 || qn.startsWith("jakarta.") || qn.startsWith("sun.")
@@ -2660,8 +2717,8 @@ public final class SpoonCollector {
 
     // If varargs: pick a concrete element type from non-null args; else keep current/Unknown.
     private List<CtTypeReference<?>> coerceVarargs(List<CtExpression<?>> args,
-                                                   int varargIndex,
-                                                   CtTypeReference<?> currentElem) {
+                                                             int varargIndex,
+                                                             CtTypeReference<?> currentElem) {
         if (varargIndex < 0 || varargIndex >= args.size()) {
             return Collections.singletonList(currentElem);
         }
@@ -2950,7 +3007,28 @@ public final class SpoonCollector {
     private void addTypePlanIfNonJdk(CollectResult out, String fqn, TypeStubPlan.Kind kind) {
         if (fqn == null || fqn.isEmpty()) return;
         if (isJdkFqn(fqn)) return;
+        // Validate FQN: must have a simple name (not just a package)
+        // Reject FQNs like "unknown." or "package." (ending with dot but no simple name)
+        if (fqn.endsWith(".")) return; // Invalid: ends with dot but no simple name
+        int lastDot = fqn.lastIndexOf('.');
+        String simpleName = (lastDot >= 0 ? fqn.substring(lastDot + 1) : fqn);
+        if (simpleName == null || simpleName.isEmpty()) return; // Invalid: no simple name
         out.typePlans.add(new TypeStubPlan(fqn, kind));
+    }
+    
+    /**
+     * Safely add a type plan from a type reference, validating the qualified name.
+     */
+    private void addTypePlanFromRef(CollectResult out, CtTypeReference<?> typeRef, TypeStubPlan.Kind kind) {
+        if (typeRef == null) return;
+        try {
+            String fqn = typeRef.getQualifiedName();
+            if (fqn == null || fqn.isEmpty()) return;
+            // Validate: check if simple name is empty
+            String simpleName = typeRef.getSimpleName();
+            if (simpleName == null || simpleName.isEmpty()) return; // Invalid: no simple name
+            addTypePlanIfNonJdk(out, fqn, kind);
+        } catch (Throwable ignored) {}
     }
 
 
@@ -3100,19 +3178,21 @@ public final class SpoonCollector {
                 String samMethodName = isCtorRef ? "make" : "apply";
                 // For constructor references, we'll infer params from the constructor below
                 // Don't set default params here - let the constructor reference handling do it
-                out.methodPlans.add(new MethodStubPlan(
-                        fiType,
-                        samMethodName,
-                        samRet,
-                        samParams,
-                        /*isStatic*/ false,
-                        MethodStubPlan.Visibility.PUBLIC,
-                        Collections.emptyList(),
-                        /*defaultOnInterface*/ false,  // abstract
-                        /*varargs*/ false,
-                        /*mirror*/ false,
-                        /*mirrorOwnerRef*/ null
-                ));
+                if (fiType != null && !isJdkType(fiType)) {
+                    out.methodPlans.add(new MethodStubPlan(
+                            fiType,
+                            samMethodName,
+                            samRet,
+                            samParams,
+                            /*isStatic*/ false,
+                            MethodStubPlan.Visibility.PUBLIC,
+                            Collections.emptyList(),
+                            /*defaultOnInterface*/ false,  // abstract
+                            /*varargs*/ false,
+                            /*mirror*/ false,
+                            /*mirrorOwnerRef*/ null
+                    ));
+                }
             }
 
 // ---- (3) Choose owner correctly: static Type::m vs instance obj::m ----
@@ -3168,7 +3248,7 @@ public final class SpoonCollector {
                             ownerRef = chooseOwnerPackage(targetType, mref);
                             String ownerQn = safeQN(ownerRef);
                             if (ownerQn != null && !ownerQn.isEmpty() && !isJdkFqn(ownerQn)) {
-                                out.typePlans.add(new TypeStubPlan(ownerQn, TypeStubPlan.Kind.CLASS));
+                                addTypePlanIfNonJdk(out, ownerQn, TypeStubPlan.Kind.CLASS);
                             }
                         } catch (Throwable ignored) {
                             // If that fails, try to create a reference from the text directly
@@ -3285,7 +3365,7 @@ public final class SpoonCollector {
                 // Ensure owner type exists (non-JDK)
                 String ownerQn = safeQN(ownerRef);
                 if (ownerQn != null && !isJdkFqn(ownerQn)) {
-                    out.typePlans.add(new TypeStubPlan(ownerQn, TypeStubPlan.Kind.CLASS));
+                    addTypePlanIfNonJdk(out, ownerQn, TypeStubPlan.Kind.CLASS);
                 }
                 // Before adding constructor plan, check if we already have one for this type
                 // and use its parameters for the SAM method
@@ -3403,19 +3483,21 @@ public final class SpoonCollector {
                     });
                     
                     // Add the correct "make" method plan with constructor parameters
-                    out.methodPlans.add(new MethodStubPlan(
-                            fiType,
-                            "make",
-                            ctorReturnType,
-                            ctorParams,  // Use constructor parameters (from existing constructor plan or inferred)
-                            /*isStatic*/ false,
-                            MethodStubPlan.Visibility.PUBLIC,
-                            Collections.emptyList(),
-                            /*defaultOnInterface*/ false,
-                            /*varargs*/ false,
-                            /*mirror*/ false,
-                            /*mirrorOwnerRef*/ null
-                    ));
+                    if (fiType != null && !isJdkType(fiType)) {
+                        out.methodPlans.add(new MethodStubPlan(
+                                fiType,
+                                "make",
+                                ctorReturnType,
+                                ctorParams,  // Use constructor parameters (from existing constructor plan or inferred)
+                                /*isStatic*/ false,
+                                MethodStubPlan.Visibility.PUBLIC,
+                                Collections.emptyList(),
+                                /*defaultOnInterface*/ false,
+                                /*varargs*/ false,
+                                /*mirror*/ false,
+                                /*mirrorOwnerRef*/ null
+                        ));
+                    }
                 }
                 continue; // do not add a method plan for ::new
             }
@@ -3677,20 +3759,22 @@ public final class SpoonCollector {
                         }
                         
                         // Add SAM method plan with correct signature from lambda
-                        MethodStubPlan lambdaMethodPlan = new MethodStubPlan(
-                                fiType,
-                                "apply",
-                                lambdaReturnType,
-                                samParams,
-                                /*isStatic*/ false,
-                                MethodStubPlan.Visibility.PUBLIC,
-                                Collections.emptyList(),
-                                /*defaultOnInterface*/ false,
-                                /*varargs*/ false,
-                                /*mirror*/ false,
-                                /*mirrorOwnerRef*/ null
-                        );
-                        out.methodPlans.add(lambdaMethodPlan);
+                        if (fiType != null && !isJdkType(fiType)) {
+                            MethodStubPlan lambdaMethodPlan = new MethodStubPlan(
+                                    fiType,
+                                    "apply",
+                                    lambdaReturnType,
+                                    samParams,
+                                    /*isStatic*/ false,
+                                    MethodStubPlan.Visibility.PUBLIC,
+                                    Collections.emptyList(),
+                                    /*defaultOnInterface*/ false,
+                                    /*varargs*/ false,
+                                    /*mirror*/ false,
+                                    /*mirrorOwnerRef*/ null
+                            );
+                            out.methodPlans.add(lambdaMethodPlan);
+                        }
                         
                         // Debug: log what we're adding
                         System.err.println("[collectLambdas] Added lambda SAM method: " + finalFiQn + "#apply(" + 
@@ -3716,10 +3800,15 @@ public final class SpoonCollector {
         for (MethodStubPlan p : out.methodPlans) {
             if (("apply".equals(p.name) || "make".equals(p.name)) && !p.defaultOnInterface && !p.isStatic) {
                 try {
-                    String ownerQn = safeQN(p.ownerType);
-                    String ownerQnErased = erasureFqn(p.ownerType);
-                    System.err.println("  - " + ownerQn + " (erased: " + ownerQnErased + ") #" + p.name + "(" + 
-                        p.paramTypes.stream().map(t -> safeQN(t)).collect(Collectors.joining(", ")) + ")");
+                    if (p.ownerType != null) {
+                        String ownerQn = safeQN(p.ownerType);
+                        String ownerQnErased = erasureFqn(p.ownerType);
+                        System.err.println("  - " + ownerQn + " (erased: " + ownerQnErased + ") #" + p.name + "(" + 
+                            p.paramTypes.stream().map(t -> safeQN(t)).collect(Collectors.joining(", ")) + ")");
+                    } else {
+                        System.err.println("  - [NULL OWNER] #" + p.name + "(" + 
+                            p.paramTypes.stream().map(t -> safeQN(t)).collect(Collectors.joining(", ")) + ")");
+                    }
                 } catch (Throwable ignored) {}
             }
         }
@@ -3730,9 +3819,11 @@ public final class SpoonCollector {
         for (MethodStubPlan p : out.methodPlans) {
             if (("apply".equals(p.name) || "make".equals(p.name)) && !p.defaultOnInterface && !p.isStatic) {
                 try {
-                    String ownerQnErased = erasureFqn(p.ownerType);
-                    if (ownerQnErased != null && !isJdkFqn(ownerQnErased)) {
-                        ownerToMethods.computeIfAbsent(ownerQnErased, k -> new ArrayList<>()).add(p);
+                    if (p.ownerType != null) {
+                        String ownerQnErased = erasureFqn(p.ownerType);
+                        if (ownerQnErased != null && !isJdkFqn(ownerQnErased)) {
+                            ownerToMethods.computeIfAbsent(ownerQnErased, k -> new ArrayList<>()).add(p);
+                        }
                     }
                 } catch (Throwable ignored) {}
             }
@@ -3891,6 +3982,757 @@ public final class SpoonCollector {
 
     // import spoon.reflect.code.CtForEach;
 // import spoon.reflect.visitor.filter.TypeFilter;
+
+    /**
+     * Collect Stream API methods (stream(), forEach, map, filter, collect, etc.)
+     * and ensure proper stubbing of Stream interface and related functional interfaces.
+     * This handles modern Java features like Stream API, Optional, CompletableFuture, etc.
+     */
+    private void collectStreamApiMethods(CtModel model, CollectResult out) {
+        // Common Stream API method names
+        java.util.Set<String> streamMethods = java.util.Set.of("stream", "parallelStream", "forEach", "map", "filter", 
+                "flatMap", "distinct", "sorted", "peek", "limit", "skip", "collect", "reduce",
+                "findFirst", "findAny", "anyMatch", "allMatch", "noneMatch", "count", "max", "min");
+        
+        // Collection forEach method
+        java.util.Set<String> collectionMethods = java.util.Set.of("forEach");
+        
+        // Optional API methods
+        java.util.Set<String> optionalMethods = java.util.Set.of("map", "flatMap", "orElse", "orElseGet", "orElseThrow", 
+                "ifPresent", "ifPresentOrElse", "filter", "or", "stream");
+        
+        // CompletableFuture methods
+        java.util.Set<String> completableFutureMethods = java.util.Set.of("thenApply", "thenAccept", "thenRun", 
+                "thenCompose", "thenCombine", "handle", "whenComplete");
+        
+        for (CtInvocation<?> inv : model.getElements(new TypeFilter<>(CtInvocation.class))) {
+            CtExecutableReference<?> ex = inv.getExecutable();
+            if (ex == null) continue;
+            
+            String methodName = ex.getSimpleName();
+            if (methodName == null) continue;
+            
+            // Get target once for all checks
+            CtExpression<?> target = inv.getTarget();
+            
+            // Check if this is a Stream API method call
+            if (streamMethods.contains(methodName)) {
+                CtTypeReference<?> ownerType = null;
+                
+                // Get the owner type from the target
+                if (target != null) {
+                    try {
+                        ownerType = target.getType();
+                    } catch (Throwable ignored) {}
+                }
+                
+                // For stream() and parallelStream(), the owner is a Collection
+                // The return type should be Stream<T>
+                if ("stream".equals(methodName) || "parallelStream".equals(methodName)) {
+                    if (ownerType != null && !isJdkType(ownerType)) {
+                        // Infer element type from collection
+                        CtTypeReference<?> elementType = inferCollectionElementType(ownerType);
+                        if (elementType == null) elementType = f.Type().OBJECT;
+                        
+                        // Create Stream<T> return type
+                        CtTypeReference<?> streamType = f.Type().createReference("java.util.stream.Stream");
+                        streamType.addActualTypeArgument(elementType.clone());
+                        
+                        // Stub stream() method on the collection type
+                        CtTypeReference<?> owner = chooseOwnerPackage(ownerType, inv);
+                        if (owner != null && !isJdkType(owner)) {
+                            // Check if method already exists to avoid duplicates
+                            boolean exists = out.methodPlans.stream().anyMatch(p -> {
+                                try {
+                                    String pOwnerQn = safeQN(p.ownerType);
+                                    String ownerQn = safeQN(owner);
+                                    return ownerQn != null && ownerQn.equals(pOwnerQn) && methodName.equals(p.name);
+                                } catch (Throwable ignored) {
+                                    return false;
+                                }
+                            });
+                            if (!exists) {
+                                List<CtTypeReference<?>> params = Collections.emptyList();
+                                out.methodPlans.add(new MethodStubPlan(
+                                        owner, methodName, streamType, params,
+                                        false, MethodStubPlan.Visibility.PUBLIC, Collections.emptyList()
+                                ));
+                            }
+                        }
+                    }
+                }
+                // For forEach, map, filter, etc. called on a Stream
+                else if (target != null) {
+                    try {
+                        CtTypeReference<?> streamType = target.getType();
+                        if (streamType != null) {
+                            String streamQn = safeQN(streamType);
+                            // Check if this is a Stream type (or unknown type that might be Stream)
+                            if (streamQn != null && (streamQn.contains("Stream") || streamQn.startsWith("unknown."))) {
+                                // Infer Stream element type from context
+                                CtTypeReference<?> elementType = inferStreamElementType(streamType, inv);
+                                if (elementType == null) elementType = f.Type().OBJECT;
+                                
+                                // Stream is a JDK type, so we don't stub it
+                                // But we ensure functional interfaces (Consumer, Function, Predicate) are stubbed
+                                // by the existing collectUnresolvedMethodCalls logic
+                                // The key is that the method call will be handled by collectUnresolvedMethodCalls
+                                // which will stub the functional interface parameter types
+                            }
+                        }
+                    } catch (Throwable ignored) {}
+                }
+            }
+            
+            // Check if this is Collection.forEach()
+            if (collectionMethods.contains(methodName) && "forEach".equals(methodName)) {
+                if (target != null) {
+                    try {
+                        CtTypeReference<?> collectionType = target.getType();
+                        if (collectionType != null && !isJdkType(collectionType)) {
+                            // Infer element type
+                            CtTypeReference<?> elementType = inferCollectionElementType(collectionType);
+                            if (elementType == null) elementType = f.Type().OBJECT;
+                            
+                            // Create Consumer<T> parameter type
+                            CtTypeReference<?> consumerType = f.Type().createReference("java.util.function.Consumer");
+                            consumerType.addActualTypeArgument(elementType.clone());
+                            
+                            // Stub forEach method
+                            CtTypeReference<?> owner = chooseOwnerPackage(collectionType, inv);
+                            if (owner != null && !isJdkType(owner)) {
+                                // Check if method already exists to avoid duplicates
+                                boolean exists = out.methodPlans.stream().anyMatch(p -> {
+                                    try {
+                                        String pOwnerQn = safeQN(p.ownerType);
+                                        String ownerQn = safeQN(owner);
+                                        return ownerQn != null && ownerQn.equals(pOwnerQn) && "forEach".equals(p.name);
+                                    } catch (Throwable ignored) {
+                                        return false;
+                                    }
+                                });
+                                if (!exists) {
+                                    List<CtTypeReference<?>> params = Collections.singletonList(consumerType);
+                                    out.methodPlans.add(new MethodStubPlan(
+                                            owner, "forEach", f.Type().VOID_PRIMITIVE, params,
+                                            false, MethodStubPlan.Visibility.PUBLIC, Collections.emptyList()
+                                    ));
+                                }
+                            }
+                        }
+                    } catch (Throwable ignored) {}
+                }
+            }
+            
+            // Handle Optional API methods (like Maybe<T>)
+            if (optionalMethods.contains(methodName) && target != null) {
+                try {
+                    CtTypeReference<?> optionalType = null;
+                    CtTypeReference<?> owner = null;
+                    CtTypeReference<?> elementType = null;
+                    
+                    // Special handling for chained calls: if target is a method invocation (e.g., map().orElse())
+                    // Get the return type directly from the previous invocation's type
+                    if (target instanceof CtInvocation && "orElse".equals(methodName)) {
+                        CtInvocation<?> prevInv = (CtInvocation<?>) target;
+                        CtExecutableReference<?> prevEx = prevInv.getExecutable();
+                        System.err.println("[collectStreamApiMethods] Processing orElse(), target is CtInvocation, previous method: " + 
+                            (prevEx != null ? prevEx.getSimpleName() : "null"));
+                        
+                        if (prevEx != null && "map".equals(prevEx.getSimpleName())) {
+                            // The target of orElse is the result of map()
+                            // Since map() hasn't been stubbed yet, we need to infer its return type
+                            // map() on Maybe<T> returns Maybe<R> where R is the lambda return type
+                            try {
+                                // First, try to get the return type from the invocation (might be null if not resolved)
+                                CtTypeReference<?> prevInvReturnType = prevInv.getType();
+                                System.err.println("[collectStreamApiMethods] Previous map() invocation return type: " + safeQN(prevInvReturnType));
+                                
+                                if (prevInvReturnType == null) {
+                                    // Infer the return type: map() on Maybe<T> returns Maybe<R>
+                                    // where R is inferred from the lambda
+                                    CtTypeReference<?> prevTargetType = prevInv.getTarget() != null ? prevInv.getTarget().getType() : null;
+                                    System.err.println("[collectStreamApiMethods] Previous map() target type: " + safeQN(prevTargetType));
+                                    
+                                    if (prevTargetType != null) {
+                                        String prevTargetQn = safeQN(prevTargetType);
+                                        if (prevTargetQn != null && !prevTargetQn.contains("java.util.Optional") && !isJdkType(prevTargetType)) {
+                                            // Check if we've already created a map() plan
+                                            boolean foundInPlans = false;
+                                            for (MethodStubPlan plan : out.methodPlans) {
+                                                try {
+                                                    String planOwnerQn = safeQN(plan.ownerType);
+                                                    if (prevTargetQn.equals(planOwnerQn) && "map".equals(plan.name)) {
+                                                        optionalType = plan.returnType;
+                                                        owner = plan.returnType;
+                                                        elementType = inferCollectionElementType(owner);
+                                                        if (elementType == null) elementType = f.Type().OBJECT;
+                                                        System.err.println("[collectStreamApiMethods] ✓ Found map() plan: " + safeQN(owner));
+                                                        foundInPlans = true;
+                                                        break;
+                                                    }
+                                                } catch (Throwable ignored) {}
+                                            }
+                                            
+                                            if (!foundInPlans) {
+                                                // Infer return type from lambda in map() call
+                                                List<CtExpression<?>> mapArgs = prevInv.getArguments();
+                                                CtTypeReference<?> lambdaReturnType = null;
+                                                
+                                                if (!mapArgs.isEmpty() && mapArgs.get(0) instanceof CtLambda) {
+                                                    CtLambda<?> lambda = (CtLambda<?>) mapArgs.get(0);
+                                                    try {
+                                                        CtExpression<?> bodyExpr = null;
+                                                        try {
+                                                            bodyExpr = lambda.getExpression();
+                                                        } catch (Throwable ignored) {
+                                                            CtStatement body = lambda.getBody();
+                                                            if (body instanceof CtReturn<?>) {
+                                                                bodyExpr = ((CtReturn<?>) body).getReturnedExpression();
+                                                            } else if (body instanceof CtExpression) {
+                                                                bodyExpr = (CtExpression<?>) body;
+                                                            }
+                                                        }
+                                                        
+                                                        if (bodyExpr != null) {
+                                                            try {
+                                                                lambdaReturnType = bodyExpr.getType();
+                                                                System.err.println("[collectStreamApiMethods] Lambda return type: " + safeQN(lambdaReturnType));
+                                                            } catch (Throwable ignored) {}
+                                                        }
+                                                    } catch (Throwable ignored) {}
+                                                }
+                                                
+                                                // If we can't infer from lambda, use the element type from Maybe<T>
+                                                if (lambdaReturnType == null) {
+                                                    lambdaReturnType = inferCollectionElementType(prevTargetType);
+                                                    if (lambdaReturnType == null) lambdaReturnType = f.Type().OBJECT;
+                                                }
+                                                
+                                                // Create Maybe<R> return type
+                                                optionalType = prevTargetType.clone();
+                                                if (optionalType.getActualTypeArguments().isEmpty()) {
+                                                    optionalType.addActualTypeArgument(lambdaReturnType.clone());
+                                                } else {
+                                                    optionalType.getActualTypeArguments().set(0, lambdaReturnType.clone());
+                                                }
+                                                
+                                                owner = optionalType;
+                                                elementType = lambdaReturnType;
+                                                System.err.println("[collectStreamApiMethods] ✓ Inferred map() return type for orElse(): " + safeQN(owner) + 
+                                                    " (element type: " + safeQN(elementType) + ")");
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    // Use the resolved return type
+                                    String prevReturnQn = safeQN(prevInvReturnType);
+                                    if (prevReturnQn != null && !prevReturnQn.contains("java.util.Optional") && !isJdkType(prevInvReturnType)) {
+                                        optionalType = prevInvReturnType;
+                                        owner = prevInvReturnType;
+                                        elementType = inferCollectionElementType(owner);
+                                        if (elementType == null) elementType = f.Type().OBJECT;
+                                        System.err.println("[collectStreamApiMethods] ✓ Using map() return type for orElse(): " + safeQN(owner) + 
+                                            " (element type: " + safeQN(elementType) + ")");
+                                    }
+                                }
+                            } catch (Throwable t) {
+                                System.err.println("[collectStreamApiMethods] Error processing chained orElse(): " + t.getMessage());
+                                t.printStackTrace();
+                            }
+                        } else {
+                            System.err.println("[collectStreamApiMethods] Previous method is not 'map', it's: " + 
+                                (prevEx != null ? prevEx.getSimpleName() : "null"));
+                        }
+                    }
+                    
+                    // If not a chained call or chained call detection failed, use normal type resolution
+                    if (optionalType == null) {
+                        optionalType = target.getType();
+                    }
+                    
+                    if (optionalType != null) {
+                        String optionalQn = safeQN(optionalType);
+                        // Check if this is an unresolved Optional-like type (not JDK Optional)
+                        if (optionalQn != null && !optionalQn.contains("java.util.Optional") && !isJdkType(optionalType)) {
+                            // Infer element type from Optional<T> or Maybe<T>
+                            if (elementType == null) {
+                                elementType = inferCollectionElementType(optionalType);
+                                if (elementType == null) elementType = f.Type().OBJECT;
+                            }
+                            
+                            if (owner == null) {
+                                owner = chooseOwnerPackage(optionalType, inv);
+                            }
+                            
+                            if (owner != null && !isJdkType(owner)) {
+                                // For map(), create Function<T, R> parameter
+                                if ("map".equals(methodName)) {
+                                    // Infer return type from lambda if available
+                                    CtTypeReference<?> returnType = elementType; // Default to same type
+                                    List<CtExpression<?>> args = inv.getArguments();
+                                    if (!args.isEmpty()) {
+                                        CtExpression<?> arg = args.get(0);
+                                        if (arg instanceof CtLambda) {
+                                            CtLambda<?> lambda = (CtLambda<?>) arg;
+                                            try {
+                                                // Try to infer return type from lambda body
+                                                // For expression lambdas (x -> expr), use getExpression()
+                                                // For block lambdas (x -> { return expr; }), use getBody()
+                                                CtExpression<?> bodyExpr = null;
+                                                try {
+                                                    bodyExpr = lambda.getExpression();
+                                                } catch (Throwable ignored) {
+                                                    // If getExpression() doesn't exist or returns null, try getBody()
+                                                    CtStatement body = lambda.getBody();
+                                                    if (body instanceof CtReturn<?>) {
+                                                        bodyExpr = ((CtReturn<?>) body).getReturnedExpression();
+                                                    } else if (body instanceof CtExpression) {
+                                                        bodyExpr = (CtExpression<?>) body;
+                                                    }
+                                                }
+                                                
+                                                if (bodyExpr != null) {
+                                                    // Check for string concatenation: "x" + y or y + "x"
+                                                    if (bodyExpr instanceof CtBinaryOperator) {
+                                                        CtBinaryOperator<?> bin = (CtBinaryOperator<?>) bodyExpr;
+                                                        if (bin.getKind() == BinaryOperatorKind.PLUS) {
+                                                            try {
+                                                                CtTypeReference<?> leftType = bin.getLeftHandOperand() != null ? bin.getLeftHandOperand().getType() : null;
+                                                                CtTypeReference<?> rightType = bin.getRightHandOperand() != null ? bin.getRightHandOperand().getType() : null;
+                                                                // Check if either operand is a String literal or String type
+                                                                boolean leftIsString = (bin.getLeftHandOperand() instanceof CtLiteral && 
+                                                                    ((CtLiteral<?>) bin.getLeftHandOperand()).getValue() instanceof String) ||
+                                                                    (leftType != null && "java.lang.String".equals(safeQN(leftType)));
+                                                                boolean rightIsString = (bin.getRightHandOperand() instanceof CtLiteral && 
+                                                                    ((CtLiteral<?>) bin.getRightHandOperand()).getValue() instanceof String) ||
+                                                                    (rightType != null && "java.lang.String".equals(safeQN(rightType)));
+                                                                if (leftIsString || rightIsString) {
+                                                                    returnType = f.Type().createReference("java.lang.String");
+                                                                }
+                                                            } catch (Throwable ignored) {}
+                                                        }
+                                                    }
+                                                    
+                                                    // If not string concatenation, try to get type directly
+                                                    String returnTypeQn = safeQN(returnType);
+                                                    if (returnType == null || returnTypeQn == null || safeQN(elementType) != null && returnTypeQn.equals(safeQN(elementType))) {
+                                                        try {
+                                                            CtTypeReference<?> bodyType = bodyExpr.getType();
+                                                            if (bodyType != null && !safeQN(bodyType).equals("void")) {
+                                                                returnType = bodyType;
+                                                            }
+                                                        } catch (Throwable ignored) {}
+                                                    }
+                                                }
+                                            } catch (Throwable ignored) {}
+                                        }
+                                    }
+                                    
+                                    // Create Function<T, R> parameter type
+                                    CtTypeReference<?> functionType = f.Type().createReference("java.util.function.Function");
+                                    functionType.addActualTypeArgument(elementType.clone());
+                                    functionType.addActualTypeArgument(returnType.clone());
+                                    
+                                    // Check if method already exists
+                                    CtTypeReference<?> finalOwner1 = owner;
+                                    boolean exists = out.methodPlans.stream().anyMatch(p -> {
+                                        try {
+                                            String pOwnerQn = safeQN(p.ownerType);
+                                            String ownerQn = safeQN(finalOwner1);
+                                            return ownerQn != null && ownerQn.equals(pOwnerQn) && "map".equals(p.name);
+                                        } catch (Throwable ignored) {
+                                            return false;
+                                        }
+                                    });
+                                    if (!exists) {
+                                        // Create Maybe<R> return type
+                                        CtTypeReference<?> returnMaybeType = owner.clone();
+                                        if (returnMaybeType.getActualTypeArguments().isEmpty()) {
+                                            returnMaybeType.addActualTypeArgument(returnType.clone());
+                                        } else {
+                                            returnMaybeType.getActualTypeArguments().set(0, returnType.clone());
+                                        }
+                                        
+                                        List<CtTypeReference<?>> params = Collections.singletonList(functionType);
+                                        out.methodPlans.add(new MethodStubPlan(
+                                                owner, "map", returnMaybeType, params,
+                                                false, MethodStubPlan.Visibility.PUBLIC, Collections.emptyList()
+                                        ));
+                                    }
+                                }
+                                // For orElse(), just return the element type
+                                else if ("orElse".equals(methodName)) {
+                                    // owner and elementType are already set correctly above (handles chained calls)
+                                    CtTypeReference<?> finalOwner = owner;
+                                    boolean exists = out.methodPlans.stream().anyMatch(p -> {
+                                        try {
+                                            String pOwnerQn = safeQN(p.ownerType);
+                                            String ownerQn = safeQN(finalOwner);
+                                            return ownerQn != null && ownerQn.equals(pOwnerQn) && "orElse".equals(p.name);
+                                        } catch (Throwable ignored) {
+                                            return false;
+                                        }
+                                    });
+                                    if (!exists) {
+                                        List<CtTypeReference<?>> params = Collections.singletonList(elementType.clone());
+                                        out.methodPlans.add(new MethodStubPlan(
+                                                owner, "orElse", elementType.clone(), params,
+                                                false, MethodStubPlan.Visibility.PUBLIC, Collections.emptyList()
+                                        ));
+                                        System.err.println("[collectStreamApiMethods] Added orElse() to " + safeQN(owner) + " with element type " + safeQN(elementType));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } catch (Throwable ignored) {}
+            }
+            
+            // Handle CompletableFuture methods (like AsyncResult<T>)
+            if (completableFutureMethods.contains(methodName) && target != null) {
+                try {
+                    CtTypeReference<?> futureType = target.getType();
+                    if (futureType != null) {
+                        String futureQn = safeQN(futureType);
+                        // Check if this is an unresolved CompletableFuture-like type (not JDK CompletableFuture)
+                        if (futureQn != null && !futureQn.contains("java.util.concurrent.CompletableFuture") && !isJdkType(futureType)) {
+                            // Infer element type from AsyncResult<T>
+                            CtTypeReference<?> elementType = inferCollectionElementType(futureType);
+                            if (elementType == null) elementType = f.Type().OBJECT;
+                            
+                            CtTypeReference<?> owner = chooseOwnerPackage(futureType, inv);
+                            if (owner != null && !isJdkType(owner)) {
+                                // For thenApply(), create Function<T, R> parameter
+                                if ("thenApply".equals(methodName)) {
+                                    // Infer return type from lambda if available
+                                    CtTypeReference<?> returnType = f.Type().OBJECT; // Default
+                                    List<CtExpression<?>> args = inv.getArguments();
+                                    if (!args.isEmpty()) {
+                                        CtExpression<?> arg = args.get(0);
+                                        if (arg instanceof CtLambda) {
+                                            CtLambda<?> lambda = (CtLambda<?>) arg;
+                                            try {
+                                                // Try to infer return type from lambda body
+                                                // For expression lambdas (x -> expr), use getExpression()
+                                                // For block lambdas (x -> { return expr; }), use getBody()
+                                                CtExpression<?> bodyExpr = null;
+                                                try {
+                                                    bodyExpr = lambda.getExpression();
+                                                    System.err.println("[collectStreamApiMethods] Got expression from lambda.getExpression()");
+                                                } catch (Throwable ignored) {
+                                                    // If getExpression() doesn't exist or returns null, try getBody()
+                                                    CtStatement body = lambda.getBody();
+                                                    if (body instanceof CtReturn<?>) {
+                                                        bodyExpr = ((CtReturn<?>) body).getReturnedExpression();
+                                                        System.err.println("[collectStreamApiMethods] Got expression from return statement");
+                                                    } else if (body instanceof CtExpression) {
+                                                        bodyExpr = (CtExpression<?>) body;
+                                                        System.err.println("[collectStreamApiMethods] Got expression from body (CtExpression)");
+                                                    }
+                                                }
+                                                
+                                                System.err.println("[collectStreamApiMethods] Processing thenApply lambda, bodyExpr type: " + 
+                                                    (bodyExpr != null ? bodyExpr.getClass().getSimpleName() : "null"));
+                                                
+                                                if (bodyExpr != null) {
+                                                    // Check for string concatenation: "x" + y or y + "x"
+                                                    if (bodyExpr instanceof CtBinaryOperator) {
+                                                        CtBinaryOperator<?> bin = (CtBinaryOperator<?>) bodyExpr;
+                                                        System.err.println("[collectStreamApiMethods] Found binary operator, kind: " + bin.getKind());
+                                                        if (bin.getKind() == BinaryOperatorKind.PLUS) {
+                                                            try {
+                                                                CtExpression<?> left = bin.getLeftHandOperand();
+                                                                CtExpression<?> right = bin.getRightHandOperand();
+                                                                CtTypeReference<?> leftType = left != null ? left.getType() : null;
+                                                                CtTypeReference<?> rightType = right != null ? right.getType() : null;
+                                                                
+                                                                // Check if either operand is a String literal
+                                                                boolean leftIsStringLiteral = (left instanceof CtLiteral && 
+                                                                    ((CtLiteral<?>) left).getValue() instanceof String);
+                                                                boolean rightIsStringLiteral = (right instanceof CtLiteral && 
+                                                                    ((CtLiteral<?>) right).getValue() instanceof String);
+                                                                
+                                                                // Check if either operand type is String
+                                                                boolean leftIsStringType = (leftType != null && "java.lang.String".equals(safeQN(leftType)));
+                                                                boolean rightIsStringType = (rightType != null && "java.lang.String".equals(safeQN(rightType)));
+                                                                
+                                                                boolean leftIsString = leftIsStringLiteral || leftIsStringType;
+                                                                boolean rightIsString = rightIsStringLiteral || rightIsStringType;
+                                                                
+                                                                System.err.println("[collectStreamApiMethods] String check - leftIsString: " + leftIsString + 
+                                                                    " (literal: " + leftIsStringLiteral + ", type: " + leftIsStringType + 
+                                                                    "), rightIsString: " + rightIsString + 
+                                                                    " (literal: " + rightIsStringLiteral + ", type: " + rightIsStringType + ")");
+                                                                
+                                                                if (leftIsString || rightIsString) {
+                                                                    returnType = f.Type().createReference("java.lang.String");
+                                                                    System.err.println("[collectStreamApiMethods] Detected string concatenation, setting return type to String");
+                                                                }
+                                                            } catch (Throwable t) {
+                                                                System.err.println("[collectStreamApiMethods] Error in string concatenation detection: " + t.getMessage());
+                                                                t.printStackTrace();
+                                                            }
+                                                        }
+                                                    }
+                                                    
+                                                    // If not string concatenation, try to get type directly
+                                                    String returnTypeQn = safeQN(returnType);
+                                                    if (returnType == null || returnTypeQn == null || "java.lang.Object".equals(returnTypeQn)) {
+                                                        try {
+                                                            CtTypeReference<?> bodyType = bodyExpr.getType();
+                                                            if (bodyType != null && !safeQN(bodyType).equals("void")) {
+                                                                returnType = bodyType;
+                                                                System.err.println("[collectStreamApiMethods] Using bodyExpr.getType(): " + safeQN(bodyType));
+                                                            }
+                                                        } catch (Throwable t) {
+                                                            System.err.println("[collectStreamApiMethods] Error getting bodyExpr type: " + t.getMessage());
+                                                        }
+                                                    }
+                                                }
+                                                
+                                                System.err.println("[collectStreamApiMethods] Final returnType for thenApply: " + safeQN(returnType));
+                                            } catch (Throwable t) {
+                                                System.err.println("[collectStreamApiMethods] Error processing lambda: " + t.getMessage());
+                                                t.printStackTrace();
+                                            }
+                                        }
+                                    }
+                                    
+                                    // Create Function<T, R> parameter type
+                                    CtTypeReference<?> functionType = f.Type().createReference("java.util.function.Function");
+                                    functionType.addActualTypeArgument(elementType.clone());
+                                    functionType.addActualTypeArgument(returnType.clone());
+                                    
+                                    // Check if method already exists
+                                    boolean exists = out.methodPlans.stream().anyMatch(p -> {
+                                        try {
+                                            String pOwnerQn = safeQN(p.ownerType);
+                                            String ownerQn = safeQN(owner);
+                                            return ownerQn != null && ownerQn.equals(pOwnerQn) && "thenApply".equals(p.name);
+                                        } catch (Throwable ignored) {
+                                            return false;
+                                        }
+                                    });
+                                    if (!exists) {
+                                        // Create AsyncResult<R> return type
+                                        CtTypeReference<?> returnFutureType = owner.clone();
+                                        if (returnFutureType.getActualTypeArguments().isEmpty()) {
+                                            returnFutureType.addActualTypeArgument(returnType.clone());
+                                        } else {
+                                            returnFutureType.getActualTypeArguments().set(0, returnType.clone());
+                                        }
+                                        
+                                        List<CtTypeReference<?>> params = Collections.singletonList(functionType);
+                                        out.methodPlans.add(new MethodStubPlan(
+                                                owner, "thenApply", returnFutureType, params,
+                                                false, MethodStubPlan.Visibility.PUBLIC, Collections.emptyList()
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } catch (Throwable ignored) {}
+            }
+        }
+    }
+    
+    /**
+     * Infer the element type from a Collection type (e.g., List<String> -> String).
+     */
+    private CtTypeReference<?> inferCollectionElementType(CtTypeReference<?> collectionType) {
+        if (collectionType == null) return null;
+        try {
+            List<CtTypeReference<?>> typeArgs = collectionType.getActualTypeArguments();
+            if (typeArgs != null && !typeArgs.isEmpty()) {
+                return typeArgs.get(0);
+            }
+        } catch (Throwable ignored) {}
+        return null;
+    }
+    
+    /**
+     * Infer the element type from a Stream type or from method call context.
+     */
+    private CtTypeReference<?> inferStreamElementType(CtTypeReference<?> streamType, CtInvocation<?> inv) {
+        if (streamType == null) return null;
+        try {
+            List<CtTypeReference<?>> typeArgs = streamType.getActualTypeArguments();
+            if (typeArgs != null && !typeArgs.isEmpty()) {
+                return typeArgs.get(0);
+            }
+        } catch (Throwable ignored) {}
+        
+        // Try to infer from parent invocation (e.g., items.stream().forEach(...))
+        CtElement parent = inv.getParent();
+        if (parent instanceof CtInvocation<?>) {
+            CtInvocation<?> parentInv = (CtInvocation<?>) parent;
+            CtExpression<?> parentTarget = parentInv.getTarget();
+            if (parentTarget != null) {
+                try {
+                    CtTypeReference<?> parentType = parentTarget.getType();
+                    return inferCollectionElementType(parentType);
+                } catch (Throwable ignored) {}
+            }
+        }
+        
+        return null;
+    }
+    
+    /**
+     * Determine the return type for a Stream API method.
+     */
+    private CtTypeReference<?> determineStreamMethodReturnType(String methodName, CtTypeReference<?> elementType, CtInvocation<?> inv) {
+        switch (methodName) {
+            case "forEach":
+                return f.Type().VOID_PRIMITIVE;
+            case "map":
+            case "flatMap":
+                // Infer return type from lambda/function argument
+                return inferMapReturnType(inv, elementType);
+            case "filter":
+            case "distinct":
+            case "sorted":
+            case "peek":
+            case "limit":
+            case "skip":
+                // These return Stream<T>
+                CtTypeReference<?> streamType = f.Type().createReference("java.util.stream.Stream");
+                streamType.addActualTypeArgument(elementType);
+                return streamType;
+            case "collect":
+                // Infer from context (usually List<T> or Collection<T>)
+                return inferCollectReturnType(inv, elementType);
+            case "findFirst":
+            case "findAny":
+                CtTypeReference<?> optionalType = f.Type().createReference("java.util.Optional");
+                optionalType.addActualTypeArgument(elementType);
+                return optionalType;
+            case "anyMatch":
+            case "allMatch":
+            case "noneMatch":
+                return f.Type().BOOLEAN_PRIMITIVE;
+            case "count":
+                return f.Type().LONG_PRIMITIVE;
+            case "max":
+            case "min":
+                CtTypeReference<?> optType = f.Type().createReference("java.util.Optional");
+                optType.addActualTypeArgument(elementType);
+                return optType;
+            default:
+                return f.Type().OBJECT;
+        }
+    }
+    
+    /**
+     * Infer return type for map/flatMap from the function argument.
+     */
+    private CtTypeReference<?> inferMapReturnType(CtInvocation<?> inv, CtTypeReference<?> inputType) {
+        // Try to get type from function argument (lambda or method reference)
+        List<CtExpression<?>> args = inv.getArguments();
+        if (args != null && !args.isEmpty()) {
+            CtExpression<?> funcArg = args.get(0);
+            if (funcArg != null) {
+                try {
+                    CtTypeReference<?> funcType = funcArg.getType();
+                    if (funcType != null) {
+                        String funcQn = safeQN(funcType);
+                        // If it's Function<T, R>, extract R
+                        if (funcQn != null && funcQn.contains("Function")) {
+                            List<CtTypeReference<?>> typeArgs = funcType.getActualTypeArguments();
+                            if (typeArgs != null && typeArgs.size() >= 2) {
+                                return typeArgs.get(1); // R is the second type parameter
+                            }
+                        }
+                    }
+                } catch (Throwable ignored) {}
+            }
+        }
+        // Default: return Stream<Object>
+        CtTypeReference<?> streamType = f.Type().createReference("java.util.stream.Stream");
+        streamType.addActualTypeArgument(f.Type().OBJECT);
+        return streamType;
+    }
+    
+    /**
+     * Infer return type for collect() from context.
+     */
+    private CtTypeReference<?> inferCollectReturnType(CtInvocation<?> inv, CtTypeReference<?> elementType) {
+        // Usually collect() returns List<T> or Collection<T>
+        CtTypeReference<?> listType = f.Type().createReference("java.util.List");
+        listType.addActualTypeArgument(elementType);
+        return listType;
+    }
+    
+    /**
+     * Infer parameters for Stream API methods.
+     */
+    private List<CtTypeReference<?>> inferStreamMethodParams(String methodName, CtTypeReference<?> elementType, CtInvocation<?> inv) {
+        List<CtExpression<?>> args = inv.getArguments();
+        List<CtTypeReference<?>> params = new ArrayList<>();
+        
+        switch (methodName) {
+            case "forEach":
+                // forEach(Consumer<? super T> action)
+                CtTypeReference<?> consumerType = f.Type().createReference("java.util.function.Consumer");
+                consumerType.addActualTypeArgument(elementType);
+                params.add(consumerType);
+                break;
+            case "map":
+            case "flatMap":
+                // map(Function<? super T, ? extends R> mapper)
+                CtTypeReference<?> functionType = f.Type().createReference("java.util.function.Function");
+                functionType.addActualTypeArgument(elementType);
+                functionType.addActualTypeArgument(f.Type().OBJECT); // R is unknown, use Object
+                params.add(functionType);
+                break;
+            case "filter":
+                // filter(Predicate<? super T> predicate)
+                CtTypeReference<?> predicateType = f.Type().createReference("java.util.function.Predicate");
+                predicateType.addActualTypeArgument(elementType);
+                params.add(predicateType);
+                break;
+            case "collect":
+                // collect(Collector<? super T, A, R> collector)
+                CtTypeReference<?> collectorType = f.Type().createReference("java.util.stream.Collector");
+                collectorType.addActualTypeArgument(elementType);
+                collectorType.addActualTypeArgument(f.Type().OBJECT); // A
+                collectorType.addActualTypeArgument(f.Type().OBJECT); // R
+                params.add(collectorType);
+                break;
+            case "sorted":
+                // sorted() or sorted(Comparator<? super T> comparator)
+                if (args != null && !args.isEmpty()) {
+                    CtTypeReference<?> comparatorType = f.Type().createReference("java.util.Comparator");
+                    comparatorType.addActualTypeArgument(elementType);
+                    params.add(comparatorType);
+                }
+                break;
+            case "limit":
+            case "skip":
+                // limit(long maxSize) or skip(long n)
+                params.add(f.Type().LONG_PRIMITIVE);
+                break;
+            case "anyMatch":
+            case "allMatch":
+            case "noneMatch":
+                // anyMatch(Predicate<? super T> predicate)
+                CtTypeReference<?> predType = f.Type().createReference("java.util.function.Predicate");
+                predType.addActualTypeArgument(elementType);
+                params.add(predType);
+                break;
+            case "max":
+            case "min":
+                // max(Comparator<? super T> comparator)
+                CtTypeReference<?> compType = f.Type().createReference("java.util.Comparator");
+                compType.addActualTypeArgument(elementType);
+                params.add(compType);
+                break;
+        }
+        
+        return params;
+    }
 
     private void collectForEachLoops(CtModel model, CollectResult out) {
         for (CtForEach fe : model.getElements(new TypeFilter<>(CtForEach.class))) {

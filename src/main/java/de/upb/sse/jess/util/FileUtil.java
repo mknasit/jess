@@ -89,4 +89,26 @@ public class FileUtil {
     public static boolean isWindows() {
         return System.getProperty("os.name").startsWith("Windows");
     }
+
+    // ADD to FileUtil.java
+    public static List<String> getAllFilesRecursive(String dir, String suffix) {
+        List<String> out = new ArrayList<>();
+        Path root = Paths.get(dir);
+        if (!Files.exists(root)) return out;
+        try {
+            Files.walk(root)
+                    .filter(p -> Files.isRegularFile(p))
+                    .filter(p -> suffix == null || p.getFileName().toString().endsWith(suffix))
+                    .forEach(p -> out.add(p.toString()));
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+        return out;
+    }
+
+    /** Convenience: list all .class files under a directory tree. */
+    public static List<String> getAllClassFiles(String dir) {
+        return getAllFilesRecursive(dir, ".class");
+    }
+
 }

@@ -29,4 +29,18 @@ public class StubbingStats {
     public void incrementStubbedConstructors() {
         stubbedConstructors++;
     }
+
+
+    // NEW: total and boolean flag
+    public int totalStubbedMembers() {
+        return stubbedFields + stubbedMethods + stubbedConstructors;
+    }
+    public boolean usedStubs() {
+        return stubbedFiles > 0 || stubbedLines > 0 || totalStubbedMembers() > 0;
+    }
+    // (nice to have) reset between runs to avoid accumulation
+    public void reset() {
+        stubbedFiles = stubbedLines = stubbedFields = stubbedMethods = stubbedConstructors = 0;
+    }
 }
+

@@ -13,6 +13,7 @@ import com.github.javaparser.symbolsolver.resolution.typesolvers.JarTypeSolver;
 import com.github.javaparser.symbolsolver.resolution.typesolvers.JavaParserTypeSolver;
 import com.github.javaparser.symbolsolver.resolution.typesolvers.ReflectionTypeSolver;
 import de.upb.sse.jess.annotation.Annotator;
+import de.upb.sse.jess.api.PublicApi;
 import de.upb.sse.jess.configuration.JessConfiguration;
 import de.upb.sse.jess.dependency.MavenDependencyResolver;
 import de.upb.sse.jess.exceptions.AmbiguityException;
@@ -33,12 +34,21 @@ import de.upb.sse.jess.visitors.pre.InternalResolutionVisitor;
 import de.upb.sse.jess.visitors.pre.PreSlicingVisitor;
 import de.upb.sse.jess.visitors.slicing.SlicingVisitor;
 import lombok.Getter;
+import org.objectweb.asm.ClassReader;
+import org.objectweb.asm.tree.ClassNode;
+import org.objectweb.asm.tree.MethodNode;
 
+import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.DirectoryStream;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
 import java.util.logging.Logger;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 public class Jess {
     public static final String SRC_OUTPUT = "gen";
@@ -53,6 +63,7 @@ public class Jess {
     private final CombinedTypeSolver combinedTypeSolver;
     private final List<Path> jarPaths = new ArrayList<>();
     private final Stubber stubber;
+    private String lastCompilationErrors; // Store last compilation error messages
 
     private static final Logger logger = Logger.getLogger(Jess.class.getName());
 
@@ -189,9 +200,10 @@ public class Jess {
 
             }
 
-            // Compile sliced files
-            boolean successfulCompilation = compile(targetClass, classOutput, false);
-            return successfulCompilation ? 0 : 1;
+            // Compile sliced files and capture errors
+            CompilerInvoker.CompilationResult result = compileWithErrors(targetClass, classOutput, false);
+            this.lastCompilationErrors = result.errorMessages; // Store errors for later retrieval
+            return result.success ? 0 : 1;
         } catch (AmbiguityException e) {
           throw e;
         } catch (Throwable e) {
@@ -279,6 +291,34 @@ public class Jess {
         }
 
         return successfulCompilation;
+    }
+    
+    /**
+     * Compile and return both success status and error messages.
+     * @param targetClass Target class name (for logging)
+     * @param classOutput Output directory for compiled classes
+     * @param silentCompilation Whether to suppress compiler output
+     * @return CompilationResult containing success status and error messages
+     */
+    private CompilerInvoker.CompilationResult compileWithErrors(String targetClass, String classOutput, boolean silentCompilation) {
+        CompilerInvoker compiler = new CompilerInvoker(config.getTargetVersion(), silentCompilation);
+        CompilerInvoker.CompilationResult result = compiler.compileFile(List.of(SRC_OUTPUT), classOutput);
+
+        if (result.success) {
+            if (!silentCompilation) {
+                System.out.println("Successful compilation");
+            }
+        } else {
+            if (!silentCompilation) {
+                System.out.println("Compilation failed for file: " + targetClass);
+                if (!result.errorMessages.isEmpty()) {
+                    System.out.println("Errors: " + result.errorMessages);
+                }
+                if (config.isExitOnCompilationFail()) System.exit(1);
+            }
+        }
+
+        return result;
     }
 
     private void generatePackages(String srcOutput) throws IOException {
@@ -388,6 +428,334 @@ public class Jess {
 
         return stubClasses.size();
     }
+
+    // Make sure these imports exist at the top of Jess.java:
+
+    // === drop-in replacement ===
+    public PublicApi.Result compileSingleMethod(
+            Path repoRoot,
+            String sourceRoot,
+            PublicApi.MethodId method,
+            PublicApi.Options options) {
+
+        final long t0 = System.nanoTime();
+        dbg("▶ compileSingleMethod class=%s name=%s desc=%s srcRoot=%s workDir=%s slice=%s",
+                method.binaryClassName, method.name, method.jvmDescriptor, sourceRoot, options.workDir, options.sliceMode);
+
+        final Path srcRoot  = repoRoot.resolve(sourceRoot);
+        final Path javaFile = resolveTopLevelSource(srcRoot, method.binaryClassName); // handles $ -> Outer.java
+        dbg("  source=%s (%s)", javaFile, Files.isRegularFile(javaFile) ? "exists" : "missing");
+
+        if (!Files.isRegularFile(javaFile)) {
+            String notes = "Source file not found: " + javaFile;
+            dbg("✖ %s", notes);
+            return new PublicApi.Result(
+                    PublicApi.Status.FAILED_PARSE, null,
+                    method.binaryClassName, java.util.List.of(),
+                    null, false, false, options.depMode, msSince(t0), notes);
+        }
+
+        final Path classesOut = options.workDir.resolve("classes");
+        try { Files.createDirectories(classesOut); }
+        catch (Exception ioe) {
+            String notes = "Failed to create classes output dir: " + classesOut + " -> " + ioe;
+            dbg("✖ %s", notes);
+            return new PublicApi.Result(
+                    PublicApi.Status.INTERNAL_ERROR, null,
+                    method.binaryClassName, java.util.List.of(),
+                    null, false, false, options.depMode, msSince(t0), notes);
+        }
+
+        // Slice decision: never slice for <clinit>, and respect sliceMode=class
+        final boolean sliceByMethod =
+                !"class".equalsIgnoreCase(options.sliceMode)
+                        && method != null
+                        && method.name != null
+                        && !"<clinit>".equals(method.name);
+
+        final java.util.List<String> keepList;
+        if (sliceByMethod) {
+            try {
+                String keep = toJessKeepSignature(method.name, method.jvmDescriptor);
+                keepList = java.util.List.of(keep);
+                dbg("  preSlice keep=%s", keep);
+            } catch (IllegalArgumentException badSig) {
+                String notes = "Invalid method descriptor for slicing: "
+                        + method.name + method.jvmDescriptor + " -> " + badSig.getMessage();
+                dbg("✖ %s", notes);
+                return new PublicApi.Result(
+                        PublicApi.Status.FAILED_PARSE, null,
+                        method.binaryClassName, java.util.List.of(),
+                        null, false, false, options.depMode, msSince(t0), notes);
+            }
+        } else {
+            keepList = java.util.List.of();
+            dbg("  preSlice keep=<whole-class>");
+        }
+
+        int exit;
+        boolean usedStubsFlag = false;
+        String compilationErrors = null;
+        try {
+            // NOTE: your existing JESS methods expect String paths
+            this.preSlice(javaFile.toString(), keepList);
+            exit = this.parse(javaFile.toString(), classesOut.toString());
+            usedStubsFlag = hasUsedStubs();
+            // Capture compilation errors from the last compilation
+            compilationErrors = this.lastCompilationErrors;
+            dbg("  parse exit=%d usedStubs=%s outDir=%s", exit, Boolean.toString(usedStubsFlag), classesOut);
+        } catch (AmbiguityException amb) {
+            String notes = "Ambiguity: " + amb.getMessage();
+            dbg("✖ %s", notes);
+            return new PublicApi.Result(
+                    PublicApi.Status.FAILED_RESOLVE, null,
+                    method.binaryClassName, java.util.List.of(),
+                    null, false, usedStubsFlag, options.depMode, msSince(t0), notes);
+        } catch (Throwable t) {
+            String notes = "Unhandled: " + t.getClass().getSimpleName() + ": " + String.valueOf(t.getMessage());
+            dbg("✖ %s", notes);
+            return new PublicApi.Result(
+                    PublicApi.Status.INTERNAL_ERROR, null,
+                    method.binaryClassName, java.util.List.of(),
+                    null, false, usedStubsFlag, options.depMode, msSince(t0), notes);
+        }
+
+        if (exit != 0) {
+            final PublicApi.Status st = (exit == 1) ? PublicApi.Status.FAILED_COMPILE : PublicApi.Status.INTERNAL_ERROR;
+            String notes = "Compiler exit code=" + exit;
+            if (compilationErrors != null && !compilationErrors.isEmpty()) {
+                notes += " | Errors: " + compilationErrors;
+            }
+            dbg("✖ %s", notes);
+            return new PublicApi.Result(
+                    st, classesOut,
+                    method.binaryClassName, java.util.List.of(),
+                    null, false, usedStubsFlag, options.depMode, msSince(t0), notes);
+        }
+
+        final java.util.List<String> emitted = listEmittedBinaryNames(classesOut);
+        dbg("  emitted=%d%s",
+                emitted.size(),
+                emitted.isEmpty() ? "" : " (eg: " + emitted.stream().limit(3).collect(Collectors.joining(", ")) +
+                        (emitted.size() > 3 ? ", …" : "") + ")");
+
+        // Verify target method exists with Code + capture class file
+        Verification v = null;
+        try {
+            v = verifyTarget(classesOut, emitted, method);
+        } catch (NoClassDefFoundError missingAsm) {
+            dbg("  (verification skipped: ASM not on classpath)");
+        }
+
+        if (v != null) {
+            if (!v.hasCode) {
+                String reason = v.reason == null ? "Target method not emitted (missing or no Code)" : v.reason;
+                dbg("  target bytecode: MISSING (%s)", reason);
+                return new PublicApi.Result(
+                        PublicApi.Status.TARGET_METHOD_NOT_EMITTED, classesOut,
+                        method.binaryClassName, emitted,
+                        v.classFileRel, /*targetHasCode*/ false,
+                        usedStubsFlag, options.depMode, msSince(t0),
+                        reason + (usedStubsFlag ? " | usedStubs" : ""));
+            } else {
+                dbg("  target bytecode: FOUND in %s", v.classFileRel == null ? "<unknown>" : v.classFileRel);
+                return new PublicApi.Result(
+                        PublicApi.Status.OK, classesOut,
+                        method.binaryClassName, emitted,
+                        v.classFileRel, /*targetHasCode*/ true,
+                        usedStubsFlag, options.depMode, msSince(t0), "");
+            }
+        }
+
+        // If verifier was skipped, return OK without the strong guarantee, targetHasCode=false, but we logged it.
+        dbg("  (no verifier result; returning OK without targetHasCode assertion)");
+        return new PublicApi.Result(
+                PublicApi.Status.OK, classesOut,
+                method.binaryClassName, emitted,
+                null, /*targetHasCode*/ false,
+                usedStubsFlag, options.depMode, msSince(t0), "");
+    }
+// === end replacement ===
+
+// ---------- helpers inside Jess.java ----------
+
+    private static Path resolveTopLevelSource(Path srcRoot, String binaryClassName) {
+        int dollar = binaryClassName.indexOf('$');
+        String top = (dollar >= 0) ? binaryClassName.substring(0, dollar) : binaryClassName;
+        return srcRoot.resolve(top + ".java");
+    }
+
+    private static void dbg(String fmt, Object... args) {
+        String flag = System.getProperty("jess.debug", "true");
+        if (!"false".equalsIgnoreCase(flag) && !"0".equals(flag)) {
+            System.out.println("[JESS] " + String.format(Locale.ROOT, fmt, args));
+        }
+    }
+
+    private static long msSince(long t0) {
+        return (System.nanoTime() - t0) / 1_000_000L;
+    }
+
+    private static final class Verification {
+        final boolean hasCode;
+        final String  classFileRel; // relative to classesOut
+        final String  reason;       // non-null when hasCode==false
+        Verification(boolean hasCode, String classFileRel, String reason) {
+            this.hasCode = hasCode; this.classFileRel = classFileRel; this.reason = reason;
+        }
+    }
+
+    private static Verification verifyTarget(Path classesOut,
+                                             java.util.List<String> emitted,
+                                             PublicApi.MethodId m) {
+        java.util.Set<Path> candidates = new LinkedHashSet<>();
+
+        for (String bin : emitted) {
+            Path p = classesOut.resolve(bin + ".class");
+            if (Files.isRegularFile(p)) candidates.add(p);
+        }
+        Path owner = classesOut.resolve(m.binaryClassName + ".class");
+        if (Files.isRegularFile(owner)) candidates.add(owner);
+        candidates.addAll(findOwnerFamilySamePackage(classesOut, m.binaryClassName));
+
+        boolean sawNoCode = false;
+        Path last = null;
+        for (Path cf : candidates) {
+            last = cf;
+            MethodPresence mp = methodPresenceInClassFile(cf, m.name, m.jvmDescriptor);
+            if (debugProbeEnabled()) {
+                String rel = classesOut.relativize(cf).toString().replace('\\','/');
+                dbg("    probe %s -> %s", rel, mp);
+            }
+            if (mp == MethodPresence.HAS_CODE) {
+                String rel = classesOut.relativize(cf).toString().replace('\\','/');
+                return new Verification(true, rel, null);
+            }
+            if (mp == MethodPresence.NO_CODE) sawNoCode = true;
+        }
+        String reason = sawNoCode ? "present without Code" : "no class contained the method";
+        String rel = (last != null && Files.isRegularFile(last)) ? classesOut.relativize(last).toString().replace('\\','/') : null;
+        return new Verification(false, rel, reason);
+    }
+
+    private enum MethodPresence { CLASS_NOT_FOUND, METHOD_NOT_FOUND, NO_CODE, HAS_CODE, ERROR }
+
+    private static boolean debugProbeEnabled() {
+        String v = System.getProperty("jess.debug", "true");
+        return !"false".equalsIgnoreCase(v) && !"0".equals(v);
+    }
+
+    private static MethodPresence methodPresenceInClassFile(Path classFile, String name, String jvmDesc) {
+        if (!Files.isRegularFile(classFile)) return MethodPresence.CLASS_NOT_FOUND;
+        try (InputStream in = Files.newInputStream(classFile)) {
+            ClassReader cr = new ClassReader(in);
+            ClassNode cn = new ClassNode();
+            cr.accept(cn, 0);
+            @SuppressWarnings("unchecked")
+            java.util.List<MethodNode> methods = (java.util.List<MethodNode>)(java.util.List<?>) cn.methods;
+            for (MethodNode mn : methods) {
+                if (Objects.equals(mn.name, name) && Objects.equals(mn.desc, jvmDesc)) {
+                    return (mn.instructions != null && mn.instructions.size() > 0)
+                            ? MethodPresence.HAS_CODE : MethodPresence.NO_CODE;
+                }
+            }
+            return MethodPresence.METHOD_NOT_FOUND;
+        } catch (Throwable t) {
+            return MethodPresence.ERROR;
+        }
+    }
+
+    private static java.util.List<String> listEmittedBinaryNames(Path classesOut) {
+        try (Stream<Path> s = Files.walk(classesOut)) {
+            return s.filter(p -> Files.isRegularFile(p) && p.toString().endsWith(".class"))
+                    .map(p -> classesOut.relativize(p).toString().replace('\\','/'))
+                    .map(n -> n.substring(0, n.length() - ".class".length()))
+                    .sorted()
+                    .collect(Collectors.toList());
+        } catch (Exception e) {
+            return java.util.List.of();
+        }
+    }
+
+    private static java.util.List<Path> findOwnerFamilySamePackage(Path classesOut, String ownerInternal) {
+        String pkg = ownerInternal.contains("/") ? ownerInternal.substring(0, ownerInternal.lastIndexOf('/')) : "";
+        String simple = ownerInternal.contains("/") ? ownerInternal.substring(ownerInternal.lastIndexOf('/') + 1) : ownerInternal;
+        Path pkgDir = pkg.isEmpty() ? classesOut : classesOut.resolve(pkg);
+        if (!Files.isDirectory(pkgDir)) return java.util.List.of();
+        try (DirectoryStream<Path> ds = Files.newDirectoryStream(pkgDir)) {
+            java.util.List<Path> out = new java.util.ArrayList<>();
+            for (Path p : ds) {
+                if (!Files.isRegularFile(p)) continue;
+                String n = p.getFileName().toString();
+                if (n.equals(simple + ".class") || n.startsWith(simple + "$")) out.add(p);
+            }
+            return out;
+        } catch (Exception e) {
+            return java.util.List.of();
+        }
+    }
+
+    // JVM descriptor -> keep signature (params only)
+    private static String toJessKeepSignature(String name, String jvmDesc) {
+        Objects.requireNonNull(name, "name");
+        Objects.requireNonNull(jvmDesc, "jvmDesc");
+        if (jvmDesc.isEmpty() || jvmDesc.charAt(0) != '(') {
+            throw new IllegalArgumentException("Descriptor must start with '(' : " + jvmDesc);
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append(name).append('(');
+        int i = 1;
+        boolean first = true;
+        while (true) {
+            char c = jvmDesc.charAt(i);
+            if (c == ')') break;
+            if (!first) sb.append(", ");
+            first = false;
+            int[] next = new int[1];
+            String t = parseParamType(jvmDesc, i, next);
+            sb.append(t);
+            i = next[0];
+        }
+        sb.append(')');
+        return sb.toString();
+    }
+    private static String parseParamType(String desc, int i, int[] nextOut) {
+        int arr = 0;
+        while (desc.charAt(i) == '[') { arr++; i++; }
+        char c = desc.charAt(i++);
+        String base;
+        switch (c) {
+            case 'B': base = "byte"; break;
+            case 'C': base = "char"; break;
+            case 'D': base = "double"; break;
+            case 'F': base = "float"; break;
+            case 'I': base = "int"; break;
+            case 'J': base = "long"; break;
+            case 'S': base = "short"; break;
+            case 'Z': base = "boolean"; break;
+            case 'V': base = "void"; break;
+            case 'L': {
+                int semi = desc.indexOf(';', i);
+                if (semi < 0) throw new IllegalArgumentException("Bad object type in desc: " + desc);
+                String internal = desc.substring(i, semi);
+                base = internal.replace('/', '.');
+                i = semi + 1;
+                break;
+            }
+            default: throw new IllegalArgumentException("Bad descriptor at " + (i - 1) + " in " + desc);
+        }
+        StringBuilder sb = new StringBuilder(base);
+        for (int k = 0; k < arr; k++) sb.append("[]");
+        nextOut[0] = i;
+        return sb.toString();
+    }
+
+    // If you have stubbing stats in your Jess impl, wire it; else keep false.
+    private boolean hasUsedStubs() {
+        // return stubbingStats != null && (stubbingStats.generatedStubs() > 0 || stubbingStats.usedStubs() > 0);
+        return false;
+    }
+
 
 
 }

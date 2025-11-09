@@ -1,17 +1,19 @@
 package de.upb.sse.jess.stubbing.spoon.generate;
 
+import de.upb.sse.jess.generation.unknown.UnknownType;
 import de.upb.sse.jess.stubbing.spoon.plan.*;
 import spoon.reflect.CtModel;
 import spoon.reflect.code.*;
 import spoon.reflect.declaration.*;
 import spoon.reflect.factory.Factory;
-import spoon.reflect.reference.CtArrayTypeReference;
-import spoon.reflect.reference.CtTypeReference;
+import spoon.reflect.reference.*;
 
 import spoon.reflect.declaration.CtType;
 import spoon.reflect.declaration.CtPackage;
+import spoon.reflect.visitor.filter.TypeFilter;
 
 import java.util.*;
+import java.util.stream.Collectors;
 
 public final class SpoonStubber {
 
@@ -46,21 +48,36 @@ public final class SpoonStubber {
 
     /**
      * Apply all TypeStubPlans; creates missing classes/interfaces/annotations.
+     * 
+     * @param plans Optional collection of method plans to infer type parameter names from.
+     *                    If provided, type parameter names (T, R, U, etc.) will be inferred from
+     *                    method signatures before creating types.
      *
      * @return number of newly created types
      */
     public int applyTypePlans(Collection<TypeStubPlan> plans) {
+        return applyTypePlans(plans, null);
+    }
+    
+    /**
+     * Apply all TypeStubPlans with method plans for type parameter name inference.
+     */
+    public int applyTypePlans(Collection<TypeStubPlan> plans, Collection<MethodStubPlan> methodPlans) {
         int created = 0;
         if (plans == null || plans.isEmpty()) return created;
 
         // (1) collect simple names that have a non-unknown plan
-        java.util.Set<String> concretePlannedSimples = new java.util.HashSet<>();
+        Set<String> concretePlannedSimples = new HashSet<>();
         for (TypeStubPlan p : plans) {
             String qn = p.qualifiedName;
-            if (qn != null && !qn.startsWith("unknown.")) {
-                int dot = qn.lastIndexOf('.');
-                String simple = (dot < 0 ? qn : qn.substring(dot + 1));
-                concretePlannedSimples.add(simple);
+            // Validate FQN: reject null, empty, or invalid FQNs
+            if (qn == null || qn.isEmpty() || qn.endsWith(".")) continue;
+            int lastDot = qn.lastIndexOf('.');
+            String simpleName = (lastDot >= 0 ? qn.substring(lastDot + 1) : qn);
+            if (simpleName == null || simpleName.isEmpty()) continue;
+            
+            if (!qn.startsWith("unknown.")) {
+                concretePlannedSimples.add(simpleName);
                 created++;
             }
         }
@@ -68,15 +85,17 @@ public final class SpoonStubber {
         // (2) create types, skipping unknown twins
         for (TypeStubPlan p : plans) {
             String qn = p.qualifiedName;
-            if (qn == null) continue;
+            // Validate FQN: reject null, empty, or invalid FQNs
+            if (qn == null || qn.isEmpty() || qn.endsWith(".")) continue;
+            int lastDot = qn.lastIndexOf('.');
+            String simpleName = (lastDot >= 0 ? qn.substring(lastDot + 1) : qn);
+            if (simpleName == null || simpleName.isEmpty()) continue;
             if (qn.startsWith("unknown.")) {
-                int dot = qn.lastIndexOf('.');
-                String simple = (dot < 0 ? qn : qn.substring(dot + 1));
-                if (concretePlannedSimples.contains(simple)) {
+                if (concretePlannedSimples.contains(simpleName)) {
                     continue; // do not create unknown.Simple when pkg.Simple is planned
                 }
             }
-            boolean wasCreated = ensureTypeExists(p);
+            boolean wasCreated = ensureTypeExists(p, methodPlans);
             if (wasCreated && p.kind == TypeStubPlan.Kind.INTERFACE) {
                 // Check if this interface will be used as a functional interface
                 // We'll mark it later when we see method plans with "apply" method
@@ -94,19 +113,37 @@ public final class SpoonStubber {
      * Ensure a type exists for the given plan (class/interface/annotation).
      * Handles generic arity inference and exception/error superclasses.
      *
+     * @param p Optional method plans to infer type parameter names from
      * @return true if a new type was created
      */
     private boolean ensureTypeExists(TypeStubPlan p) {
+        return ensureTypeExists(p, null);
+    }
+    
+    private boolean ensureTypeExists(TypeStubPlan p, Collection<MethodStubPlan> methodPlans) {
         String qn = p.qualifiedName;
-        if (qn != null && (qn.startsWith("java.")
+        
+        // Validate FQN: reject null, empty, or invalid FQNs
+        if (qn == null || qn.isEmpty()) return false;
+        if (qn.endsWith(".")) return false; // Invalid: ends with dot but no simple name
+        int lastDot = qn.lastIndexOf('.');
+        String simpleName = (lastDot >= 0 ? qn.substring(lastDot + 1) : qn);
+        if (simpleName == null || simpleName.isEmpty()) return false; // Invalid: no simple name
+        
+        if (qn.startsWith("java.")
                 || qn.startsWith("javax.")
                 || qn.startsWith("jakarta.")
                 || qn.startsWith("sun.")
-                || qn.startsWith("jdk."))) {
+                || qn.startsWith("jdk.")) {
             return false;
         }
-        if (qn != null && qn.startsWith("unknown.")) {
-            String simple = qn.substring(qn.lastIndexOf('.') + 1);
+        if (qn.startsWith("unknown.")) {
+            String simple = simpleName; // Use the already extracted simple name
+            
+            // Prevent creating primitive types as classes (byte, int, short, etc.)
+            if (isPrimitiveTypeName(simple)) {
+                return false;
+            }
 
             for (String createdFqn : createdTypes) {
                 if (createdFqn == null) continue;
@@ -130,8 +167,8 @@ public final class SpoonStubber {
 
 
         // === skip creating unknown.* if a concrete same-simple type exists ===
-        if (qn != null && qn.startsWith("unknown.")) {
-            String simple = qn.substring(qn.lastIndexOf('.') + 1); // e.g., "P"
+        if (qn.startsWith("unknown.")) {
+            String simple = simpleName; // Use the already extracted simple name
             for (String createdFqn : createdTypes) {
                 if (createdFqn == null) continue;
                 String createdSimple = createdFqn.contains("$")
@@ -146,9 +183,9 @@ public final class SpoonStubber {
 
         // --- member type fast-path: plan says Outer$Inner (or deeper) ---
         if (qn != null && qn.contains("$")) {
-            int lastDot = qn.lastIndexOf('.');
-            String pkg = (lastDot >= 0 ? qn.substring(0, lastDot) : "");
-            String afterPkg = (lastDot >= 0 ? qn.substring(lastDot + 1) : qn); // e.g., Outer$Inner$Deeper
+            int lastDotofinedx = qn.lastIndexOf('.');
+            String pkg = (lastDotofinedx >= 0 ? qn.substring(0, lastDotofinedx) : "");
+            String afterPkg = (lastDotofinedx >= 0 ? qn.substring(lastDotofinedx + 1) : qn); // e.g., Outer$Inner$Deeper
 
             String[] parts = afterPkg.split("\\$");
             if (parts.length >= 2) {
@@ -235,6 +272,11 @@ public final class SpoonStubber {
             pkg = "unknown";
             name = qn;
         }
+        
+        // Prevent creating primitive types as classes
+        if (isPrimitiveTypeName(name)) {
+            return false;
+        }
 
         CtPackage packageObj = f.Package().getOrCreate(pkg);
         CtType<?> existing = packageObj.getType(name);
@@ -266,8 +308,12 @@ public final class SpoonStubber {
         created.addModifier(ModifierKind.PUBLIC);
 
         // Add generic parameters if usages imply arity.
+        // Also infer actual type parameter names (T, R, U, etc.) from method plans
         int arity = inferGenericArityFromUsages(qn);
-        if (arity > 0) addTypeParameters(created, arity);
+        if (arity > 0) {
+            List<String> paramNames = inferTypeParameterNamesFromMethodPlans(qn, arity, methodPlans);
+            addTypeParameters(created, arity, paramNames);
+        }
 
         // If it looks like an exception/error, set a throwable superclass.
         if (created instanceof CtClass) {
@@ -460,13 +506,13 @@ public final class SpoonStubber {
                 // For functional interfaces, check if we already have a SAM method (apply/make)
                 // Even if parameter types differ (int vs Integer), we can only have ONE SAM method
                 // Prefer the one with non-primitive parameters (Integer over int) as it's more general
-                java.util.List<CtMethod<?>> existingSamMethods = owner.getMethods().stream()
+                List<CtMethod<?>> existingSamMethods = owner.getMethods().stream()
                         .filter(m -> {
                             String mName = m.getSimpleName();
                             return ("apply".equals(mName) || "make".equals(mName)) && 
-                                   m.getModifiers().contains(spoon.reflect.declaration.ModifierKind.ABSTRACT);
+                                   m.getModifiers().contains(ModifierKind.ABSTRACT);
                         })
-                        .collect(java.util.stream.Collectors.toList());
+                        .collect(Collectors.toList());
                 
                 if (!existingSamMethods.isEmpty() && ("apply".equals(p.name) || "make".equals(p.name)) && !p.defaultOnInterface && !p.isStatic) {
                     // Check if the new method has non-primitive parameters and existing has primitive
@@ -529,20 +575,155 @@ public final class SpoonStubber {
             if (hasMethod(owner, p.name, p.paramTypes)) continue;
 
             // 2) normalize return type
-            CtTypeReference<?> rt0 = normalizeUnknownRef(
-                    (p.returnType != null ? p.returnType : f.Type().VOID_PRIMITIVE));
+            // IMPORTANT: Check for type parameters BEFORE normalization
+            CtTypeReference<?> rt0 = (p.returnType != null ? p.returnType : f.Type().VOID_PRIMITIVE);
+            
+            // Check if return type matches owner's type parameters BEFORE normalization
+            if (owner instanceof CtFormalTypeDeclarer && rt0 != null) {
+                String returnTypeSimple = rt0.getSimpleName();
+                String returnQn = safeQN(rt0);
+                
+                // Check if this looks like a type parameter (single uppercase letter)
+                // The qualified name might be null, empty, equal to simple name, or start with "unknown."
+                boolean looksLikeTypeParam = returnTypeSimple != null && 
+                    returnTypeSimple.length() == 1 && 
+                    returnTypeSimple.matches("[A-Z]") && 
+                    returnTypeSimple.charAt(0) >= 'T';
+                
+                boolean hasNoPackage = returnQn == null || returnQn.isEmpty() || 
+                    returnQn.equals(returnTypeSimple) ||
+                    (returnQn.startsWith("unknown.") && returnQn.equals("unknown." + returnTypeSimple));
+                
+                if (looksLikeTypeParam && hasNoPackage) {
+                    try {
+                        List<CtTypeParameter> ownerParams = ((CtFormalTypeDeclarer) owner).getFormalCtTypeParameters();
+                        if (ownerParams != null && !ownerParams.isEmpty()) {
+                            // First try to find by exact name match
+                            boolean found = false;
+                            for (CtTypeParameter tp : ownerParams) {
+                                if (returnTypeSimple.equals(tp.getSimpleName())) {
+                                    rt0 = tp.getReference();
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            
+                            // If not found by name, try by position:
+                            // T -> first param, R -> second param, U -> third param, etc.
+                            if (!found) {
+                                String[] standardNames = {"T", "R", "U", "V", "W", "X", "Y", "Z"};
+                                int index = -1;
+                                for (int j = 0; j < standardNames.length; j++) {
+                                    if (standardNames[j].equals(returnTypeSimple)) {
+                                        index = j;
+                                        break;
+                                    }
+                                }
+                                if (index >= 0 && index < ownerParams.size()) {
+                                    rt0 = ownerParams.get(index).getReference();
+                                }
+                            }
+                        }
+                    } catch (Throwable ignored) {}
+                }
+            }
+            
+            // Now normalize (but type parameter references should already be resolved)
+            // IMPORTANT: If rt0 is already a type parameter reference, don't normalize it
+            if (!(rt0 instanceof CtTypeParameterReference)) {
+                rt0 = normalizeUnknownRef(rt0);
+            }
+            if (rt0 == null) {
+                rt0 = f.Type().VOID_PRIMITIVE;
+            }
+            
             @SuppressWarnings({"rawtypes", "unchecked"})
             CtTypeReference rt = (CtTypeReference) rt0;
 
             // 3) normalize parameters (convert last to array if varargs)
+            // IMPORTANT: Check for type parameters BEFORE normalization to avoid breaking the match
             boolean willBeVarargs = p.varargs;
             List<CtTypeReference<?>> normParams = new ArrayList<>(p.paramTypes.size());
             for (int i = 0; i < p.paramTypes.size(); i++) {
-                CtTypeReference<?> t = normalizeUnknownRef(p.paramTypes.get(i));
+                CtTypeReference<?> t = p.paramTypes.get(i);
+                
+                // Check if this is a type parameter BEFORE normalization
+                // This handles cases like Uncheck.apply(T) where T is a type parameter
+                if (owner instanceof CtFormalTypeDeclarer && t != null) {
+                    String paramTypeSimple = t.getSimpleName();
+                    String paramQn = safeQN(t);
+                    
+                    // Check if this looks like a type parameter (single uppercase letter)
+                    // The qualified name might be null, empty, equal to simple name, or start with "unknown."
+                    boolean looksLikeTypeParam = paramTypeSimple != null && 
+                        paramTypeSimple.length() == 1 && 
+                        paramTypeSimple.matches("[A-Z]") && 
+                        paramTypeSimple.charAt(0) >= 'T';
+                    
+                    boolean hasNoPackage = paramQn == null || paramQn.isEmpty() || 
+                        paramQn.equals(paramTypeSimple) ||
+                        (paramQn.startsWith("unknown.") && paramQn.equals("unknown." + paramTypeSimple));
+                    
+                    if (looksLikeTypeParam && hasNoPackage) {
+                        try {
+                            List<CtTypeParameter> ownerParams = ((CtFormalTypeDeclarer) owner).getFormalCtTypeParameters();
+                            if (ownerParams != null && !ownerParams.isEmpty()) {
+                                String ownerQnref = safeQN(owner.getReference());
+                                System.err.println("[applyMethodPlans] Trying to match type parameter '" + paramTypeSimple + 
+                                    "' for owner " + ownerQnref + " (has " + ownerParams.size() + " type params)");
+                                
+                                // First try to find by exact name match
+                                boolean found = false;
+                                for (CtTypeParameter tp : ownerParams) {
+                                    String tpName = tp.getSimpleName();
+                                    System.err.println("[applyMethodPlans]   - Checking type param: " + tpName);
+                                    if (paramTypeSimple.equals(tpName)) {
+                                        t = tp.getReference();
+                                        found = true;
+                                        System.err.println("[applyMethodPlans]   - Matched by name: " + paramTypeSimple);
+                                        break;
+                                    }
+                                }
+                                
+                                // If not found by name, try by position:
+                                // T -> first param, R -> second param, U -> third param, etc.
+                                if (!found) {
+                                    String[] standardNames = {"T", "R", "U", "V", "W", "X", "Y", "Z"};
+                                    int index = -1;
+                                    for (int j = 0; j < standardNames.length; j++) {
+                                        if (standardNames[j].equals(paramTypeSimple)) {
+                                            index = j;
+                                            break;
+                                        }
+                                    }
+                                    if (index >= 0 && index < ownerParams.size()) {
+                                        t = ownerParams.get(index).getReference();
+                                        System.err.println("[applyMethodPlans]   - Matched by position: " + paramTypeSimple + " -> index " + index);
+                                    } else {
+                                        System.err.println("[applyMethodPlans]   - No match found for " + paramTypeSimple);
+                                    }
+                                }
+                            } else {
+                                String ownerQnRef = safeQN(owner.getReference());
+                                System.err.println("[applyMethodPlans] Owner " + ownerQnRef + " has no type parameters!");
+                            }
+                        } catch (Throwable e) {
+                            System.err.println("[applyMethodPlans] Error matching type parameter: " + e.getMessage());
+                            e.printStackTrace();
+                        }
+                    }
+                }
+                
+                // Now normalize (but type parameter references should already be resolved)
+                // IMPORTANT: If t is already a type parameter reference, don't normalize it
+                if (!(t instanceof CtTypeParameterReference)) {
+                    t = normalizeUnknownRef(t);
+                }
                 if (t == null) {
                     // Fallback to Object if normalization fails
                     t = f.Type().createReference("java.lang.Object");
                 }
+                
                 if (willBeVarargs && i == p.paramTypes.size() - 1) {
                     // varargs at AST-level is an array on the last parameter
                     // Only create array if not already an array
@@ -582,6 +763,23 @@ public final class SpoonStubber {
 
             // 6) create the method on the real owner
             CtMethod<?> m = f.Method().create(owner, mods, rt, p.name, params, thrown);
+            
+            // Special handling for methods overriding Object methods - must be public
+            // Also prevent overriding final methods like getClass()
+            if ("getClass".equals(p.name) && p.paramTypes.isEmpty()) {
+                // Cannot override Object.getClass() - it's final
+                owner.removeMethod(m);
+                createdMethods.add(sig(owner.getQualifiedName(), p.name, normParams) + " : " + readable(rt0) + " [SKIPPED: final method]");
+                continue;
+            }
+            
+            // Methods overriding Object methods must be public
+            if (("toString".equals(p.name) || "equals".equals(p.name) || "hashCode".equals(p.name)) && 
+                owner instanceof CtClass) {
+                m.addModifier(ModifierKind.PUBLIC);
+                m.removeModifier(ModifierKind.PRIVATE);
+                m.removeModifier(ModifierKind.PROTECTED);
+            }
 
             // mark varargs on the last parameter (Spoon 10.x)
             if (willBeVarargs && !params.isEmpty()) {
@@ -595,12 +793,19 @@ public final class SpoonStubber {
                 last.setVarArgs(true);
             }
 
+            // Prevent illegal modifier combinations: abstract and static
+            if (m.hasModifier(ModifierKind.ABSTRACT) && m.hasModifier(ModifierKind.STATIC)) {
+                // Remove abstract if static (static methods can't be abstract in interfaces)
+                m.removeModifier(ModifierKind.ABSTRACT);
+            }
 
             // 7) interface default/abstract body handling
             boolean ownerIsInterface = owner instanceof CtInterface;
             if (ownerIsInterface) {
                 if (p.isStatic) {
                     m.addModifier(ModifierKind.STATIC);
+                    // Static methods in interfaces can't be abstract
+                    m.removeModifier(ModifierKind.ABSTRACT);
                 }
 
                 if (p.defaultOnInterface) {
@@ -612,9 +817,19 @@ public final class SpoonStubber {
                     m.setBody(body);
                     m.removeModifier(ModifierKind.ABSTRACT);
                 } else {
-                    m.setBody(null);
-                    m.addModifier(ModifierKind.PUBLIC);
-                    m.addModifier(ModifierKind.ABSTRACT);
+                    // Only make abstract if not static
+                    if (!p.isStatic) {
+                        m.setBody(null);
+                        m.addModifier(ModifierKind.PUBLIC);
+                        m.addModifier(ModifierKind.ABSTRACT);
+                    } else {
+                        // Static method in interface - must have body
+                        CtBlock<?> body = f.Core().createBlock();
+                        CtReturn<?> ret = defaultReturn(rt0);
+                        if (ret != null) body.addStatement(ret);
+                        m.setBody(body);
+                        m.addModifier(ModifierKind.PUBLIC);
+                    }
                 }
             } else {
                 CtBlock<?> body = f.Core().createBlock();
@@ -683,13 +898,13 @@ public final class SpoonStubber {
                                 CtArrayTypeReference<?> arr = f.Core().createArrayTypeReference();
                                 arr.setComponentType(mirrorElem);
                                 mirrorRt = arr;
-                                mirrorParamRefs = java.util.Collections.emptyList();
+                                mirrorParamRefs = Collections.emptyList();
                             } else if (isEnumValueOf) {
                                 mirrorRt = mirrorElem;
-                                mirrorParamRefs = java.util.List.of(f.Type().createReference("java.lang.String"));
+                                mirrorParamRefs = List.of(f.Type().createReference("java.lang.String"));
                             } else { // name()
                                 mirrorRt = f.Type().createReference("java.lang.String");
-                                mirrorParamRefs = java.util.Collections.emptyList();
+                                mirrorParamRefs = Collections.emptyList();
                             }
                         }
 
@@ -893,7 +1108,7 @@ public final class SpoonStubber {
             CtTypeReference<?> safe;
             try {
                 safe = (raw == null || isNullish(raw))
-                        ? f.Type().createReference(de.upb.sse.jess.generation.unknown.UnknownType.CLASS)
+                        ? f.Type().createReference(UnknownType.CLASS)
                         : normalizeUnknownRef(raw); // ensure normalization survives
                 // Additional safety check
                 if (safe == null || isNullish(safe)) {
@@ -1088,12 +1303,18 @@ public final class SpoonStubber {
     private CtTypeReference<?> normalizeUnknownRef(CtTypeReference<?> t) {
         if (t == null) return null;
         try {
+            // Check if this is a type parameter reference - if so, don't normalize it
+            // Type parameters are created with references that should be preserved
+            if (t instanceof CtTypeParameterReference) {
+                return t; // Don't normalize type parameter references
+            }
+            
             String qn = safeQN(t);
             String simple = t.getSimpleName();
 
             if ("Unknown".equals(simple) && (qn.isEmpty() || !qn.contains("."))) {
                 CtTypeReference<?> u = f.Type().createReference(
-                        de.upb.sse.jess.generation.unknown.UnknownType.CLASS
+                        UnknownType.CLASS
                 );
                 u.setImplicit(false);
                 u.setSimplyQualified(false);   // simple name, rely on the explicit import
@@ -1166,7 +1387,7 @@ public final class SpoonStubber {
      * and force FQN printing to avoid import conflicts.
      */
 
-    public void qualifyAmbiguousSimpleTypes(java.util.Set<String> onlySimples) {
+    public void qualifyAmbiguousSimpleTypes(Set<String> onlySimples) {
         if (onlySimples == null || onlySimples.isEmpty()) return;
         Map<String, Set<String>> map = simpleNameToPkgs();
         map.entrySet().removeIf(e -> e.getValue().size() < 2 || !onlySimples.contains(e.getKey()));
@@ -1223,19 +1444,149 @@ public final class SpoonStubber {
     }
 
     /**
-     * Add type parameters T0..T{arity-1} to a newly created type if it can declare formals.
+     * Infer type parameter names (T, R, U, etc.) from method plans.
+     * This is more accurate than inferring from the model because we can see
+     * the actual type parameter names used in method signatures.
      */
-    private void addTypeParameters(CtType<?> created, int arity) {
+    private List<String> inferTypeParameterNamesFromMethodPlans(String fqn, int arity, 
+            Collection<MethodStubPlan> methodPlans) {
+        if (methodPlans == null || methodPlans.isEmpty()) {
+            // Fallback to standard names
+            return getDefaultTypeParameterNames(arity);
+        }
+        
+        String simple = fqn.substring(fqn.lastIndexOf('.') + 1);
+        Set<String> usedNames = new LinkedHashSet<>();
+        
+        // Collect type parameter names from method plans for this type
+        for (MethodStubPlan plan : methodPlans) {
+            try {
+                String ownerQn = safeQN(plan.ownerType);
+                // Also check erased FQN for generic types
+                String ownerQnErased = erasureFqn(plan.ownerType);
+                String fqnErased = erasureFqn(f.Type().createReference(fqn));
+                
+                boolean matches = ownerQn != null && (ownerQn.equals(fqn) || ownerQn.equals(fqnErased));
+                if (!matches && ownerQnErased != null) {
+                    matches = ownerQnErased.equals(fqn) || ownerQnErased.equals(fqnErased);
+                }
+                if (!matches) continue;
+                
+                // Check return type
+                if (plan.returnType != null) {
+                    String retSimple = plan.returnType.getSimpleName();
+                    String retQn = safeQN(plan.returnType);
+                    // Check if it's a type parameter (single uppercase letter, no real package)
+                    if (retSimple != null && retSimple.length() == 1 && 
+                        retSimple.matches("[A-Z]") && retSimple.charAt(0) >= 'T' &&
+                        (retQn == null || retQn.isEmpty() || retQn.equals(retSimple) || 
+                         retQn.startsWith("unknown."))) {
+                        usedNames.add(retSimple);
+                    }
+                }
+                
+                // Check parameter types
+                if (plan.paramTypes != null) {
+                    for (CtTypeReference<?> paramType : plan.paramTypes) {
+                        if (paramType == null) continue;
+                        String paramSimple = paramType.getSimpleName();
+                        String paramQn = safeQN(paramType);
+                        // Check if it's a type parameter (single uppercase letter, no real package)
+                        if (paramSimple != null && paramSimple.length() == 1 && 
+                            paramSimple.matches("[A-Z]") && paramSimple.charAt(0) >= 'T' &&
+                            (paramQn == null || paramQn.isEmpty() || paramQn.equals(paramSimple) ||
+                             paramQn.startsWith("unknown."))) {
+                            usedNames.add(paramSimple);
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {}
+        }
+        
+        // Use collected names, or fall back to standard names
+        List<String> result = new ArrayList<>();
+        String[] defaults = {"T", "R", "U", "V", "W", "X", "Y", "Z"};
+        List<String> collected = new ArrayList<>(usedNames);
+        
+        for (int i = 0; i < arity; i++) {
+            if (i < collected.size()) {
+                result.add(collected.get(i));
+            } else if (i < defaults.length) {
+                result.add(defaults[i]);
+            } else {
+                result.add("T" + i);
+            }
+        }
+        return result;
+    }
+    
+    /**
+     * Get the erased FQN of a type reference (removes generic type arguments).
+     */
+    private String erasureFqn(CtTypeReference<?> ref) {
+        if (ref == null) return null;
+        try {
+            String qn = safeQN(ref);
+            if (qn == null) return null;
+            // Remove generic type arguments (e.g., "Uncheck<T>" -> "Uncheck")
+            int angleBracket = qn.indexOf('<');
+            if (angleBracket > 0) {
+                return qn.substring(0, angleBracket);
+            }
+            return qn;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+    
+    /**
+     * Get default type parameter names (T, R, U, etc.)
+     */
+    private List<String> getDefaultTypeParameterNames(int arity) {
+        List<String> result = new ArrayList<>();
+        String[] defaults = {"T", "R", "U", "V", "W", "X", "Y", "Z"};
+        for (int i = 0; i < arity; i++) {
+            if (i < defaults.length) {
+                result.add(defaults[i]);
+            } else {
+                result.add("T" + i);
+            }
+        }
+        return result;
+    }
+    
+    /**
+     * Check if a simple name is a Java primitive type name.
+     * Prevents stubbing primitive types like byte, int, short, etc. as classes.
+     */
+    private boolean isPrimitiveTypeName(String simpleName) {
+        if (simpleName == null) return false;
+        return simpleName.equals("byte") || simpleName.equals("short") || simpleName.equals("int") ||
+               simpleName.equals("long") || simpleName.equals("float") || simpleName.equals("double") ||
+               simpleName.equals("char") || simpleName.equals("boolean") || simpleName.equals("void");
+    }
+    
+    /**
+     * Add type parameters with given names (or T0..T{arity-1} if names not provided) to a newly created type.
+     */
+    private void addTypeParameters(CtType<?> created, int arity, List<String> paramNames) {
         if (!(created instanceof CtFormalTypeDeclarer) || arity <= 0) return;
         CtFormalTypeDeclarer decl = (CtFormalTypeDeclarer) created;
 
-        // don’t duplicate if already has params
+        // don't duplicate if already has params
         if (decl.getFormalCtTypeParameters() != null && !decl.getFormalCtTypeParameters().isEmpty()) return;
 
+        String createdQn = safeQN(created.getReference());
+        System.err.println("[addTypeParameters] Creating " + arity + " type parameter(s) for " + createdQn);
+        
         for (int i = 0; i < arity; i++) {
             CtTypeParameter tp = f.Core().createTypeParameter();
-            tp.setSimpleName("T" + i);
+            String name = (paramNames != null && i < paramNames.size()) 
+                    ? paramNames.get(i) 
+                    : ("T" + i);
+            tp.setSimpleName(name);
             decl.addFormalCtTypeParameter(tp);
+            System.err.println("[addTypeParameters]   - Added type parameter: " + name);
         }
     }
 
@@ -1460,7 +1811,7 @@ public final class SpoonStubber {
                     // If a raw superinterface with same erasure exists, remove it; if exact parameterized exists, skip
                     CtTypeReference<?> rawExisting = null;
                     boolean exactExists = false;
-                    for (CtTypeReference<?> cur : new java.util.ArrayList<>(owner.getSuperInterfaces())) {
+                    for (CtTypeReference<?> cur : new ArrayList<>(owner.getSuperInterfaces())) {
                         if (cur == null) continue;
                         if (cur.getQualifiedName().equals(withArgs.getQualifiedName())) {
                             if (cur.getActualTypeArguments().isEmpty()) {
@@ -1523,7 +1874,7 @@ public final class SpoonStubber {
                 if (toAttach != null) {
                     CtTypeReference<?> rawExisting = null;
                     boolean exactExists = false;
-                    for (CtTypeReference<?> cur : new java.util.ArrayList<>(owner.getSuperInterfaces())) {
+                    for (CtTypeReference<?> cur : new ArrayList<>(owner.getSuperInterfaces())) {
                         if (cur == null) continue;
                         if (cur.getQualifiedName().equals(toAttach.getQualifiedName())) {
                             if (cur.getActualTypeArguments().isEmpty()) {
@@ -1711,7 +2062,7 @@ public final class SpoonStubber {
         }
 
         // Visit every type reference and adjust package/simple name when a mapping exists
-        for (CtTypeReference<?> tr : model.getElements(new spoon.reflect.visitor.filter.TypeFilter<>(CtTypeReference.class))) {
+        for (CtTypeReference<?> tr : model.getElements(new TypeFilter<>(CtTypeReference.class))) {
             String qn = safeQN(tr);
             if (qn == null || !qn.startsWith("unknown.")) continue;
 
@@ -1731,7 +2082,7 @@ public final class SpoonStubber {
                 tr.setPackage(null);
             } else {
                 // Use the reference's own factory to get a package reference
-                spoon.reflect.reference.CtPackageReference pref =
+                CtPackageReference pref =
                         tr.getFactory().Package().getOrCreate(pkg).getReference();
                 tr.setPackage(pref);
             }
@@ -1822,7 +2173,7 @@ public final class SpoonStubber {
 
             boolean removed = cu.getImports().removeIf(imp -> {
                 try {
-                    spoon.reflect.reference.CtReference r = imp.getReference();
+                    CtReference r = imp.getReference();
                     if (r == null) return false;
                     String s = r.toString(); // robust across CtReference subclasses
                     return "unknown.*".equals(s) || (s != null && s.startsWith("unknown."));

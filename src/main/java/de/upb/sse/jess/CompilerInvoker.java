@@ -3,12 +3,12 @@ package de.upb.sse.jess;
 import de.upb.sse.jess.finder.JarFinder;
 import de.upb.sse.jess.util.FileUtil;
 
-import javax.tools.JavaCompiler;
-import javax.tools.ToolProvider;
+import javax.tools.*;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.PrintWriter;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -32,10 +32,17 @@ public class CompilerInvoker {
     public boolean compileFile(String fileString, String output) {
         // keep static field in sync (use the *existing* param name)
         CompilerInvoker.output = output;
-        return this.compileFile(List.of(fileString), output);
+        CompilationResult result = this.compileFile(List.of(fileString), output);
+        return result.success;
     }
 
-    public boolean compileFile(List<String> fileStrings, String output) {
+    /**
+     * Compile files and return both success status and error messages.
+     * @param fileStrings List of file/directory paths to compile
+     * @param output Output directory for compiled classes
+     * @return CompilationResult containing success status and error messages
+     */
+    public CompilationResult compileFile(List<String> fileStrings, String output) {
         // keep static field in sync
         CompilerInvoker.output = output;
 
@@ -48,20 +55,76 @@ public class CompilerInvoker {
                 JarFinder.find(Jess.JAR_DIRECTORY).stream()
                         .collect(Collectors.joining(FileUtil.isWindows() ? ";" : ":"));
 
-        List<String> argLine = new ArrayList<>(filesToCompile);
+        // Build compiler options (without file names)
+        List<String> options = new ArrayList<>();
         if (targetVersion != null && !targetVersion.equals("unknown")) {
-            argLine.add("-source"); argLine.add(this.targetVersion);
-            argLine.add("-target"); argLine.add(this.targetVersion);
+            options.add("-source");
+            options.add(this.targetVersion);
+            options.add("-target");
+            options.add(this.targetVersion);
         }
-        argLine.add("-Xlint:-options");
-        argLine.add("-cp"); argLine.add(classPath);
-        argLine.add("-d");  argLine.add(output); // <-- still pass the param
-        // ...
+        options.add("-Xlint:-options");
+        options.add("-cp");
+        options.add(classPath);
+        options.add("-d");
+        options.add(output);
+        
         JavaCompiler comp = ToolProvider.getSystemJavaCompiler();
-        OutputStream oStream = silentCompilation ? OutputStream.nullOutputStream() : null;
-        InputStream  iStream = silentCompilation ? InputStream.nullInputStream()  : null;
-        int result = comp.run(iStream, oStream, oStream, argLine.toArray(String[]::new));
-        return result == 0;
+        DiagnosticCollector<JavaFileObject> diagnostics = new DiagnosticCollector<>();
+        
+        StandardJavaFileManager fileManager = comp.getStandardFileManager(diagnostics, null, null);
+        
+        // Convert file paths to JavaFileObjects
+        Iterable<? extends JavaFileObject> compilationUnits = fileManager.getJavaFileObjectsFromStrings(filesToCompile);
+        
+        // Create a compilation task
+        PrintWriter errorWriter = silentCompilation ? null : new PrintWriter(System.err, true);
+        JavaCompiler.CompilationTask task = comp.getTask(
+                errorWriter,  // Writer for compiler output (null = silent)
+                fileManager,
+                diagnostics,
+                options, // compiler options (without file names)
+                null,
+                compilationUnits
+        );
+        
+        boolean success = task.call();
+        
+        // Collect error messages
+        StringBuilder errorMessages = new StringBuilder();
+        for (Diagnostic<? extends JavaFileObject> diagnostic : diagnostics.getDiagnostics()) {
+            if (diagnostic.getKind() == Diagnostic.Kind.ERROR) {
+                if (errorMessages.length() > 0) {
+                    errorMessages.append("; ");
+                }
+                String message = diagnostic.getMessage(null);
+                String source = diagnostic.getSource() != null ? diagnostic.getSource().getName() : "unknown";
+                long line = diagnostic.getLineNumber();
+                long column = diagnostic.getColumnNumber();
+                errorMessages.append(String.format("%s:%d:%d: %s", source, line, column, message));
+            }
+        }
+        
+        try {
+            fileManager.close();
+        } catch (IOException e) {
+            // Ignore
+        }
+        
+        return new CompilationResult(success, errorMessages.toString());
+    }
+    
+    /**
+     * Result of a compilation attempt, including success status and error messages.
+     */
+    public static class CompilationResult {
+        public final boolean success;
+        public final String errorMessages;
+        
+        public CompilationResult(boolean success, String errorMessages) {
+            this.success = success;
+            this.errorMessages = errorMessages != null ? errorMessages : "";
+        }
     }
 
     private List<String> getFileNames(List<String> fileNames, Path dir) {

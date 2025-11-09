@@ -68,7 +68,8 @@ public final class SpoonStubbingRunner implements Stubber {
         SpoonStubber stubber = new SpoonStubber(f, model);
 
         int created = 0;
-        created += stubber.applyTypePlans(plans.typePlans);       // types (classes/interfaces/annotations)
+        // Pass method plans to applyTypePlans so it can infer type parameter names (T, R, U, etc.)
+        created += stubber.applyTypePlans(plans.typePlans, plans.methodPlans);       // types (classes/interfaces/annotations)
 
         created += stubber.applyFieldPlans(plans.fieldPlans);     // fields
         created += stubber.applyConstructorPlans(plans.ctorPlans);// constructors
@@ -99,6 +100,32 @@ public final class SpoonStubbingRunner implements Stubber {
         // Fix field accesses with null targets (should be implicit this)
         // This fixes cases like ".logger.logOut()" where the target is lost
         fixFieldAccessTargets(model, f);
+
+        // Remove primitive types that were incorrectly stubbed (byte, int, short, etc.)
+        // These should never be classes
+        java.util.List<CtType<?>> toRemove = new java.util.ArrayList<>();
+        for (CtType<?> type : model.getAllTypes()) {
+            String simpleName = type.getSimpleName();
+            if (simpleName != null && isPrimitiveTypeName(simpleName)) {
+                // Check if it's in the unknown package (primitive types shouldn't be stubbed)
+                CtPackage pkg = type.getPackage();
+                String pkgName = (pkg != null ? pkg.getQualifiedName() : "");
+                if (pkgName.startsWith("unknown.") || pkgName.equals("unknown")) {
+                    toRemove.add(type);
+                }
+            }
+        }
+        for (CtType<?> type : toRemove) {
+            try {
+                CtPackage pkg = type.getPackage();
+                if (pkg != null) {
+                    pkg.removeType(type);
+                }
+            } catch (Throwable ignored) {}
+        }
+        if (!toRemove.isEmpty()) {
+            System.err.println("[SpoonStubbingRunner] Removed " + toRemove.size() + " incorrectly stubbed primitive type(s)");
+        }
 
         // Remove unknown.Helper if a real Helper exists
         model.getAllTypes().stream()
@@ -216,6 +243,16 @@ public final class SpoonStubbingRunner implements Stubber {
         return created;
     }
 
+    /**
+     * Check if a simple name is a Java primitive type name.
+     */
+    private static boolean isPrimitiveTypeName(String simpleName) {
+        if (simpleName == null) return false;
+        return simpleName.equals("byte") || simpleName.equals("short") || simpleName.equals("int") ||
+               simpleName.equals("long") || simpleName.equals("float") || simpleName.equals("double") ||
+               simpleName.equals("char") || simpleName.equals("boolean") || simpleName.equals("void");
+    }
+    
     /**
      * Fix field accesses that have problematic targets causing leading dots in output.
      * When a field access has a null target (implicit this), ensure it's properly handled.
