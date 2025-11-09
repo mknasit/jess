@@ -125,6 +125,9 @@ public final class SpoonStubbingRunner implements Stubber {
 
         stubber.report(); // summary
 
+        // Make classes public if they are referenced from other packages
+        makeReferencedClassesPublic(model, f);
+
         // Fix field accesses with null targets (should be implicit this)
         // This fixes cases like ".logger.logOut()" where the target is lost
         fixFieldAccessTargets(model, f);
@@ -204,6 +207,10 @@ public final class SpoonStubbingRunner implements Stubber {
         
         // Post-process generated files to fix unknown.Unknown -> Unknown with import
         postProcessUnknownTypes(slicedSrcDir);
+        
+        // Post-process to remove duplicate nested class files (e.g., ComplexBuilderTest$Builder.java)
+        // when the nested class is already in the parent file
+        postProcessRemoveDuplicateNestedClassFiles(slicedSrcDir);
         
         return created;
     }
@@ -792,8 +799,8 @@ public final class SpoonStubbingRunner implements Stubber {
                     ref.setSimplyQualified(false);
                     ref.setImplicit(false);
                 } else {
-                    ref.setSimplyQualified(true);
-                    ref.setImplicit(false);
+                ref.setSimplyQualified(true);
+                ref.setImplicit(false);
                 }
             } catch (Throwable ignored2) {
                 // Last resort: force FQN
@@ -1002,11 +1009,15 @@ public final class SpoonStubbingRunner implements Stubber {
         for (var entry : plans.implementsPlans.entrySet()) {
             String ownerQn = entry.getKey();
             if (ownerQn != null) referenced.add(ownerQn);
+            
+            // Also collect interface types
             for (var ifaceRef : entry.getValue()) {
                 String ifaceQn = safeQN(ifaceRef);
                 if (ifaceQn != null) referenced.add(ifaceQn);
             }
         }
+        
+        // The existing code already collects all type references, so *Grpc should be included
         
         // Collect from all type references in the model
         for (CtTypeReference<?> typeRef : model.getElements(new TypeFilter<>(CtTypeReference.class))) {
@@ -1088,6 +1099,112 @@ public final class SpoonStubbingRunner implements Stubber {
                     }
                 } catch (Throwable ignored) {}
             }
+        }
+    }
+    
+    /**
+     * Make classes public if they are referenced from other packages.
+     * This ensures that classes can be accessed across package boundaries.
+     */
+    private static void makeReferencedClassesPublic(CtModel model, Factory f) {
+        // Collect all type references in the model
+        Set<String> referencedTypeQns = new HashSet<>();
+        
+        for (CtTypeReference<?> ref : model.getElements(new TypeFilter<>(CtTypeReference.class))) {
+            try {
+                String qn = ref.getQualifiedName();
+                if (qn != null && !qn.isEmpty() && !qn.startsWith("java.") && 
+                    !qn.startsWith("javax.") && !qn.startsWith("jakarta.")) {
+                    referencedTypeQns.add(qn);
+                }
+            } catch (Throwable ignored) {}
+        }
+        
+        // Also check method return types and parameter types
+        for (CtMethod<?> method : model.getElements(new TypeFilter<>(CtMethod.class))) {
+            try {
+                CtTypeReference<?> returnType = method.getType();
+                if (returnType != null) {
+                    String qn = returnType.getQualifiedName();
+                    if (qn != null && !qn.isEmpty() && !qn.startsWith("java.") && 
+                        !qn.startsWith("javax.") && !qn.startsWith("jakarta.")) {
+                        referencedTypeQns.add(qn);
+                    }
+                }
+                for (CtParameter<?> param : method.getParameters()) {
+                    CtTypeReference<?> paramType = param.getType();
+                    if (paramType != null) {
+                        String qn = paramType.getQualifiedName();
+                        if (qn != null && !qn.isEmpty() && !qn.startsWith("java.") && 
+                            !qn.startsWith("javax.") && !qn.startsWith("jakarta.")) {
+                            referencedTypeQns.add(qn);
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {}
+        }
+        
+        // For each referenced type, find it in the model and make it public
+        for (String referencedQn : referencedTypeQns) {
+            try {
+                CtType<?> referencedType = f.Type().get(referencedQn);
+                if (referencedType != null && referencedType instanceof CtClass) {
+                    CtClass<?> cls = (CtClass<?>) referencedType;
+                    // Only make it public if it's not already public and not in the unknown package
+                    CtPackage pkg = cls.getPackage();
+                    String pkgName = (pkg != null ? pkg.getQualifiedName() : "");
+                    if (!pkgName.startsWith("unknown") && !cls.hasModifier(ModifierKind.PUBLIC)) {
+                        cls.addModifier(ModifierKind.PUBLIC);
+                    }
+                }
+            } catch (Throwable ignored) {}
+        }
+    }
+    
+    /**
+     * Post-process to remove duplicate nested class files.
+     * Spoon sometimes writes nested classes to separate files (e.g., Outer$Inner.java),
+     * but they should be in the parent file. This removes those duplicate files.
+     */
+    private static void postProcessRemoveDuplicateNestedClassFiles(Path outputDir) {
+        try {
+            if (!Files.exists(outputDir)) {
+                return;
+            }
+            
+            // Find all files matching pattern: *$*.java (nested classes)
+            try (Stream<Path> paths = Files.walk(outputDir)) {
+                paths.filter(p -> {
+                    String fileName = p.getFileName().toString();
+                    return fileName.endsWith(".java") && fileName.contains("$");
+                }).forEach(nestedFile -> {
+                    try {
+                        // Extract parent class name (e.g., ComplexBuilderTest$Builder -> ComplexBuilderTest)
+                        String fileName = nestedFile.getFileName().toString();
+                        String parentClassName = fileName.substring(0, fileName.indexOf('$'));
+                        String parentFileName = parentClassName + ".java";
+                        
+                        // Find parent file in same directory
+                        Path parentFile = nestedFile.getParent().resolve(parentFileName);
+                        if (Files.exists(parentFile)) {
+                            // Check if parent file already contains the nested class definition
+                            String parentContent = Files.readString(parentFile);
+                            // If parent file has the nested class, delete the separate file
+                            // We check for "class " + simple name of nested class
+                            String nestedSimpleName = fileName.substring(fileName.indexOf('$') + 1, fileName.length() - 5);
+                            if (parentContent.contains("class " + nestedSimpleName) || 
+                                parentContent.contains("static class " + nestedSimpleName)) {
+                                // Nested class is already in parent file - delete duplicate
+                                Files.delete(nestedFile);
+                            }
+                        }
+                    } catch (Exception e) {
+                        // Ignore errors during cleanup
+                    }
+                });
+            }
+        } catch (Exception e) {
+            // Ignore errors
         }
     }
     
