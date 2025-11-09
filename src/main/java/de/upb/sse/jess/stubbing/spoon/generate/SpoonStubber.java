@@ -1128,6 +1128,7 @@ public final class SpoonStubber {
 
     /**
      * Check if a method with name and parameter signature exists.
+     * Treats Object and Unknown as equivalent to avoid duplicate methods.
      */
     private boolean hasMethod(CtType<?> owner, String name, List<CtTypeReference<?>> paramTypes) {
         for (CtMethod<?> m : owner.getMethods()) {
@@ -1138,10 +1139,18 @@ public final class SpoonStubber {
             for (int i = 0; i < ps.size(); i++) {
                 String a = readable(ps.get(i).getType());
                 String b = readable(paramTypes.get(i));
-                if (!Objects.equals(a, b)) {
+                // Treat Object and Unknown as equivalent to avoid duplicates
+                if (Objects.equals(a, b)) {
+                    continue; // Exact match
+                }
+                // Check if both are Object or Unknown (equivalent)
+                boolean aIsObjectOrUnknown = "java.lang.Object".equals(a) || "unknown.Unknown".equals(a) || "Unknown".equals(a);
+                boolean bIsObjectOrUnknown = "java.lang.Object".equals(b) || "unknown.Unknown".equals(b) || "Unknown".equals(b);
+                if (aIsObjectOrUnknown && bIsObjectOrUnknown) {
+                    continue; // Both are Object/Unknown - equivalent
+                }
                     all = false;
                     break;
-                }
             }
             if (all) return true;
         }
@@ -2280,6 +2289,71 @@ public final class SpoonStubber {
                 }
             }
         }
+        
+        // Second pass: Preserve nested generic type arguments recursively
+        preserveNestedGenericArguments();
+    }
+    
+    /**
+     * Preserve nested generic type arguments recursively.
+     * Handles cases like Mono<ResponseEntity<Map<String, List<T>>>>.
+     */
+    private void preserveNestedGenericArguments() {
+        // Find all type references and ensure nested type arguments are preserved
+        for (CtTypeReference<?> ref : model.getElements(new TypeFilter<>(CtTypeReference.class))) {
+            try {
+                if (ref.getActualTypeArguments().isEmpty()) continue;
+                
+                // Recursively preserve nested type arguments
+                preserveNestedGenericsRecursive(ref);
+            } catch (Throwable ignored) {}
+        }
+    }
+    
+    /**
+     * Recursively preserve nested generic type arguments in a type reference.
+     */
+    private void preserveNestedGenericsRecursive(CtTypeReference<?> ref) {
+        if (ref == null) return;
+        
+        try {
+            List<CtTypeReference<?>> typeArgs = ref.getActualTypeArguments();
+            if (typeArgs == null || typeArgs.isEmpty()) return;
+            
+            // For each type argument, recursively preserve its nested arguments
+            for (CtTypeReference<?> arg : typeArgs) {
+                // Recursively process nested type arguments
+                preserveNestedGenericsRecursive(arg);
+                
+                // If this argument is a generic type we created, ensure it has type parameters
+                String argQn = safeQN(arg);
+                if (argQn != null && !isJdkFqn(argQn)) {
+                    CtType<?> argType = f.Type().get(argQn);
+                    if (argType != null && createdTypes.contains(argQn)) {
+                        // Check if this type needs type parameters
+                        List<CtTypeReference<?>> argTypeArgs = arg.getActualTypeArguments();
+                        if (argTypeArgs != null && !argTypeArgs.isEmpty()) {
+                            // Ensure the type has type parameters
+                            if (argType instanceof CtFormalTypeDeclarer) {
+                                CtFormalTypeDeclarer declarer = (CtFormalTypeDeclarer) argType;
+                                List<CtTypeParameter> existing = declarer.getFormalCtTypeParameters();
+                                int neededArity = argTypeArgs.size();
+                                if (existing == null || existing.size() < neededArity) {
+                                    // Add missing type parameters
+                                    String[] defaultNames = {"T", "R", "U", "V", "W", "X", "Y", "Z"};
+                                    for (int i = existing == null ? 0 : existing.size(); i < neededArity; i++) {
+                                        String name = i < defaultNames.length ? defaultNames[i] : "T" + i;
+                                        CtTypeParameter tp = f.Core().createTypeParameter();
+                                        tp.setSimpleName(name);
+                                        declarer.addFormalCtTypeParameter(tp);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
     }
 
 
@@ -2298,13 +2372,16 @@ public final class SpoonStubber {
             CtClass<?> cls = (CtClass<?>) type;
             if (cls.getSuperInterfaces().isEmpty()) continue;
             
-            // Collect all abstract methods from all superinterfaces
+            // Collect all currently implemented methods
             Set<String> implementedMethods = new HashSet<>();
             for (CtMethod<?> m : cls.getMethods()) {
                 implementedMethods.add(methodSignature(m));
             }
             
-            // For each superinterface, add missing abstract methods
+            // FIRST: Collect ALL abstract methods from ALL interfaces
+            // Use LinkedHashMap to preserve order and handle conflicts (first interface wins)
+            Map<String, MethodInfo> allAbstractMethods = new LinkedHashMap<>();
+            
             for (CtTypeReference<?> superIface : cls.getSuperInterfaces()) {
                 try {
                     CtType<?> ifaceType = superIface.getTypeDeclaration();
@@ -2313,32 +2390,110 @@ public final class SpoonStubber {
                     CtInterface<?> iface = (CtInterface<?>) ifaceType;
                     for (CtMethod<?> ifaceMethod : iface.getMethods()) {
                         // Only add abstract methods that aren't already implemented
-                        // Check if it's abstract, not static, and doesn't have a body (not default)
                         boolean hasBody = ifaceMethod.getBody() != null;
                         if (ifaceMethod.isAbstract() && !hasBody && !ifaceMethod.isStatic()) {
                             String sig = methodSignature(ifaceMethod);
-                            if (!implementedMethods.contains(sig)) {
-                                // Clone the method and add it to the class
-                                CtMethod<?> impl = cloneMethodForImplementation(ifaceMethod, cls);
-                                cls.addMethod(impl);
-                                implementedMethods.add(sig);
-                                createdMethods.add(cls.getQualifiedName() + "#" + sig);
+                            // Only add if not already present (handles conflicts - first interface wins)
+                            if (!allAbstractMethods.containsKey(sig) && !implementedMethods.contains(sig)) {
+                                allAbstractMethods.put(sig, new MethodInfo(ifaceMethod, superIface));
                             }
                         }
                     }
                 } catch (Throwable ignored) {}
             }
+            
+            // SECOND: Implement all collected abstract methods
+            for (Map.Entry<String, MethodInfo> entry : allAbstractMethods.entrySet()) {
+                String sig = entry.getKey();
+                MethodInfo methodInfo = entry.getValue();
+                
+                            if (!implementedMethods.contains(sig)) {
+                    try {
+                                // Clone the method and add it to the class
+                        CtMethod<?> impl = cloneMethodForImplementation(
+                            methodInfo.method, cls, methodInfo.interfaceRef);
+                                cls.addMethod(impl);
+                                implementedMethods.add(sig);
+                                createdMethods.add(cls.getQualifiedName() + "#" + sig);
+                    } catch (Throwable e) {
+                        // Ignore individual method failures, continue with others
+                    }
+                }
+            }
+        }
+            }
+    
+    /**
+     * Helper class to store method and interface reference together.
+     */
+    private static class MethodInfo {
+        final CtMethod<?> method;
+        final CtTypeReference<?> interfaceRef;
+        
+        MethodInfo(CtMethod<?> method, CtTypeReference<?> interfaceRef) {
+            this.method = method;
+            this.interfaceRef = interfaceRef;
         }
     }
 
     /**
      * Clone an interface method for implementation in a class.
+     * Substitutes type parameters with actual type arguments from the superinterface.
      */
-    private CtMethod<?> cloneMethodForImplementation(CtMethod<?> ifaceMethod, CtClass<?> targetClass) {
+    private CtMethod<?> cloneMethodForImplementation(CtMethod<?> ifaceMethod, CtClass<?> targetClass, 
+                                                     CtTypeReference<?> superIfaceRef) {
         CtMethod<?> impl = f.Core().clone(ifaceMethod);
         impl.setParent(targetClass);
         impl.removeModifier(ModifierKind.ABSTRACT);
-        impl.removeModifier(ModifierKind.PUBLIC); // Will be added by default
+        // Keep PUBLIC modifier if present, or add it if interface method is public
+        if (ifaceMethod.hasModifier(ModifierKind.PUBLIC)) {
+            impl.addModifier(ModifierKind.PUBLIC);
+        } else {
+            // Interface methods are public by default in Java, so make it public
+            impl.addModifier(ModifierKind.PUBLIC);
+        }
+        
+        // Substitute type parameters with actual type arguments
+        // Get the interface type declaration to find type parameters
+        CtType<?> ifaceType = superIfaceRef.getTypeDeclaration();
+        if (ifaceType instanceof CtFormalTypeDeclarer) {
+            CtFormalTypeDeclarer formalTypeDeclarer = (CtFormalTypeDeclarer) ifaceType;
+            List<CtTypeParameter> typeParams = formalTypeDeclarer.getFormalCtTypeParameters();
+            List<CtTypeReference<?>> actualTypeArgs = superIfaceRef.getActualTypeArguments();
+            
+            // Create a map from type parameter names to actual type arguments
+            Map<String, CtTypeReference<?>> typeParamMap = new HashMap<>();
+            if (typeParams != null && actualTypeArgs != null) {
+                int minSize = Math.min(typeParams.size(), actualTypeArgs.size());
+                for (int i = 0; i < minSize; i++) {
+                    CtTypeParameter param = typeParams.get(i);
+                    if (param != null) {
+                        String paramName = param.getSimpleName();
+                        if (paramName != null) {
+                            typeParamMap.put(paramName, actualTypeArgs.get(i));
+                        }
+                    }
+                }
+            }
+            
+            // Substitute type parameters in return type
+            if (!typeParamMap.isEmpty()) {
+                CtTypeReference<?> returnType = impl.getType();
+                if (returnType != null) {
+                    CtTypeReference<?> substitutedReturnType = substituteTypeParameters(returnType, typeParamMap);
+                    impl.setType(substitutedReturnType);
+                }
+                
+                // Substitute type parameters in parameter types
+                for (CtParameter<?> param : impl.getParameters()) {
+                    CtTypeReference<?> paramType = param.getType();
+                    if (paramType != null) {
+                        CtTypeReference<?> substitutedParamType = substituteTypeParameters(paramType, typeParamMap);
+                        param.setType(substitutedParamType);
+                    }
+                }
+            }
+        }
         
         // Add a default body
         CtBlock<?> body = f.Core().createBlock();
@@ -2354,6 +2509,44 @@ public final class SpoonStubber {
         impl.setBody(body);
         
         return impl;
+    }
+    
+    /**
+     * Substitute type parameters in a type reference with actual type arguments.
+     */
+    private CtTypeReference<?> substituteTypeParameters(CtTypeReference<?> typeRef, 
+                                                         Map<String, CtTypeReference<?>> typeParamMap) {
+        if (typeRef == null || typeParamMap.isEmpty()) return typeRef;
+        
+        try {
+            String simpleName = typeRef.getSimpleName();
+            if (simpleName != null && typeParamMap.containsKey(simpleName)) {
+                // This is a type parameter - substitute it
+                CtTypeReference<?> actualType = typeParamMap.get(simpleName);
+                if (actualType != null) {
+                    return actualType.clone();
+                }
+            }
+            
+            // Check if this type has type arguments that need substitution
+            List<CtTypeReference<?>> typeArgs = typeRef.getActualTypeArguments();
+            if (typeArgs != null && !typeArgs.isEmpty()) {
+                // Clone the type reference and substitute type arguments recursively
+                CtTypeReference<?> substituted = typeRef.clone();
+                substituted.getActualTypeArguments().clear();
+                for (CtTypeReference<?> arg : typeArgs) {
+                    CtTypeReference<?> substitutedArg = substituteTypeParameters(arg, typeParamMap);
+                    substituted.addActualTypeArgument(substitutedArg != null ? substitutedArg : arg);
+                }
+                return substituted;
+            }
+            
+            // No substitution needed, return as-is
+            return typeRef;
+        } catch (Throwable e) {
+            // If substitution fails, return original
+            return typeRef;
+        }
     }
 
     /**
@@ -2404,12 +2597,20 @@ public final class SpoonStubber {
     /**
      * Detect and fix builder pattern issues.
      * Creates Builder classes and ensures builder() methods return Builder instances.
+     * Handles complex builder patterns: AbstractBuilder<T>, checkOrigin(), setters, etc.
      */
     public void fixBuilderPattern() {
+        // First pass: Find builder() methods and create basic Builder classes
+        // Also find existing Builder classes in the model
+        Set<String> existingBuilderQns = new HashSet<>();
         for (CtType<?> type : model.getAllTypes()) {
             if (!(type instanceof CtClass)) continue;
             
             CtClass<?> cls = (CtClass<?>) type;
+            String clsQn = safeQN(cls.getReference());
+            if (clsQn != null && clsQn.contains("Builder") && clsQn.contains("$")) {
+                existingBuilderQns.add(clsQn);
+            }
             
             // Look for builder() methods
             for (CtMethod<?> method : cls.getMethods()) {
@@ -2432,8 +2633,82 @@ public final class SpoonStubber {
                     builderQn = ownerQn + "$Builder";
                 }
                 
+                // Only create Builder if it doesn't already exist
+                if (!existingBuilderQns.contains(builderQn)) {
                 // Ensure Builder class exists
                 ensureBuilderClass(cls, builderQn);
+                } else {
+                    // Builder exists - just ensure it's not public
+                    CtType<?> existingBuilder = f.Type().get(builderQn);
+                    if (existingBuilder instanceof CtClass) {
+                        CtClass<?> existingBuilderClass = (CtClass<?>) existingBuilder;
+                        if (existingBuilderClass.hasModifier(ModifierKind.PUBLIC)) {
+                            existingBuilderClass.removeModifier(ModifierKind.PUBLIC);
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Second pass: Detect and add builder methods from usage (checkOrigin, setters, etc.)
+        detectAndAddBuilderMethods();
+        
+        // Third pass: Fix return types for existing builder methods (checkOrigin should return File, not void)
+        fixBuilderMethodReturnTypes();
+        
+        // Fourth pass: Handle AbstractBuilder<T> inheritance
+        handleAbstractBuilderInheritance();
+    }
+    
+    /**
+     * Fix return types for existing builder methods that were created with wrong return types.
+     */
+    private void fixBuilderMethodReturnTypes() {
+        for (CtType<?> type : model.getAllTypes()) {
+            if (!(type instanceof CtClass)) continue;
+            
+            CtClass<?> cls = (CtClass<?>) type;
+            String clsQn = safeQN(cls.getReference());
+            if (clsQn == null || !clsQn.contains("Builder")) continue;
+            
+            // Check all methods in this Builder class
+            for (CtMethod<?> method : cls.getMethods()) {
+                String methodName = method.getSimpleName();
+                if (methodName == null || !methodName.startsWith("checkOrigin")) continue;
+                
+                // Get expected return type
+                CtTypeReference<?> expectedReturnType = inferBuilderMethodReturnType(cls, methodName);
+                if (expectedReturnType == null) continue;
+                
+                // Check current return type
+                CtTypeReference<?> currentReturnType = method.getType();
+                if (currentReturnType == null) continue;
+                
+                String currentReturnQn = safeQN(currentReturnType);
+                String expectedReturnQn = safeQN(expectedReturnType);
+                
+                // If return type is void but should be File (or other type), fix it
+                if (currentReturnQn != null && expectedReturnQn != null &&
+                    !currentReturnQn.equals(expectedReturnQn) &&
+                    (currentReturnQn.equals("void") || currentReturnQn.contains("void"))) {
+                    // Fix return type
+                    method.setType(expectedReturnType);
+                    
+                    // Fix body to return a default value
+                    CtBlock<?> body = method.getBody();
+                    if (body == null) {
+                        body = f.Core().createBlock();
+                        method.setBody(body);
+                    }
+                    body.getStatements().clear();
+                    if (!expectedReturnType.equals(f.Type().VOID_PRIMITIVE)) {
+                        CtReturn<?> ret = f.Core().createReturn();
+                        @SuppressWarnings({"unchecked", "rawtypes"})
+                        CtExpression defaultValue = (CtExpression) createDefaultValue(expectedReturnType);
+                        ret.setReturnedExpression(defaultValue);
+                        body.addStatement(ret);
+                    }
+                }
             }
         }
     }
@@ -2442,9 +2717,34 @@ public final class SpoonStubber {
      * Ensure a Builder class exists for the given owner class.
      */
     private void ensureBuilderClass(CtClass<?> owner, String builderQn) {
-        // Check if Builder already exists
+        // First check if owner already has a nested Builder class
+        for (CtType<?> nestedType : owner.getNestedTypes()) {
+            if (nestedType instanceof CtClass) {
+                CtClass<?> nestedClass = (CtClass<?>) nestedType;
+                String nestedQn = safeQN(nestedClass.getReference());
+                if (nestedQn != null && nestedQn.equals(builderQn)) {
+                    // Builder already exists as nested class - don't create duplicate
+                    if (nestedClass.hasModifier(ModifierKind.PUBLIC)) {
+                        nestedClass.removeModifier(ModifierKind.PUBLIC);
+                    }
+                    return;
+                }
+            }
+        }
+        
+        // Check if Builder already exists in the model
         CtType<?> existing = f.Type().get(builderQn);
         if (existing != null && existing instanceof CtClass) {
+            // Builder already exists - ensure it's not public (to avoid file naming issues)
+            CtClass<?> existingBuilder = (CtClass<?>) existing;
+            if (existingBuilder.hasModifier(ModifierKind.PUBLIC)) {
+                existingBuilder.removeModifier(ModifierKind.PUBLIC);
+            }
+            // Check if it's already nested in owner
+            CtType<?> declaringType = existingBuilder.getDeclaringType();
+            if (declaringType != null && declaringType.equals(owner)) {
+                return; // Already nested in owner
+            }
             return; // Already exists
         }
         
@@ -2454,7 +2754,9 @@ public final class SpoonStubber {
             : "Builder";
         
         CtClass<?> builder = f.Class().create(owner, builderSimple);
-        builder.addModifier(ModifierKind.PUBLIC);
+        // Don't make Builder public - nested classes should not be public to avoid file naming issues
+        // Java requires public nested classes to be in separate files, which causes compilation errors
+        // builder.addModifier(ModifierKind.PUBLIC);
         builder.addModifier(ModifierKind.STATIC);
         
         // Add get() method that returns the owner type
@@ -2478,6 +2780,625 @@ public final class SpoonStubber {
         getMethod.setBody(getBody);
         
         createdTypes.add(builderQn);
+    }
+    
+    /**
+     * Detect builder method calls (checkOrigin, setPathCounters, setObservers, etc.)
+     * and add them to Builder classes.
+     */
+    private void detectAndAddBuilderMethods() {
+        // Find all method invocations that might be builder methods
+        for (CtInvocation<?> inv : model.getElements(new TypeFilter<>(CtInvocation.class))) {
+            CtExecutableReference<?> ex = inv.getExecutable();
+            if (ex == null) continue;
+            
+            String methodName = ex.getSimpleName();
+            if (methodName == null) continue;
+            
+            // Skip if this is not a builder method pattern
+            if (!isBuilderMethodPattern(methodName)) continue;
+            
+            // Check if this is a builder method call
+            CtExpression<?> target = inv.getTarget();
+            
+            CtTypeReference<?> targetType = null;
+            if (target != null) {
+                try {
+                    targetType = target.getType();
+                } catch (Throwable ignored) {}
+            }
+            
+            // If target is null or type is null, try to infer from method chain
+            // In method chains like builder().checkOriginFile(), the target of checkOriginFile()
+            // is the result of builder(), so we need to look at the parent invocation
+            if (targetType == null) {
+                CtElement parent = inv.getParent();
+                while (parent != null) {
+                    if (parent instanceof CtInvocation<?>) {
+                        CtInvocation<?> parentInv = (CtInvocation<?>) parent;
+                        CtExecutableReference<?> parentEx = parentInv.getExecutable();
+                        if (parentEx != null) {
+                            // Check if parent is builder() method
+                            if ("builder".equals(parentEx.getSimpleName())) {
+                                // This is chained after builder() - infer Builder type
+                                CtTypeReference<?> builderReturnType = parentEx.getType();
+                                if (builderReturnType != null) {
+                                    targetType = builderReturnType;
+                                    break;
+                                }
+                            }
+                            // Also check if parent invocation returns a Builder
+                            CtTypeReference<?> parentReturnType = parentEx.getType();
+                            if (parentReturnType != null) {
+                                String parentReturnQn = safeQN(parentReturnType);
+                                if (parentReturnQn != null && parentReturnQn.contains("Builder")) {
+                                    targetType = parentReturnType;
+                                    break;
+                                }
+                            }
+                        }
+                    } else if (parent instanceof CtVariableRead<?>) {
+                        // If target is a variable, check its type
+                        CtVariableRead<?> varRead = (CtVariableRead<?>) parent;
+                        try {
+                            CtTypeReference<?> varType = varRead.getType();
+                            if (varType != null) {
+                                String varTypeQn = safeQN(varType);
+                                if (varTypeQn != null && varTypeQn.contains("Builder")) {
+                                    targetType = varType;
+                                    break;
+                                }
+                            }
+                        } catch (Throwable ignored) {}
+                    }
+                    parent = parent.getParent();
+                }
+            }
+            
+            // Also check if target is itself an invocation that returns Builder
+            if (targetType == null && target instanceof CtInvocation<?>) {
+                CtInvocation<?> targetInv = (CtInvocation<?>) target;
+                CtExecutableReference<?> targetEx = targetInv.getExecutable();
+                if (targetEx != null) {
+                    // Check if this is a builder() method call
+                    if ("builder".equals(targetEx.getSimpleName())) {
+                        // This is builder() - get its return type
+                        CtTypeReference<?> targetReturnType = targetEx.getType();
+                        if (targetReturnType != null) {
+                            String targetReturnQn = safeQN(targetReturnType);
+                            if (targetReturnQn != null && targetReturnQn.contains("Builder")) {
+                                targetType = targetReturnType;
+                            } else {
+                                // Try to find the actual method declaration
+                                try {
+                                    CtExecutable<?> targetExec = targetEx.getExecutableDeclaration();
+                                    if (targetExec instanceof CtMethod) {
+                                        CtMethod<?> targetMethod = (CtMethod<?>) targetExec;
+                                        CtTypeReference<?> methodReturnType = targetMethod.getType();
+                                        if (methodReturnType != null) {
+                                            String methodReturnQn = safeQN(methodReturnType);
+                                            if (methodReturnQn != null && methodReturnQn.contains("Builder")) {
+                                                targetType = methodReturnType;
+                                            }
+                                        }
+                                    }
+                                } catch (Throwable ignored) {}
+                            }
+                        } else {
+                            // Return type is null - try to find the actual method declaration
+                            try {
+                                CtExecutable<?> targetExec = targetEx.getExecutableDeclaration();
+                                if (targetExec instanceof CtMethod) {
+                                    CtMethod<?> targetMethod = (CtMethod<?>) targetExec;
+                                    CtTypeReference<?> methodReturnType = targetMethod.getType();
+                                    if (methodReturnType != null) {
+                                        String methodReturnQn = safeQN(methodReturnType);
+                                        if (methodReturnQn != null && methodReturnQn.contains("Builder")) {
+                                            targetType = methodReturnType;
+                                        }
+                                    }
+                                }
+                            } catch (Throwable ignored) {}
+                        }
+                    } else {
+                        // Not builder(), but check if it returns a Builder
+                        CtTypeReference<?> targetReturnType = targetEx.getType();
+                        if (targetReturnType != null) {
+                            String targetReturnQn = safeQN(targetReturnType);
+                            if (targetReturnQn != null && targetReturnQn.contains("Builder")) {
+                                targetType = targetReturnType;
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // If still null, try to find Builder from owner class
+            if (targetType == null) {
+                // Look for builder() method in the same class or parent classes
+                CtElement owner = inv.getParent(CtType.class);
+                if (owner instanceof CtClass) {
+                    CtClass<?> ownerClass = (CtClass<?>) owner;
+                    for (CtMethod<?> method : ownerClass.getMethods()) {
+                        if ("builder".equals(method.getSimpleName()) && method.getParameters().isEmpty()) {
+                            CtTypeReference<?> builderReturnType = method.getType();
+                            if (builderReturnType != null) {
+                                String builderReturnQn = safeQN(builderReturnType);
+                                if (builderReturnQn != null && builderReturnQn.contains("Builder")) {
+                                    targetType = builderReturnType;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // If still null and target is an invocation, try to get type from the method's return type
+            if (targetType == null && target instanceof CtInvocation<?>) {
+                CtInvocation<?> targetInv = (CtInvocation<?>) target;
+                CtExecutableReference<?> targetEx = targetInv.getExecutable();
+                if (targetEx != null) {
+                    try {
+                        CtTypeReference<?> targetReturnType = targetEx.getType();
+                        if (targetReturnType != null) {
+                            String targetReturnQn = safeQN(targetReturnType);
+                            // If it's a Builder type, use it
+                            if (targetReturnQn != null && targetReturnQn.contains("Builder")) {
+                                targetType = targetReturnType;
+                            }
+                        }
+                    } catch (Throwable ignored) {}
+                }
+            }
+            
+            // Final fallback: if method name matches builder pattern, try to find Builder from owner class
+            if (targetType == null) {
+                CtElement owner = inv.getParent(CtType.class);
+                if (owner instanceof CtClass) {
+                    CtClass<?> ownerClass = (CtClass<?>) owner;
+                    // Look for nested Builder class
+                    for (CtType<?> nested : ownerClass.getNestedTypes()) {
+                        if (nested instanceof CtClass) {
+                            String nestedName = nested.getSimpleName();
+                            if (nestedName != null && nestedName.contains("Builder")) {
+                                targetType = nested.getReference();
+                                break;
+                            }
+                        }
+                    }
+                    // If not found, look for builder() method return type
+                    if (targetType == null) {
+                        for (CtMethod<?> method : ownerClass.getMethods()) {
+                            if ("builder".equals(method.getSimpleName()) && method.getParameters().isEmpty()) {
+                                CtTypeReference<?> builderReturnType = method.getType();
+                                if (builderReturnType != null) {
+                                    String builderReturnQn = safeQN(builderReturnType);
+                                    if (builderReturnQn != null && builderReturnQn.contains("Builder")) {
+                                        targetType = builderReturnType;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // If still null after all fallbacks, skip this invocation
+            if (targetType == null) continue;
+            
+            String targetQn = safeQN(targetType);
+            if (targetQn == null || !targetQn.contains("Builder")) continue;
+            
+            // This is a call on a Builder - find or create the Builder class
+            CtType<?> builderType = f.Type().get(targetQn);
+            if (builderType == null || !(builderType instanceof CtClass)) {
+                // Builder doesn't exist yet - try to find it by simple name
+                // Extract owner class from Builder name (e.g., ComplexBuilderTest$Builder -> ComplexBuilderTest)
+                if (targetQn.contains("$")) {
+                    String ownerQn = targetQn.substring(0, targetQn.lastIndexOf('$'));
+                    CtType<?> ownerType = f.Type().get(ownerQn);
+                    if (ownerType instanceof CtClass) {
+                        // Ensure Builder exists
+                        ensureBuilderClass((CtClass<?>) ownerType, targetQn);
+                        builderType = f.Type().get(targetQn);
+                    }
+                } else {
+                    // Not a nested class - try to find Builder in the owner class
+                    CtElement owner = inv.getParent(CtType.class);
+                    if (owner instanceof CtClass) {
+                        CtClass<?> ownerClass = (CtClass<?>) owner;
+                        // Look for nested Builder class
+                        for (CtType<?> nested : ownerClass.getNestedTypes()) {
+                            if (nested instanceof CtClass) {
+                                String nestedName = nested.getSimpleName();
+                                if (nestedName != null && nestedName.contains("Builder")) {
+                                    builderType = nested;
+                                    break;
+                                }
+                            }
+                        }
+                        // If still not found, create it
+                        if (builderType == null) {
+                            String ownerQn = safeQN(ownerClass.getReference());
+                            if (ownerQn != null) {
+                                String builderQn = ownerQn + "$Builder";
+                                ensureBuilderClass(ownerClass, builderQn);
+                                builderType = f.Type().get(builderQn);
+                            }
+                        }
+                    }
+                }
+                if (builderType == null || !(builderType instanceof CtClass)) continue;
+            }
+            
+            CtClass<?> builder = (CtClass<?>) builderType;
+            
+            // Check if method already exists
+            List<CtTypeReference<?>> paramTypes = inferParameterTypes(inv);
+            boolean methodExists = hasMethod(builder, methodName, paramTypes);
+            
+            if (methodExists) {
+                // Method exists - check if return type is correct for checkOrigin methods
+                if (methodName.startsWith("checkOrigin")) {
+                    // Find the existing method and fix its return type if it's void
+                    for (CtMethod<?> existingMethod : builder.getMethods()) {
+                        if (existingMethod.getSimpleName().equals(methodName) &&
+                            existingMethod.getParameters().size() == paramTypes.size()) {
+                            CtTypeReference<?> existingReturnType = existingMethod.getType();
+                            CtTypeReference<?> expectedReturnType = inferBuilderMethodReturnType(builder, methodName);
+                            if (existingReturnType != null && expectedReturnType != null) {
+                                String existingReturnQn = safeQN(existingReturnType);
+                                String expectedReturnQn = safeQN(expectedReturnType);
+                                if (existingReturnQn != null && expectedReturnQn != null && 
+                                    !existingReturnQn.equals(expectedReturnQn) &&
+                                    (existingReturnQn.equals("void") || existingReturnQn.contains("void"))) {
+                                    // Fix return type
+                                    existingMethod.setType(expectedReturnType);
+                                    // Also fix body if needed
+                                    if (existingMethod.getBody() != null && !expectedReturnType.equals(f.Type().VOID_PRIMITIVE)) {
+                                        CtBlock<?> body = existingMethod.getBody();
+                                        body.getStatements().clear();
+                                        CtReturn<?> ret = f.Core().createReturn();
+                                        @SuppressWarnings({"unchecked", "rawtypes"})
+                                        CtExpression defaultValue = (CtExpression) createDefaultValue(expectedReturnType);
+                                        ret.setReturnedExpression(defaultValue);
+                                        body.addStatement(ret);
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+                continue; // Already exists (or fixed)
+            }
+            
+            // Add the builder method
+            addBuilderMethod(builder, methodName, inv);
+        }
+    }
+    
+    /**
+     * Check if a method name matches builder method patterns.
+     */
+    private boolean isBuilderMethodPattern(String methodName) {
+        return methodName.startsWith("checkOrigin") || 
+               methodName.startsWith("set") || 
+               methodName.startsWith("with") ||
+               methodName.startsWith("add") ||
+               methodName.equals("get");
+    }
+    
+    /**
+     * Add a builder method based on usage pattern.
+     */
+    private void addBuilderMethod(CtClass<?> builder, String methodName, CtInvocation<?> usage) {
+        try {
+            // Infer return type based on method name pattern
+            CtTypeReference<?> returnType = inferBuilderMethodReturnType(builder, methodName);
+            
+            // Infer parameter types from usage
+            List<CtTypeReference<?>> paramTypes = inferParameterTypes(usage);
+            
+            // Create the method
+            Set<ModifierKind> mods = new HashSet<>();
+            mods.add(ModifierKind.PUBLIC);
+            
+            CtMethod<?> method = f.Method().create(
+                builder,
+                mods,
+                returnType,
+                methodName,
+                makeParams(paramTypes),
+                Collections.emptySet()
+            );
+            
+            // Add body for fluent methods (return this) or validation methods
+            CtBlock<?> body = f.Core().createBlock();
+            if (isFluentMethod(methodName) || methodName.startsWith("with")) {
+                // Fluent method: return this;
+                CtReturn<?> ret = f.Core().createReturn();
+                @SuppressWarnings({"unchecked", "rawtypes"})
+                CtExpression thisAccess = (CtExpression) f.Code().createThisAccess(builder.getReference());
+                ret.setReturnedExpression(thisAccess);
+                body.addStatement(ret);
+            } else if (methodName.startsWith("checkOrigin")) {
+                // Validation method: return inferred type (usually File, byte[], etc.)
+                CtReturn<?> ret = f.Core().createReturn();
+                @SuppressWarnings({"unchecked", "rawtypes"})
+                CtExpression defaultValue = (CtExpression) createDefaultValue(returnType);
+                ret.setReturnedExpression(defaultValue);
+                body.addStatement(ret);
+            }
+            // For set* methods, can be void or fluent - default to fluent
+            else if (methodName.startsWith("set")) {
+                CtReturn<?> ret = f.Core().createReturn();
+                @SuppressWarnings({"unchecked", "rawtypes"})
+                CtExpression thisAccess = (CtExpression) f.Code().createThisAccess(builder.getReference());
+                ret.setReturnedExpression(thisAccess);
+                body.addStatement(ret);
+            }
+            
+            method.setBody(body);
+        } catch (Throwable e) {
+            // Ignore failures
+        }
+    }
+    
+    /**
+     * Infer return type for a builder method.
+     */
+    private CtTypeReference<?> inferBuilderMethodReturnType(CtClass<?> builder, String methodName) {
+        // Fluent methods return Builder
+        if (isFluentMethod(methodName) || methodName.startsWith("set") || methodName.startsWith("with")) {
+            return builder.getReference();
+        }
+        
+        // checkOrigin methods return various types based on name
+        if (methodName.startsWith("checkOrigin")) {
+            if (methodName.contains("File")) {
+                return f.Type().createReference("java.io.File");
+            } else if (methodName.contains("ByteArray") || methodName.contains("Bytes")) {
+                return f.Type().createArrayReference(f.Type().BYTE_PRIMITIVE);
+            } else if (methodName.contains("Path")) {
+                return f.Type().createReference("java.nio.file.Path");
+            } else {
+                return f.Type().OBJECT;
+            }
+        }
+        
+        // Default: return Object
+        return f.Type().OBJECT;
+    }
+    
+    /**
+     * Check if a method name indicates a fluent method.
+     */
+    private boolean isFluentMethod(String methodName) {
+        return methodName.startsWith("set") || methodName.startsWith("with") || 
+               methodName.startsWith("add") || methodName.startsWith("put");
+    }
+    
+    /**
+     * Infer parameter types from an invocation.
+     */
+    private List<CtTypeReference<?>> inferParameterTypes(CtInvocation<?> inv) {
+        List<CtTypeReference<?>> paramTypes = new ArrayList<>();
+        for (CtExpression<?> arg : inv.getArguments()) {
+            try {
+                // Check if argument is null literal
+                if (arg instanceof CtLiteral) {
+                    CtLiteral<?> literal = (CtLiteral<?>) arg;
+                    if (literal.getValue() == null) {
+                        // Null argument - use Object as default type
+                        paramTypes.add(f.Type().OBJECT);
+                        continue;
+                    }
+                }
+                
+                CtTypeReference<?> argType = arg.getType();
+                if (argType != null && !argType.equals(f.Type().NULL_TYPE)) {
+                    paramTypes.add(argType);
+                } else {
+                    // Unknown or null type - use Object
+                    paramTypes.add(f.Type().OBJECT);
+                }
+            } catch (Throwable e) {
+                paramTypes.add(f.Type().OBJECT);
+            }
+        }
+        return paramTypes;
+    }
+    
+    /**
+     * Handle AbstractBuilder<T> inheritance for Builder classes.
+     */
+    private void handleAbstractBuilderInheritance() {
+        // Find all Builder classes
+        for (CtType<?> type : model.getAllTypes()) {
+            if (!(type instanceof CtClass)) continue;
+            
+            CtClass<?> cls = (CtClass<?>) type;
+            String clsQn = safeQN(cls.getReference());
+            if (clsQn == null || !clsQn.contains("Builder")) continue;
+            
+            // Check if Builder already extends AbstractBuilder
+            CtTypeReference<?> superclass = cls.getSuperclass();
+            if (superclass != null) {
+                String superQn = safeQN(superclass);
+                if (superQn != null && superQn.contains("AbstractBuilder")) {
+                    // Builder already extends AbstractBuilder - ensure it exists
+                    ensureAbstractBuilderExists(superQn, cls);
+                    continue;
+                }
+            }
+            
+            // Check if this Builder should extend AbstractBuilder
+            // Look for AbstractBuilder references in the model
+            String abstractBuilderQn = findAbstractBuilderForBuilder(cls);
+            if (abstractBuilderQn != null) {
+                // Ensure AbstractBuilder exists
+                ensureAbstractBuilderExists(abstractBuilderQn, cls);
+                
+                // Make Builder extend AbstractBuilder
+                CtTypeReference<?> abstractBuilderRef = f.Type().createReference(abstractBuilderQn);
+                // Add type argument if owner has type parameters
+                CtType<?> owner = cls.getDeclaringType();
+                if (owner instanceof CtFormalTypeDeclarer) {
+                    CtFormalTypeDeclarer formal = (CtFormalTypeDeclarer) owner;
+                    List<CtTypeParameter> typeParams = formal.getFormalCtTypeParameters();
+                    if (typeParams != null && !typeParams.isEmpty()) {
+                        // Use first type parameter as argument to AbstractBuilder
+                        CtTypeReference<?> typeParamRef = f.Type().createReference(typeParams.get(0).getSimpleName());
+                        abstractBuilderRef.addActualTypeArgument(typeParamRef);
+                    } else {
+                        // Use owner type as argument
+                        abstractBuilderRef.addActualTypeArgument(owner.getReference());
+                    }
+                } else if (owner != null) {
+                    // Use owner type as argument
+                    abstractBuilderRef.addActualTypeArgument(owner.getReference());
+                }
+                cls.setSuperclass(abstractBuilderRef);
+            }
+        }
+    }
+    
+    /**
+     * Find AbstractBuilder FQN for a Builder class.
+     */
+    private String findAbstractBuilderForBuilder(CtClass<?> builder) {
+        // First, check if Builder already has a superclass that is AbstractBuilder
+        CtTypeReference<?> superclass = builder.getSuperclass();
+        if (superclass != null) {
+            String superQn = safeQN(superclass);
+            if (superQn != null && superQn.contains("AbstractBuilder")) {
+                return superQn;
+            }
+        }
+        
+        // Check package of builder - AbstractBuilder is usually in same package
+        String builderQn = safeQN(builder.getReference());
+        if (builderQn == null) return null;
+        
+        int lastDot = builderQn.lastIndexOf('.');
+        if (lastDot < 0) {
+            // No package - check if there's a reference to AbstractBuilder in same package as owner
+            CtType<?> owner = builder.getDeclaringType();
+            if (owner != null) {
+                String ownerQn = safeQN(owner.getReference());
+                if (ownerQn != null) {
+                    int ownerLastDot = ownerQn.lastIndexOf('.');
+                    if (ownerLastDot >= 0) {
+                        String ownerPackage = ownerQn.substring(0, ownerLastDot);
+                        String candidate = ownerPackage + ".AbstractBuilder";
+                        CtType<?> existing = f.Type().get(candidate);
+                        if (existing != null) {
+                            return candidate;
+                        }
+                    }
+                }
+            }
+            return null;
+        }
+        
+        String packageName = builderQn.substring(0, lastDot);
+        
+        // Common patterns: package.input.AbstractBuilder, package.file.AbstractBuilder
+        String[] commonPackages = {
+            packageName + ".AbstractBuilder",
+            packageName.replace(".input", "") + ".input.AbstractBuilder",
+            packageName.replace(".file", "") + ".file.AbstractBuilder"
+        };
+        
+        for (String candidate : commonPackages) {
+            CtType<?> existing = f.Type().get(candidate);
+            if (existing != null) {
+                return candidate;
+            }
+        }
+        
+        // Check if AbstractBuilder is referenced in the model (from source code)
+        for (CtTypeReference<?> ref : model.getElements(new TypeFilter<>(CtTypeReference.class))) {
+            String refQn = safeQN(ref);
+            if (refQn != null && refQn.contains("AbstractBuilder")) {
+                // Extract the FQN without type arguments
+                String baseQn = refQn;
+                int typeArgStart = baseQn.indexOf('<');
+                if (typeArgStart > 0) {
+                    baseQn = baseQn.substring(0, typeArgStart);
+                }
+                return baseQn;
+            }
+        }
+        
+        return null;
+    }
+    
+    /**
+     * Ensure AbstractBuilder<T> class exists.
+     */
+    private void ensureAbstractBuilderExists(String abstractBuilderQn, CtClass<?> builder) {
+        CtType<?> existing = f.Type().get(abstractBuilderQn);
+        if (existing != null) {
+            // Check if it's already abstract and has type parameters
+            if (existing instanceof CtClass) {
+                CtClass<?> cls = (CtClass<?>) existing;
+                // Ensure it's abstract
+                if (!cls.hasModifier(ModifierKind.ABSTRACT)) {
+                    cls.addModifier(ModifierKind.ABSTRACT);
+                }
+                // CRITICAL: Ensure superclass is Object, not itself (avoid cycles)
+                CtTypeReference<?> superclass = cls.getSuperclass();
+                String superQn = superclass != null ? safeQN(superclass) : null;
+                if (superQn != null && superQn.equals(abstractBuilderQn)) {
+                    // AbstractBuilder is extending itself - fix it!
+                    cls.setSuperclass(f.Type().OBJECT);
+                } else if (superclass == null || superclass.equals(f.Type().OBJECT)) {
+                    // Good - no superclass or just Object
+                } else {
+                    // Has a superclass that's not Object - check if it's a cycle
+                    if (superQn != null && superQn.contains("AbstractBuilder")) {
+                        // Might be a cycle - set to Object
+                        cls.setSuperclass(f.Type().OBJECT);
+                    }
+                }
+                // Ensure it has type parameter <T>
+                if (cls instanceof CtFormalTypeDeclarer) {
+                    CtFormalTypeDeclarer formal = (CtFormalTypeDeclarer) cls;
+                    List<CtTypeParameter> typeParams = formal.getFormalCtTypeParameters();
+                    if (typeParams == null || typeParams.isEmpty()) {
+                        CtTypeParameter typeParam = f.Core().createTypeParameter();
+                        typeParam.setSimpleName("T");
+                        formal.addFormalCtTypeParameter(typeParam);
+                    }
+                }
+            }
+            return; // Already exists
+        }
+        
+        // Create AbstractBuilder as a generic class
+        int lastDot = abstractBuilderQn.lastIndexOf('.');
+        String packageName = lastDot >= 0 ? abstractBuilderQn.substring(0, lastDot) : "";
+        String className = lastDot >= 0 ? abstractBuilderQn.substring(lastDot + 1) : abstractBuilderQn;
+        
+        CtPackage pkg = f.Package().getOrCreate(packageName);
+        CtClass<?> abstractBuilder = f.Class().create(pkg, className);
+        abstractBuilder.addModifier(ModifierKind.PUBLIC);
+        abstractBuilder.addModifier(ModifierKind.ABSTRACT);
+        
+        // CRITICAL: Set superclass to Object FIRST to avoid any cycles
+        // Never let AbstractBuilder extend itself
+        abstractBuilder.setSuperclass(f.Type().OBJECT);
+        
+        // Add type parameter <T>
+        CtTypeParameter typeParam = f.Core().createTypeParameter();
+        typeParam.setSimpleName("T");
+        abstractBuilder.addFormalCtTypeParameter(typeParam);
+        
+        createdTypes.add(abstractBuilderQn);
     }
 
     /* ======================================================================
@@ -2666,17 +3587,28 @@ public final class SpoonStubber {
                 
                 if (toListMethod == null) continue;
                 
-                // Check if it already returns Unknown (either unknown.Unknown or just Unknown)
+                // Check if it already returns Unknown or Object (needs to be fixed to Collector)
                 CtTypeReference<?> currentReturnType = toListMethod.getType();
                 if (currentReturnType == null) continue;
                 
                 String currentReturnQn = safeQN(currentReturnType);
                 String currentReturnSimple = currentReturnType.getSimpleName();
-                // Only fix if it returns Unknown (either qualified or simple name)
-                if (currentReturnQn == null || 
-                    (!currentReturnQn.startsWith("unknown.") && !"Unknown".equals(currentReturnSimple))) {
-                    continue;
+                // Fix if it returns Unknown, Object, or is not already a Collector
+                boolean needsFix = false;
+                if (currentReturnQn != null) {
+                    if (currentReturnQn.startsWith("unknown.") || "Unknown".equals(currentReturnSimple)) {
+                        needsFix = true;
+                    } else if ("java.lang.Object".equals(currentReturnQn) || "Object".equals(currentReturnSimple)) {
+                        needsFix = true;
+                    } else if (!currentReturnQn.startsWith("java.util.stream.Collector")) {
+                        // Not a Collector type - needs fix
+                        needsFix = true;
+                    }
+                } else {
+                    needsFix = true;
                 }
+                
+                if (!needsFix) continue;
                 
                 // Infer the return type from context
                 // 1. Get the Stream element type from the collect() invocation
