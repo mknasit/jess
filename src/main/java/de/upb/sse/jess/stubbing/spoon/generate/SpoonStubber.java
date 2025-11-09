@@ -2574,6 +2574,189 @@ public final class SpoonStubber {
             addStreamMethodIfMissing(iface, "spliterator", f.Type().createReference("java.util.Spliterator"), Collections.emptyList());
             addStreamMethodIfMissing(iface, "unordered", iface.getReference(), Collections.emptyList());
         }
+        
+        // Fix collector method return types
+        fixCollectorMethodReturnTypes();
+    }
+    
+    /**
+     * Fix collector method return types (e.g., IntListCollector.toList() should return Collector<Integer, ?, IntList>).
+     */
+    private void fixCollectorMethodReturnTypes() {
+        // Find all collect() invocations
+        for (CtInvocation<?> inv : model.getElements(new TypeFilter<>(CtInvocation.class))) {
+            CtExecutableReference<?> ex = inv.getExecutable();
+            if (ex == null || !"collect".equals(ex.getSimpleName())) continue;
+            
+            // Get the collector argument
+            List<CtExpression<?>> args = inv.getArguments();
+            if (args == null || args.isEmpty()) continue;
+            
+            CtExpression<?> collectorArg = args.get(0);
+            if (!(collectorArg instanceof CtInvocation<?>)) continue;
+            
+            CtInvocation<?> collectorInv = (CtInvocation<?>) collectorArg;
+            CtExecutableReference<?> collectorEx = collectorInv.getExecutable();
+            if (collectorEx == null) continue;
+            
+            String collectorMethodName = collectorEx.getSimpleName();
+            if (!"toList".equals(collectorMethodName) && !"toCollection".equals(collectorMethodName) && 
+                !"toSet".equals(collectorMethodName)) continue;
+            
+            // Get the collector class (e.g., IntListCollector)
+            // For static methods, target might be CtTypeAccess
+            CtExpression<?> collectorTarget = collectorInv.getTarget();
+            CtTypeReference<?> collectorClassType = null;
+            
+            // First, try to get from the executable's declaring type (most reliable for static methods)
+            try {
+                CtTypeReference<?> declaringType = collectorEx.getDeclaringType();
+                if (declaringType != null) {
+                    collectorClassType = declaringType;
+                    String qn = safeQN(collectorClassType);
+                    // If we only got simple name, try to get qualified name
+                    if (qn != null && !qn.contains(".")) {
+                        // Try to find the type in the model by simple name
+                        for (CtType<?> type : model.getAllTypes()) {
+                            if (qn.equals(type.getSimpleName())) {
+                                collectorClassType = type.getReference();
+                                break;
+                            }
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {}
+            
+            // If that didn't work, try from target (for instance methods)
+            if (collectorClassType == null && collectorTarget != null) {
+                try {
+                    // For CtTypeAccess (static method calls), get the accessed type directly
+                    if (collectorTarget instanceof spoon.reflect.code.CtTypeAccess<?>) {
+                        spoon.reflect.code.CtTypeAccess<?> typeAccess = (spoon.reflect.code.CtTypeAccess<?>) collectorTarget;
+                        collectorClassType = typeAccess.getAccessedType();
+                    } else {
+                        CtTypeReference<?> targetType = collectorTarget.getType();
+                        // Only use if it's not void
+                        if (targetType != null && !targetType.equals(f.Type().VOID_PRIMITIVE)) {
+                            collectorClassType = targetType;
+                        }
+                    }
+                } catch (Throwable ignored) {}
+            }
+            
+            if (collectorClassType == null) continue;
+            
+            try {
+                String collectorClassQn = safeQN(collectorClassType);
+                if (collectorClassQn == null || collectorClassQn.startsWith("java.") || 
+                    collectorClassQn.startsWith("javax.") || collectorClassQn.startsWith("jakarta.")) continue;
+                
+                // Find the collector class
+                CtType<?> collectorClass = f.Type().get(collectorClassQn);
+                if (collectorClass == null) continue;
+                
+                // Find the toList() method
+                CtMethod<?> toListMethod = null;
+                for (CtMethod<?> method : collectorClass.getMethods()) {
+                    if (collectorMethodName.equals(method.getSimpleName()) && method.getParameters().isEmpty()) {
+                        toListMethod = method;
+                        break;
+                    }
+                }
+                
+                if (toListMethod == null) continue;
+                
+                // Check if it already returns Unknown (either unknown.Unknown or just Unknown)
+                CtTypeReference<?> currentReturnType = toListMethod.getType();
+                if (currentReturnType == null) continue;
+                
+                String currentReturnQn = safeQN(currentReturnType);
+                String currentReturnSimple = currentReturnType.getSimpleName();
+                // Only fix if it returns Unknown (either qualified or simple name)
+                if (currentReturnQn == null || 
+                    (!currentReturnQn.startsWith("unknown.") && !"Unknown".equals(currentReturnSimple))) {
+                    continue;
+                }
+                
+                // Infer the return type from context
+                // 1. Get the Stream element type from the collect() invocation
+                CtTypeReference<?> streamElementType = null;
+                try {
+                    CtExpression<?> streamTarget = inv.getTarget();
+                    if (streamTarget != null) {
+                        CtTypeReference<?> streamType = streamTarget.getType();
+                        if (streamType != null) {
+                            List<CtTypeReference<?>> streamTypeArgs = streamType.getActualTypeArguments();
+                            if (streamTypeArgs != null && !streamTypeArgs.isEmpty()) {
+                                streamElementType = streamTypeArgs.get(0);
+                            }
+                        }
+                    }
+                } catch (Throwable ignored) {}
+                
+                if (streamElementType == null) {
+                    streamElementType = f.Type().OBJECT;
+                }
+                
+                // 2. Infer the result type from collector class name (e.g., IntListCollector -> IntList)
+                String collectorSimpleName = collectorClassType.getSimpleName();
+                CtTypeReference<?> resultType = null;
+                if (collectorSimpleName != null && collectorSimpleName.endsWith("Collector")) {
+                    String resultTypeName = collectorSimpleName.substring(0, collectorSimpleName.length() - 9);
+                    String resultTypeQn = collectorClassType.getPackage() != null ?
+                        collectorClassType.getPackage().getQualifiedName() + "." + resultTypeName :
+                        resultTypeName;
+                    
+                    try {
+                        CtType<?> resultTypeDecl = f.Type().get(resultTypeQn);
+                        if (resultTypeDecl != null) {
+                            resultType = resultTypeDecl.getReference();
+                        } else {
+                            resultType = f.Type().createReference(resultTypeQn);
+                        }
+                    } catch (Throwable ignored) {}
+                }
+                
+                if (resultType == null) {
+                    // Fallback: try to infer from parent method return type
+                    CtElement parent = inv.getParent();
+                    while (parent != null) {
+                        if (parent instanceof CtMethod<?>) {
+                            CtMethod<?> method = (CtMethod<?>) parent;
+                            try {
+                                CtTypeReference<?> methodReturnType = method.getType();
+                                if (methodReturnType != null) {
+                                    String methodReturnQn = safeQN(methodReturnType);
+                                    if (methodReturnQn != null && !methodReturnQn.startsWith("java.") && 
+                                        !methodReturnQn.startsWith("javax.") && !methodReturnQn.startsWith("jakarta.")) {
+                                        resultType = methodReturnType;
+                                        break;
+                                    }
+                                }
+                            } catch (Throwable ignored) {}
+                        }
+                        parent = parent.getParent();
+                    }
+                }
+                
+                if (resultType == null) {
+                    // Last fallback: use List<T>
+                    resultType = f.Type().createReference("java.util.List");
+                    resultType.addActualTypeArgument(streamElementType);
+                }
+                
+                // Create Collector<T, ?, R> return type
+                CtTypeReference<?> collectorType = f.Type().createReference("java.util.stream.Collector");
+                collectorType.addActualTypeArgument(streamElementType.clone());
+                collectorType.addActualTypeArgument(f.Type().OBJECT); // A (accumulator) - use Object
+                collectorType.addActualTypeArgument(resultType.clone()); // R (result)
+                
+                // Update the method return type
+                toListMethod.setType(collectorType);
+            } catch (Throwable e) {
+                // Ignore errors
+            }
+        }
     }
 
     /**

@@ -4544,9 +4544,85 @@ public final class SpoonCollector {
     private CtTypeReference<?> inferCollectionElementType(CtTypeReference<?> collectionType) {
         if (collectionType == null) return null;
         try {
+            // First, check if it has generic type arguments
             List<CtTypeReference<?>> typeArgs = collectionType.getActualTypeArguments();
             if (typeArgs != null && !typeArgs.isEmpty()) {
                 return typeArgs.get(0);
+            }
+            
+            // If no generic args, try to infer from type name
+            // Common patterns: StringList -> String, IntList -> Integer/int, ItemList -> Item, etc.
+            String simpleName = collectionType.getSimpleName();
+            if (simpleName != null) {
+                // Check for common type name patterns
+                if (simpleName.endsWith("List") || simpleName.endsWith("Collection") || 
+                    simpleName.endsWith("Set") || simpleName.endsWith("Queue")) {
+                    String elementName = simpleName.substring(0, simpleName.length() - 
+                        (simpleName.endsWith("List") ? 4 : 
+                         simpleName.endsWith("Collection") ? 10 :
+                         simpleName.endsWith("Queue") ? 5 : 3));
+                    
+                    if (!elementName.isEmpty()) {
+                        // Try to find the element type in the model
+                        // First check if it's a primitive wrapper
+                        if ("Int".equals(elementName) || "Integer".equals(elementName)) {
+                            return f.Type().INTEGER_PRIMITIVE;
+                        } else if ("Long".equals(elementName)) {
+                            return f.Type().LONG_PRIMITIVE;
+                        } else if ("Double".equals(elementName)) {
+                            return f.Type().DOUBLE_PRIMITIVE;
+                        } else if ("Float".equals(elementName)) {
+                            return f.Type().FLOAT_PRIMITIVE;
+                        } else if ("Boolean".equals(elementName)) {
+                            return f.Type().BOOLEAN_PRIMITIVE;
+                        } else if ("Char".equals(elementName) || "Character".equals(elementName)) {
+                            return f.Type().CHARACTER_PRIMITIVE;
+                        } else if ("Byte".equals(elementName)) {
+                            return f.Type().BYTE_PRIMITIVE;
+                        } else if ("Short".equals(elementName)) {
+                            return f.Type().SHORT_PRIMITIVE;
+                        } else {
+                            // Try to find the type in the model
+                            // First, try same package as collection
+                            String collectionPkg = collectionType.getPackage() != null ? 
+                                collectionType.getPackage().getQualifiedName() : "";
+                            String elementQn = collectionPkg.isEmpty() ? elementName : collectionPkg + "." + elementName;
+                            
+                            // Check if the element type exists in the model (same package first)
+                            CtType<?> elementType = f.Type().get(elementQn);
+                            if (elementType != null) {
+                                return elementType.getReference();
+                            }
+                            
+                            // Try to find by simple name in the model (any package)
+                            CtModel model = f.getModel();
+                            if (model != null) {
+                                for (CtType<?> type : model.getAllTypes()) {
+                                    if (elementName.equals(type.getSimpleName())) {
+                                        return type.getReference();
+                                    }
+                                }
+                            }
+                            
+                            // Try java.lang. only for common types
+                            if ("String".equals(elementName) || "Object".equals(elementName) || 
+                                "Integer".equals(elementName) || "Long".equals(elementName) ||
+                                "Double".equals(elementName) || "Float".equals(elementName) ||
+                                "Boolean".equals(elementName) || "Character".equals(elementName) ||
+                                "Byte".equals(elementName) || "Short".equals(elementName)) {
+                                try {
+                                    CtTypeReference<?> ref = f.Type().createReference("java.lang." + elementName);
+                                    if (ref != null) {
+                                        return ref;
+                                    }
+                                } catch (Throwable ignored) {}
+                            }
+                            
+                            // If type not found, return null (will default to Object in caller)
+                            return null;
+                        }
+                    }
+                }
             }
         } catch (Throwable ignored) {}
         return null;
@@ -4659,7 +4735,84 @@ public final class SpoonCollector {
      * Infer return type for collect() from context.
      */
     private CtTypeReference<?> inferCollectReturnType(CtInvocation<?> inv, CtTypeReference<?> elementType) {
-        // Usually collect() returns List<T> or Collection<T>
+        // Try to infer from context:
+        // 1. Check if collect() is used in a method - use the method's return type
+        // 2. Check the collector argument (e.g., IntListCollector.toList() -> IntList)
+        // 3. Fallback to List<T>
+        
+        // First, try to get return type from parent method
+        CtElement parent = inv.getParent();
+        while (parent != null) {
+            if (parent instanceof CtMethod<?>) {
+                CtMethod<?> method = (CtMethod<?>) parent;
+                try {
+                    CtTypeReference<?> returnType = method.getType();
+                    if (returnType != null && !isJdkType(returnType)) {
+                        // Check if it's a collection type that matches the element type
+                        String returnQn = safeQN(returnType);
+                        if (returnQn != null && (returnQn.contains("List") || returnQn.contains("Collection") || 
+                            returnQn.contains("Set"))) {
+                            return returnType;
+                        }
+                    }
+                } catch (Throwable ignored) {}
+            }
+            parent = parent.getParent();
+        }
+        
+        // Second, try to infer from collector argument (e.g., IntListCollector.toList())
+        List<CtExpression<?>> args = inv.getArguments();
+        if (args != null && !args.isEmpty()) {
+            CtExpression<?> collectorArg = args.get(0);
+            if (collectorArg instanceof CtInvocation<?>) {
+                CtInvocation<?> collectorInv = (CtInvocation<?>) collectorArg;
+                CtExecutableReference<?> collectorEx = collectorInv.getExecutable();
+                if (collectorEx != null) {
+                    String methodName = collectorEx.getSimpleName();
+                    if ("toList".equals(methodName) || "toCollection".equals(methodName) || 
+                        "toSet".equals(methodName)) {
+                        // Try to infer from the collector class name
+                        CtExpression<?> collectorTarget = collectorInv.getTarget();
+                        if (collectorTarget != null) {
+                            try {
+                                CtTypeReference<?> collectorClassType = collectorTarget.getType();
+                                if (collectorClassType != null) {
+                                    String collectorClassQn = safeQN(collectorClassType);
+                                    // For static method calls like IntListCollector.toList(),
+                                    // the target type is the class itself
+                                    if (collectorClassQn != null && !isJdkType(collectorClassType)) {
+                                        // Try to infer return type from collector class name
+                                        // e.g., IntListCollector -> IntList
+                                        String simpleName = collectorClassType.getSimpleName();
+                                        if (simpleName != null && simpleName.endsWith("Collector")) {
+                                            String returnTypeName = simpleName.substring(0, simpleName.length() - 9);
+                                            // Try to find the return type
+                                            String returnTypeQn = collectorClassType.getPackage() != null ?
+                                                collectorClassType.getPackage().getQualifiedName() + "." + returnTypeName :
+                                                returnTypeName;
+                                            
+                                            try {
+                                                CtType<?> returnType = f.Type().get(returnTypeQn);
+                                                if (returnType != null) {
+                                                    return returnType.getReference();
+                                                }
+                                                // Try creating a reference
+                                                CtTypeReference<?> ref = f.Type().createReference(returnTypeQn);
+                                                if (ref != null) {
+                                                    return ref;
+                                                }
+                                            } catch (Throwable ignored) {}
+                                        }
+                                    }
+                                }
+                            } catch (Throwable ignored) {}
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Fallback: Usually collect() returns List<T>
         CtTypeReference<?> listType = f.Type().createReference("java.util.List");
         listType.addActualTypeArgument(elementType);
         return listType;
