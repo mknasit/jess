@@ -82,8 +82,8 @@ public class StubGenerator {
         if (typeDec instanceof ClassOrInterfaceDeclaration) {
             ClassOrInterfaceDeclaration ciDec = (ClassOrInterfaceDeclaration) typeDec;
 
-            addFields(typeDec, stubClass.getFieldTypes());
-            addMethods(typeDec, stubClass.getMethodTypes());
+            addFields(genCu, typeDec, stubClass.getFieldTypes(), packageName);
+            addMethods(genCu, typeDec, stubClass.getMethodTypes(), packageName);
 
             if (!existingTypeDec) {
                 addTypeParameters(ciDec, stubClass.getTypeParameters());
@@ -122,26 +122,27 @@ public class StubGenerator {
         }
     }
 
-    private void addFields(TypeDeclaration<?> typeDec, Set<FieldType> fields) {
+    private void addFields(CompilationUnit cu, TypeDeclaration<?> typeDec, Set<FieldType> fields, String currentPackage) {
         for (FieldType field : fields) {
             if (typeDec.getFieldByName(field.getName()).isPresent()) continue;
 
             Modifier.Keyword visibility = field.getVisibility() == Visibility.PROTECTED ? Modifier.Keyword.PROTECTED : Modifier.Keyword.PUBLIC;
             // TODO: generate placeholder type if unknown
             String fieldType = field.getType() == null ? UnknownType.CLASS : field.getType().getType();
-            FieldDeclaration fieldDec = typeDec.addField(fieldType.replace("java.lang.", ""), field.getName(), visibility);
+            String simpleTypeName = getSimpleTypeNameAndAddImport(cu, fieldType, currentPackage);
+            FieldDeclaration fieldDec = typeDec.addField(simpleTypeName, field.getName(), visibility);
             fieldDec.setStatic(field.isStaticField());
             stubbingStats.incrementStubbedFields();
         }
     }
 
-    private void addMethods(TypeDeclaration<?> typeDec, Set<MethodType> methods) {
+    private void addMethods(CompilationUnit cu, TypeDeclaration<?> typeDec, Set<MethodType> methods, String currentPackage) {
         for (MethodType method : methods) {
             if (methodAlreadyExists(typeDec, method)) continue;
 
             // handle constructors
             if (method.isConstructor()) {
-                addConstructor(typeDec, method);
+                addConstructor(cu, typeDec, method, currentPackage);
                 continue;
             }
 
@@ -160,14 +161,21 @@ public class StubGenerator {
                     break;
                 }
                 String parameterName = "arg" + i;
-                methodDec.addParameter(parameterTypeContext.getType().replace("java.lang.", ""), parameterName);
+                String parameterType = parameterTypeContext.getType();
+                String simpleTypeName = getSimpleTypeNameAndAddImport(cu, parameterType, currentPackage);
+                methodDec.addParameter(simpleTypeName, parameterName);
             }
 
             if (nullParameter) continue;
 
             // set return type
             String methodReturnType = method.getReturnType() == null ? "void" : method.getReturnType().getType();
-            methodDec.setType(methodReturnType);
+            if (!methodReturnType.equals("void")) {
+                String simpleReturnType = getSimpleTypeNameAndAddImport(cu, methodReturnType, currentPackage);
+                methodDec.setType(simpleReturnType);
+            } else {
+                methodDec.setType("void");
+            }
             if (methodReturnType.equals("void")) continue;
 
             // add generic return statement if method has a non-void return type
@@ -181,7 +189,7 @@ public class StubGenerator {
         }
     }
 
-    private void addConstructor(TypeDeclaration<?> typeDec, MethodType constructor) {
+    private void addConstructor(CompilationUnit cu, TypeDeclaration<?> typeDec, MethodType constructor, String currentPackage) {
         if (constructorAlreadyExists(typeDec, constructor)) return;
         ConstructorDeclaration constDec = typeDec.addConstructor(Modifier.Keyword.PUBLIC);
         stubbingStats.incrementStubbedConstructors();
@@ -194,7 +202,8 @@ public class StubGenerator {
                 return;
             }
             String parameterName = "arg" + i;
-            constDec.addParameter(parameterType.replace("java.lang.", ""), parameterName);
+            String simpleTypeName = getSimpleTypeNameAndAddImport(cu, parameterType, currentPackage);
+            constDec.addParameter(simpleTypeName, parameterName);
         }
     }
 
@@ -277,6 +286,55 @@ public class StubGenerator {
                 .toArray(String[]::new);
         Optional<ConstructorDeclaration> constructorBySignature = typeDec.getConstructorByParameterTypes(parameters);
         return constructorBySignature.isPresent();
+    }
+
+    /**
+     * Extracts the simple name from a type string (which may be FQN like "unknown.Unknown")
+     * and adds an import if the type is from a different package.
+     * 
+     * @param cu The compilation unit to add imports to
+     * @param typeName The type name (may be FQN or simple name)
+     * @param currentPackage The package of the current class
+     * @return The simple type name to use in the code
+     */
+    private String getSimpleTypeNameAndAddImport(CompilationUnit cu, String typeName, String currentPackage) {
+        if (typeName == null || typeName.isEmpty()) {
+            return typeName;
+        }
+
+        // Handle generic types (e.g., "List<String>")
+        int genericStart = typeName.indexOf('<');
+        String baseType = genericStart > 0 ? typeName.substring(0, genericStart) : typeName;
+        String genericPart = genericStart > 0 ? typeName.substring(genericStart) : "";
+
+        // Remove java.lang. prefix (these don't need imports)
+        if (baseType.startsWith("java.lang.")) {
+            return baseType.substring("java.lang.".length()) + genericPart;
+        }
+
+        // Check if it's a fully qualified name (contains a dot)
+        int lastDot = baseType.lastIndexOf('.');
+        if (lastDot > 0) {
+            String packageName = baseType.substring(0, lastDot);
+            String simpleName = baseType.substring(lastDot + 1);
+
+            // Only add import if it's from a different package
+            if (!packageName.equals(currentPackage)) {
+                String fqn = baseType;
+                // Check if import already exists
+                Set<String> existingImports = cu.getImports().stream()
+                        .map(NodeWithName::getNameAsString)
+                        .collect(Collectors.toSet());
+                
+                if (!existingImports.contains(fqn)) {
+                    cu.addImport(fqn);
+                }
+            }
+            return simpleName + genericPart;
+        }
+
+        // It's already a simple name, return as is
+        return typeName;
     }
 
 }
