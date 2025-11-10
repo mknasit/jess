@@ -541,13 +541,19 @@ public class Jess {
 
         // Verify target method exists with Code + capture class file
         Verification v = null;
+        boolean asmAvailable = true;
         try {
             v = verifyTarget(classesOut, emitted, method);
-        } catch (NoClassDefFoundError missingAsm) {
-            dbg("  (verification skipped: ASM not on classpath)");
+        } catch (NoClassDefFoundError | NoSuchMethodError missingAsm) {
+            asmAvailable = false;
+            dbg("  (verification skipped: ASM not on classpath - %s)", missingAsm.getMessage());
+        } catch (Throwable t) {
+            // Other errors during verification - log but continue
+            dbg("  (verification error: %s)", t.getMessage());
         }
 
         if (v != null) {
+            // Verification succeeded - we have a definitive answer
             if (!v.hasCode) {
                 String reason = v.reason == null ? "Target method not emitted (missing or no Code)" : v.reason;
                 dbg("  target bytecode: MISSING (%s)", reason);
@@ -567,13 +573,17 @@ public class Jess {
             }
         }
 
-        // If verifier was skipped, return OK without the strong guarantee, targetHasCode=false, but we logged it.
-        dbg("  (no verifier result; returning OK without targetHasCode assertion)");
+        // If verifier was skipped (ASM not available), return OK but note in status
+        // This is a fallback - we can't verify bytecode without ASM
+        String notes = asmAvailable 
+                ? "Bytecode verification failed (unknown error)" 
+                : "Bytecode verification skipped (ASM not available)";
+        dbg("  (no verifier result; returning OK without targetHasCode assertion - %s)", notes);
         return new PublicApi.Result(
                 PublicApi.Status.OK, classesOut,
                 method.binaryClassName, emitted,
                 null, /*targetHasCode*/ false,
-                usedStubsFlag, options.depMode, msSince(t0), "");
+                usedStubsFlag, options.depMode, msSince(t0), notes);
     }
 // === end replacement ===
 

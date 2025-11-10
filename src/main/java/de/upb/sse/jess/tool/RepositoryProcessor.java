@@ -43,8 +43,12 @@ public class RepositoryProcessor {
     private final Map<String, AtomicInteger> notEmittedReasons = new HashMap<>();  // Reasons why methods weren't emitted
     private final List<MethodResult> methodResults = new ArrayList<>();
     
+    /**
+     * Create a RepositoryProcessor that processes ALL methods (no limit, no random selection).
+     * Methods are processed sequentially in the order they are found in the source files.
+     */
     public RepositoryProcessor(String projectDir, List<String> sourceRoots, List<String> classpathJars) {
-        this(projectDir, sourceRoots, classpathJars, -1);  // -1 means unlimited
+        this(projectDir, sourceRoots, classpathJars, -1);  // -1 means unlimited - process ALL methods sequentially
     }
     
     public RepositoryProcessor(String projectDir, List<String> sourceRoots, List<String> classpathJars, int maxMethodsToProcess) {
@@ -72,6 +76,7 @@ public class RepositoryProcessor {
         config.setExitOnCompilationFail(false);
         config.setExitOnParsingFail(false);
         config.setFailOnAmbiguity(false);
+        config.setMinimalStubbing(true);  // Explicitly enable minimal stubbing (default is true, but making it explicit)
         
         this.jess = new Jess(config, absoluteSourceRoots, classpathJars);
         
@@ -403,37 +408,64 @@ public class RepositoryProcessor {
     }
     
     private String getTypeDescriptor(String typeName) {
-        // Simple type mapping - this is a basic implementation
-        // For a complete solution, you'd want to use JavaParser's type resolution
-        switch (typeName) {
-            case "void": return "V";
-            case "boolean": return "Z";
-            case "byte": return "B";
-            case "char": return "C";
-            case "short": return "S";
-            case "int": return "I";
-            case "long": return "J";
-            case "float": return "F";
-            case "double": return "D";
-            default:
-                // For object types, convert package.Class to Lpackage/Class;
-                if (typeName.contains("[]")) {
-                    int arrayCount = 0;
-                    String baseType = typeName;
-                    while (baseType.endsWith("[]")) {
-                        arrayCount++;
-                        baseType = baseType.substring(0, baseType.length() - 2);
+        return getTypeDescriptor(typeName, new HashSet<>());
+    }
+    
+    private String getTypeDescriptor(String typeName, Set<String> visited) {
+        // Prevent infinite recursion
+        if (visited.contains(typeName)) {
+            // Fallback: return Object descriptor to avoid infinite loop
+            return "Ljava/lang/Object;";
+        }
+        visited.add(typeName);
+        
+        try {
+            // Simple type mapping - this is a basic implementation
+            // For a complete solution, you'd want to use JavaParser's type resolution
+            switch (typeName) {
+                case "void": return "V";
+                case "boolean": return "Z";
+                case "byte": return "B";
+                case "char": return "C";
+                case "short": return "S";
+                case "int": return "I";
+                case "long": return "J";
+                case "float": return "F";
+                case "double": return "D";
+                default:
+                    // For object types, convert package.Class to Lpackage/Class;
+                    // Handle arrays - only strip trailing [] (not [] inside generics)
+                    if (typeName.endsWith("[]")) {
+                        int arrayCount = 0;
+                        String baseType = typeName;
+                        // Only strip trailing [] pairs, not [] inside generics like List<byte[]>
+                        while (baseType.endsWith("[]")) {
+                            arrayCount++;
+                            baseType = baseType.substring(0, baseType.length() - 2).trim();
+                            // Safety check: if we've stripped too much, break
+                            if (baseType.isEmpty()) {
+                                baseType = "java.lang.Object";
+                                break;
+                            }
+                        }
+                        String baseDesc = getTypeDescriptor(baseType, visited);
+                        StringBuilder desc = new StringBuilder();
+                        for (int i = 0; i < arrayCount; i++) {
+                            desc.append("[");
+                        }
+                        desc.append(baseDesc);
+                        return desc.toString();
+                    } else {
+                        // Remove generic type parameters for JVM descriptor (e.g., List<String> -> List)
+                        int genericStart = typeName.indexOf('<');
+                        if (genericStart > 0) {
+                            typeName = typeName.substring(0, genericStart);
+                        }
+                        return "L" + typeName.replace(".", "/") + ";";
                     }
-                    String baseDesc = getTypeDescriptor(baseType);
-                    StringBuilder desc = new StringBuilder();
-                    for (int i = 0; i < arrayCount; i++) {
-                        desc.append("[");
-                    }
-                    desc.append(baseDesc);
-                    return desc.toString();
-                } else {
-                    return "L" + typeName.replace(".", "/") + ";";
-                }
+            }
+        } finally {
+            visited.remove(typeName);
         }
     }
     

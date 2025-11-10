@@ -14,6 +14,8 @@ public class JessConfiguration {
     private boolean keepAsteriskImports = true;
     private boolean failOnAmbiguity = true;
     private boolean disableStubbing = false;
+    private boolean minimalStubbing = false; // Default to minimal stubbing mode
+    private boolean includeJdkStubs = false; // Default to false - JDK types are available from JRE, stubs cause conflicts
     public enum StubberKind { JESS, SPOON }
 
     private StubberKind stubberKind = StubberKind.SPOON ;

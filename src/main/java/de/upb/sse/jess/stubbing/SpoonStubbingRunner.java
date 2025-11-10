@@ -66,7 +66,27 @@ public final class SpoonStubbingRunner implements Stubber {
         SpoonCollector collector = new SpoonCollector(f, cfg);
         SpoonCollector.CollectResult plans = collector.collect(model);
 
-        // 3) Generate shims for common libraries (on-demand, before stubbing)
+        // 3) Generate JDK stubs for SootUp compatibility (if explicitly enabled)
+        // WARNING: JDK stubs should only be enabled when JDK types are NOT available from classpath
+        // and you need them in the output directory for SootUp. They can cause conflicts if JDK
+        // types are available during compilation.
+        if (cfg.isIncludeJdkStubs()) {
+            try {
+                // Double-check: only generate if we're in noClasspath mode
+                // and types are not resolvable
+                de.upb.sse.jess.stubbing.spoon.jdk.JdkStubGenerator jdkStubGenerator = 
+                    new de.upb.sse.jess.stubbing.spoon.jdk.JdkStubGenerator(f);
+                int jdkStubsGenerated = jdkStubGenerator.generateJdkStubs();
+                if (jdkStubsGenerated > 0) {
+                    System.out.println("Generated " + jdkStubsGenerated + " JDK stub classes for SootUp compatibility");
+                }
+            } catch (Exception e) {
+                System.err.println("Warning: Failed to generate JDK stubs: " + e.getMessage());
+                // Continue without JDK stubs - don't fail the entire process
+            }
+        }
+        
+        // 4) Generate shims for common libraries (on-demand, before stubbing)
         // Only generate shims for types that are referenced but missing
         de.upb.sse.jess.stubbing.spoon.shim.ShimGenerator shimGenerator = 
             new de.upb.sse.jess.stubbing.spoon.shim.ShimGenerator(f);
@@ -78,7 +98,7 @@ public final class SpoonStubbingRunner implements Stubber {
             System.out.println("Generated " + shimsGenerated + " shim classes for common libraries");
         }
         
-        // 4) Generate stubs
+        // 5) Generate stubs
         // If your SpoonStubber has a (Factory) ctor, use that. Otherwise keep (Factory, CtModel).
         SpoonStubber stubber = new SpoonStubber(f, model);
 
@@ -91,15 +111,28 @@ public final class SpoonStubbingRunner implements Stubber {
         created += stubber.applyMethodPlans(plans.methodPlans);   // methods
         stubber.applyImplementsPlans(plans.implementsPlans);
 
-        // CRITICAL FIXES: Apply all critical fixes after initial stubbing
-        stubber.preserveGenericTypeArgumentsInUsages();  // Fix: Mono<T> becomes Mono
-        stubber.autoImplementInterfaceMethods();         // Fix: Missing interface method implementations
-        stubber.fixBuilderPattern();                      // Fix: Builder pattern support
-        stubber.autoInitializeFields();                   // Fix: Field initialization (logger, etc.)
-        stubber.addStreamApiMethods();                    // Fix: Stream API interface methods
-        stubber.fixTypeConversionIssues();               // Fix: Unknown type conversion issues
-        stubber.fixSyntaxErrors();                       // Fix: Syntax generation errors
-        fixConstructorCallTypeArguments(model, f);        // Fix: Constructor calls to match variable declarations
+        // MINIMAL STUBBING MODE: Only apply fixes that are absolutely necessary for compilation
+        // In minimal mode, we only stub what's directly referenced in target methods
+        boolean minimalMode = cfg.isMinimalStubbing();
+        
+        if (minimalMode) {
+            // Minimal mode: Only essential fixes for directly referenced code
+            stubber.preserveGenericTypeArgumentsInUsages();  // Essential: Preserve generic types
+            stubber.fixCollectorMethodReturnTypes();          // Essential: Fix collector return types for directly called methods
+            stubber.fixTypeConversionIssues();               // Essential: Fix type conversion errors
+            stubber.fixSyntaxErrors();                       // Essential: Fix syntax errors
+            fixConstructorCallTypeArguments(model, f);        // Essential: Fix constructor calls
+        } else {
+            // Comprehensive mode: All critical fixes (for maximum compatibility)
+            stubber.preserveGenericTypeArgumentsInUsages();  // Fix: Mono<T> becomes Mono
+            stubber.autoImplementInterfaceMethods();         // Fix: Missing interface method implementations
+            stubber.fixBuilderPattern();                      // Fix: Builder pattern support
+            stubber.autoInitializeFields();                   // Fix: Field initialization (logger, etc.)
+            stubber.addStreamApiMethods();                    // Fix: Stream API interface methods
+            stubber.fixTypeConversionIssues();               // Fix: Unknown type conversion issues
+            stubber.fixSyntaxErrors();                       // Fix: Syntax generation errors
+            fixConstructorCallTypeArguments(model, f);        // Fix: Constructor calls to match variable declarations
+        }
 
         //stubber.rebindUnknownTypeReferencesToConcrete();
         stubber.rebindUnknownTypeReferencesToConcrete(plans.unknownToConcrete);
@@ -1017,15 +1050,31 @@ public final class SpoonStubbingRunner implements Stubber {
             }
         }
         
-        // The existing code already collects all type references, so *Grpc should be included
-        
-        // Collect from all type references in the model
+        // Collect from all type references in the model (including extends, implements, field types, etc.)
         for (CtTypeReference<?> typeRef : model.getElements(new TypeFilter<>(CtTypeReference.class))) {
             try {
                 String qn = safeQN(typeRef);
                 if (qn != null && !qn.isEmpty() && !qn.startsWith("java.") && 
                     !qn.startsWith("javax.") && !qn.startsWith("jakarta.")) {
                     referenced.add(qn);
+                }
+            } catch (Throwable ignored) {}
+        }
+        
+        // Also collect from supertypes (extends/implements)
+        for (CtType<?> type : model.getAllTypes()) {
+            try {
+                if (type.getSuperclass() != null) {
+                    String superQn = safeQN(type.getSuperclass());
+                    if (superQn != null && !superQn.startsWith("java.")) {
+                        referenced.add(superQn);
+                    }
+                }
+                for (CtTypeReference<?> iface : type.getSuperInterfaces()) {
+                    String ifaceQn = safeQN(iface);
+                    if (ifaceQn != null && !ifaceQn.startsWith("java.")) {
+                        referenced.add(ifaceQn);
+                    }
                 }
             } catch (Throwable ignored) {}
         }

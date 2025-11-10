@@ -108,9 +108,12 @@ public class ShimGenerator {
         addShim("io.grpc", "CallOptions", createClassShim("io.grpc.CallOptions",
             Arrays.asList("withDeadline", "withWaitForReady", "withCompression")));
         
-        // Protocol Buffers shims
+        // Protocol Buffers shims (standard package)
         addShim("com.google.protobuf", "GeneratedMessageLite", 
             createClassShim("com.google.protobuf.GeneratedMessageLite",
+                Arrays.asList("parseFrom", "toByteArray", "getSerializedSize")));
+        addShim("com.google.protobuf", "GeneratedMessage", 
+            createClassShim("com.google.protobuf.GeneratedMessage",
                 Arrays.asList("parseFrom", "toByteArray", "getSerializedSize")));
         addShim("com.google.protobuf", "Message", 
             createInterfaceShim("com.google.protobuf.Message",
@@ -118,9 +121,41 @@ public class ShimGenerator {
         addShim("com.google.protobuf", "MessageLite", 
             createInterfaceShim("com.google.protobuf.MessageLite",
                 Arrays.asList("toByteArray", "getSerializedSize")));
+        addShim("com.google.protobuf", "MessageOrBuilder", 
+            createInterfaceShim("com.google.protobuf.MessageOrBuilder",
+                Arrays.asList("toByteArray", "getSerializedSize")));
         addShim("com.google.protobuf", "Parser", 
             createInterfaceShim("com.google.protobuf.Parser",
                 Arrays.asList("parseFrom", "parseDelimitedFrom")));
+        addShim("com.google.protobuf", "ExtensionRegistryLite", 
+            createClassShim("com.google.protobuf.ExtensionRegistryLite"));
+        addShim("com.google.protobuf", "InvalidProtocolBufferException", 
+            createClassShim("com.google.protobuf.InvalidProtocolBufferException"));
+        
+        // Apache Thrift shims
+        addShim("org.apache.thrift", "TBase", createInterfaceShim("org.apache.thrift.TBase"));
+        addShim("org.apache.thrift", "TException", createClassShim("org.apache.thrift.TException"));
+        addShim("org.apache.thrift", "TIOError", createClassShim("org.apache.thrift.TIOError"));
+        addShim("org.apache.thrift", "TResult", createClassShim("org.apache.thrift.TResult"));
+        addShim("org.apache.thrift", "TFieldIdEnum", createInterfaceShim("org.apache.thrift.TFieldIdEnum"));
+        addShim("org.apache.thrift.protocol", "TProtocol", createClassShim("org.apache.thrift.protocol.TProtocol",
+            Arrays.asList("readString", "writeString", "readI32", "writeI32")));
+        addShim("org.apache.thrift.scheme", "StandardScheme", createClassShim("org.apache.thrift.scheme.StandardScheme"));
+        addShim("org.apache.thrift.scheme", "TupleScheme", createClassShim("org.apache.thrift.scheme.TupleScheme"));
+        
+        // Apache Hadoop shims
+        addShim("org.apache.hadoop.util", "Shell", createClassShim("org.apache.hadoop.util.Shell",
+            Arrays.asList("execCommand", "execCommand", "getExitCode")));
+        addShim("org.apache.hadoop.conf", "Configuration", createClassShim("org.apache.hadoop.conf.Configuration",
+            Arrays.asList("get", "set", "getInt", "getLong", "getBoolean")));
+        
+        // Apache HBase shims
+        addShim("org.apache.hadoop.hbase.util", "FSUtils", createClassShim("org.apache.hadoop.hbase.util.FSUtils",
+            Arrays.asList("getRootDir", "getWALDir")));
+        
+        // Apache ZooKeeper shims
+        addShim("org.apache.zookeeper", "Watcher", createInterfaceShim("org.apache.zookeeper.Watcher",
+            Arrays.asList("process")));
     }
     
     /**
@@ -230,9 +265,119 @@ public class ShimGenerator {
                     }
                 }
             }
+            
+            // Handle shaded protobuf packages (e.g., org.apache.hbase.thirdparty.com.google.protobuf.*)
+            // Map shaded protobuf types to standard protobuf shims
+            for (String refType : referencedTypes) {
+                if (refType.contains(".protobuf.") && !refType.startsWith("com.google.protobuf.")) {
+                    // This is a shaded protobuf package
+                    String className = refType.substring(refType.lastIndexOf('.') + 1);
+                    String standardFqn = "com.google.protobuf." + className;
+                    
+                    // Check if we have a shim definition for the standard protobuf type
+                    ShimDefinition standardShim = shimDefinitions.get(standardFqn);
+                    if (standardShim != null) {
+                        // Generate shim in the shaded package
+                        if (factory.Type().get(refType) == null) {
+                            if (generateShadedProtobufShim(refType, standardShim)) {
+                                generated++;
+                            }
+                        }
+                    } else {
+                        // Handle protobuf-specific types that don't have standard equivalents
+                        // e.g., *OrBuilder, CodedOutputStream, etc.
+                        if (className.endsWith("OrBuilder")) {
+                            // Generate an interface shim for *OrBuilder types
+                            if (factory.Type().get(refType) == null) {
+                                ShimDefinition orBuilderShim = createInterfaceShim(refType, 
+                                    Arrays.asList("toByteArray", "getSerializedSize"));
+                                if (generateShadedProtobufShim(refType, orBuilderShim)) {
+                                    generated++;
+                                }
+                            }
+                        } else if ("CodedOutputStream".equals(className)) {
+                            // Generate a class shim for CodedOutputStream
+                            if (factory.Type().get(refType) == null) {
+                                ShimDefinition codedOutputStreamShim = createClassShim(refType, 
+                                    Arrays.asList("writeBytes", "writeString", "writeInt32"));
+                                if (generateShadedProtobufShim(refType, codedOutputStreamShim)) {
+                                    generated++;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
         
         return generated;
+    }
+    
+    /**
+     * Generate a shim for a shaded protobuf type by copying the structure from the standard protobuf shim.
+     */
+    private boolean generateShadedProtobufShim(String shadedFqn, ShimDefinition standardShim) {
+        try {
+            // Remove "unknown." prefix if present (types might be resolved as unknown.*)
+            String actualFqn = shadedFqn;
+            if (shadedFqn.startsWith("unknown.")) {
+                actualFqn = shadedFqn.substring("unknown.".length());
+            }
+            
+            int lastDot = actualFqn.lastIndexOf('.');
+            String packageName = lastDot >= 0 ? actualFqn.substring(0, lastDot) : "";
+            String className = lastDot >= 0 ? actualFqn.substring(lastDot + 1) : actualFqn;
+            
+            // Don't create packages in "unknown" - use the actual package
+            if (packageName.startsWith("unknown.")) {
+                packageName = packageName.substring("unknown.".length());
+            }
+            
+            CtPackage pkg = factory.Package().getOrCreate(packageName);
+            
+            CtType<?> type;
+            switch (standardShim.getKind()) {
+                case CLASS:
+                    type = factory.Class().create(pkg, className);
+                    break;
+                case INTERFACE:
+                    type = factory.Interface().create(pkg, className);
+                    break;
+                case ANNOTATION:
+                    type = factory.Annotation().create(pkg, className);
+                    break;
+                default:
+                    return false;
+            }
+            
+            type.addModifier(ModifierKind.PUBLIC);
+            
+            // Special handling for GeneratedMessage and GeneratedMessageLite - make them generic
+            if (("GeneratedMessage".equals(className) || "GeneratedMessageLite".equals(className)) 
+                && type instanceof CtClass) {
+                CtClass<?> cls = (CtClass<?>) type;
+                // Add type parameters <T, M>
+                CtTypeParameter typeParam1 = factory.Core().createTypeParameter();
+                typeParam1.setSimpleName("T");
+                cls.addFormalCtTypeParameter(typeParam1);
+                
+                CtTypeParameter typeParam2 = factory.Core().createTypeParameter();
+                typeParam2.setSimpleName("M");
+                cls.addFormalCtTypeParameter(typeParam2);
+            }
+            
+            // Add methods if specified
+            if (!standardShim.getMethodNames().isEmpty()) {
+                for (String methodName : standardShim.getMethodNames()) {
+                    addShimMethod(type, methodName);
+                }
+            }
+            
+            return true;
+        } catch (Throwable t) {
+            System.err.println("[ShimGenerator] Failed to generate shaded protobuf shim for " + shadedFqn + ": " + t.getMessage());
+            return false;
+        }
     }
     
     /**
@@ -339,8 +484,9 @@ public class ShimGenerator {
             
             type.addModifier(ModifierKind.PUBLIC);
             
-            // Special handling for GeneratedMessageLite - make it generic
-            if ("com.google.protobuf.GeneratedMessageLite".equals(shim.getFqn()) && type instanceof CtClass) {
+            // Special handling for GeneratedMessage and GeneratedMessageLite - make them generic
+            if (("com.google.protobuf.GeneratedMessageLite".equals(fqn) || 
+                 "com.google.protobuf.GeneratedMessage".equals(fqn)) && type instanceof CtClass) {
                 CtClass<?> cls = (CtClass<?>) type;
                 // Add type parameters <T, M>
                 CtTypeParameter typeParam1 = factory.Core().createTypeParameter();
@@ -403,10 +549,25 @@ public class ShimGenerator {
             // Determine return type based on method name
             CtTypeReference<?> returnType = inferReturnType(methodName, type);
             
-            // Special handling for Protocol Buffers methods
-            if (type.getQualifiedName() != null && type.getQualifiedName().contains("protobuf")) {
+            // Special handling for Protocol Buffers methods (both standard and shaded packages)
+            String typeQn = type.getQualifiedName();
+            if (typeQn != null && (typeQn.contains("protobuf") || typeQn.contains("thirdparty"))) {
                 if ("toByteArray".equals(methodName)) {
                     returnType = factory.Type().createArrayReference(factory.Type().BYTE_PRIMITIVE);
+                } else if ("getSerializedSize".equals(methodName)) {
+                    returnType = factory.Type().INTEGER_PRIMITIVE;
+                } else if ("parseFrom".equals(methodName)) {
+                    // parseFrom returns the type itself
+                    returnType = type.getReference();
+                }
+            }
+            
+            // Special handling for Hadoop Configuration.get() - should return String, not boolean
+            if (typeQn != null && typeQn.contains("hadoop.conf.Configuration")) {
+                if ("get".equals(methodName)) {
+                    // Configuration.get(String key) returns String
+                    // Configuration.get(String key, String defaultValue) returns String
+                    returnType = factory.Type().createReference("java.lang.String");
                 }
             }
             

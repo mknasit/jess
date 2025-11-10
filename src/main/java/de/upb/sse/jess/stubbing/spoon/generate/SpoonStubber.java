@@ -3502,8 +3502,9 @@ public final class SpoonStubber {
     
     /**
      * Fix collector method return types (e.g., IntListCollector.toList() should return Collector<Integer, ?, IntList>).
+     * This is essential for compilation and should be called even in minimal mode.
      */
-    private void fixCollectorMethodReturnTypes() {
+    public void fixCollectorMethodReturnTypes() {
         // Find all collect() invocations
         for (CtInvocation<?> inv : model.getElements(new TypeFilter<>(CtInvocation.class))) {
             CtExecutableReference<?> ex = inv.getExecutable();
