@@ -4,9 +4,16 @@ import de.upb.sse.jess.api.PublicApi;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.Arrays;
 import java.util.List;
+import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -20,18 +27,23 @@ public class RepositoryProcessorTest {
     // ============================================================================
     // CONFIGURATION - Modify these parameters as needed
     // ============================================================================
-    
+//    {
+//        "name": "Protocol Buffer",
+//            "projectDir": "/Users/mitul/Documents/study/Thesis/partial compilation/JessTesting/src/test/resources/projects/protobuf",
+//            "sourceRoots": ["java/core/src/main/java/com/google/protobuf"],
+//        "classpathJars": []
+//    }
     /** Project directory path */
-    private static final String PROJECT_DIR = "/Users/mitul/Documents/study/Thesis/partial compilation/JessTesting/src/test/resources/projects/commons-io";
+    private static final String PROJECT_DIR = "/Users/mitul/Documents/study/Thesis/partial compilation/JessTesting/src/test/resources/projects/protobuf";
     
     /** Source root directories (comma-separated or as list) */
-    private static final List<String> SOURCE_ROOTS = Arrays.asList("src/main/java/");
+    private static final List<String> SOURCE_ROOTS = Arrays.asList("java/core/src/main/java/");
     
     /** Classpath JAR files (empty list if none) */
     private static final List<String> CLASSPATH_JARS = Arrays.asList();
     
     /** Maximum number of methods to process (-1 for unlimited, or set to 100, 1000, etc.) */
-    private static final int MAX_METHODS = -1;
+    private static final int MAX_METHODS = 1000;
     
     // ============================================================================
     
@@ -72,6 +84,9 @@ public class RepositoryProcessorTest {
         
         // Print final statistics
         printResults(result);
+        
+        // Record failed compilation cases to a text file
+        recordFailedCompilations(result);
         
         // Assertions
         assertTrue(result.totalMethods > 0, "Should have processed at least one method");
@@ -158,5 +173,130 @@ public class RepositoryProcessorTest {
         }
         
         System.out.println("=".repeat(80));
+    }
+    
+    /**
+     * Record all failed compilation cases to a text file for analysis.
+     */
+    private static void recordFailedCompilations(RepositoryProcessor.ProcessingResult result) {
+        // Filter failed compilations (status != OK && status != TARGET_METHOD_NOT_EMITTED)
+        List<RepositoryProcessor.MethodResult> failedMethods = result.methodResults.stream()
+                .filter(mr -> {
+                    de.upb.sse.jess.api.PublicApi.Status status = mr.result.status;
+                    return status != de.upb.sse.jess.api.PublicApi.Status.OK 
+                            && status != de.upb.sse.jess.api.PublicApi.Status.TARGET_METHOD_NOT_EMITTED;
+                })
+                .collect(Collectors.toList());
+        
+        if (failedMethods.isEmpty()) {
+            System.out.println("\n✓ No failed compilations to record.");
+            return;
+        }
+        
+        // Create output file path in the logs directory
+        String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss"));
+        String fileName = "failed_compilations_" + timestamp + ".txt";
+        Path logsDir = Paths.get("/Users/mitul/Documents/study/Thesis/partial compilation/jess/src/test/resources/logs");
+        try {
+            Files.createDirectories(logsDir);
+        } catch (IOException e) {
+            System.err.println("Failed to create logs directory: " + e.getMessage());
+        }
+        Path outputFile = logsDir.resolve(fileName);
+        
+        try {
+            StringBuilder content = new StringBuilder();
+            content.append("=".repeat(100)).append("\n");
+            content.append("FAILED COMPILATION CASES\n");
+            content.append("=".repeat(100)).append("\n");
+            content.append("Generated: ").append(LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))).append("\n");
+            content.append("Project Directory: ").append(PROJECT_DIR).append("\n");
+            content.append("Total Failed Compilations: ").append(failedMethods.size()).append("\n");
+            content.append("Total Methods Processed: ").append(result.totalMethods).append("\n");
+            content.append("=".repeat(100)).append("\n\n");
+            
+            // Analyze failure patterns
+            long builderMethods = failedMethods.stream()
+                    .filter(mr -> mr.methodName.contains("builder") || mr.methodName.equals("get") || 
+                                 mr.methodName.contains("checkOrigin") || mr.binaryClassName.contains("$Builder"))
+                    .count();
+            long getterMethods = failedMethods.stream()
+                    .filter(mr -> mr.methodName.startsWith("get") && !mr.methodName.equals("get"))
+                    .count();
+            long toStringMethods = failedMethods.stream()
+                    .filter(mr -> mr.methodName.equals("toString"))
+                    .count();
+            long streamMethods = failedMethods.stream()
+                    .filter(mr -> mr.binaryClassName.contains("function") || mr.binaryClassName.contains("Stream"))
+                    .count();
+            
+            content.append("FAILURE PATTERN ANALYSIS:\n");
+            content.append("-".repeat(100)).append("\n");
+            content.append("  Builder pattern methods (builder, get, checkOrigin): ").append(builderMethods).append("\n");
+            content.append("  Getter methods (get*): ").append(getterMethods).append("\n");
+            content.append("  toString() methods: ").append(toStringMethods).append("\n");
+            content.append("  Stream/Functional interface methods: ").append(streamMethods).append("\n");
+            content.append("\n");
+            content.append("NOTE: Current error messages only show compiler exit codes.\n");
+            content.append("      To diagnose issues better, we need to capture actual compiler error messages.\n");
+            content.append("      Consider enhancing CompilerInvoker to capture stderr output.\n");
+            content.append("\n");
+            
+            // Group by status for summary
+            java.util.Map<de.upb.sse.jess.api.PublicApi.Status, Long> statusCounts = failedMethods.stream()
+                    .collect(Collectors.groupingBy(mr -> mr.result.status, Collectors.counting()));
+            
+            content.append("FAILURE STATUS SUMMARY:\n");
+            content.append("-".repeat(100)).append("\n");
+            statusCounts.entrySet().stream()
+                    .sorted((a, b) -> Long.compare(b.getValue(), a.getValue()))
+                    .forEach(entry -> {
+                        content.append(String.format("  %-30s: %d cases (%.1f%%)\n", 
+                                entry.getKey(), 
+                                entry.getValue(),
+                                (double) entry.getValue() / failedMethods.size() * 100.0));
+                    });
+            content.append("\n");
+            
+            // Detailed list of failures
+            content.append("DETAILED FAILURE LIST:\n");
+            content.append("=".repeat(100)).append("\n\n");
+            
+            for (int i = 0; i < failedMethods.size(); i++) {
+                RepositoryProcessor.MethodResult mr = failedMethods.get(i);
+                content.append(String.format("FAILURE #%d\n", i + 1));
+                content.append("-".repeat(100)).append("\n");
+                content.append("Status: ").append(mr.result.status).append("\n");
+                content.append("Class: ").append(mr.binaryClassName).append("\n");
+                content.append("Method: ").append(mr.methodName).append("\n");
+                content.append("Descriptor: ").append(mr.jvmDescriptor).append("\n");
+                content.append("Source File: ").append(mr.sourceFile).append("\n");
+                
+                if (mr.result.notes != null && !mr.result.notes.isEmpty()) {
+                    content.append("Notes: ").append(mr.result.notes).append("\n");
+                }
+                
+                if (mr.result.elapsedMs > 0) {
+                    content.append("Elapsed Time: ").append(mr.result.elapsedMs).append(" ms\n");
+                }
+                
+                if (mr.result.depsResolved != null && !mr.result.depsResolved.isEmpty()) {
+                    content.append("Dependencies Resolved: ").append(mr.result.depsResolved).append("\n");
+                }
+                
+                content.append("Used Stubs: ").append(mr.result.usedStubs ? "Yes" : "No").append("\n");
+                content.append("\n");
+            }
+            
+            // Write to file
+            Files.writeString(outputFile, content.toString(), StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+            
+            System.out.println("\n✓ Recorded " + failedMethods.size() + " failed compilation cases to:");
+            System.out.println("  " + outputFile.toAbsolutePath());
+            
+        } catch (IOException e) {
+            System.err.println("Failed to write failed compilations file: " + e.getMessage());
+            e.printStackTrace();
+        }
     }
 }

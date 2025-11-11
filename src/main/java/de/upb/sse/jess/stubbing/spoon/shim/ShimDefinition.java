@@ -9,7 +9,8 @@ public class ShimDefinition {
     public enum Kind {
         CLASS,
         INTERFACE,
-        ANNOTATION
+        ANNOTATION,
+        ENUM
     }
     
     private final String fqn;

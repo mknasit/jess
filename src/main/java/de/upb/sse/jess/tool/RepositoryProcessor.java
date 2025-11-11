@@ -76,7 +76,8 @@ public class RepositoryProcessor {
         config.setExitOnCompilationFail(false);
         config.setExitOnParsingFail(false);
         config.setFailOnAmbiguity(false);
-        config.setMinimalStubbing(true);  // Explicitly enable minimal stubbing (default is true, but making it explicit)
+        config.setMinimalStubbing(false);
+        config.setIncludeJdkStubs(false);// Explicitly enable minimal stubbing (default is true, but making it explicit)
         
         this.jess = new Jess(config, absoluteSourceRoots, classpathJars);
         

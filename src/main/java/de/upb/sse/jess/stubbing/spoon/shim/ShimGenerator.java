@@ -6,6 +6,7 @@ import spoon.reflect.code.CtReturn;
 import spoon.reflect.declaration.*;
 import spoon.reflect.factory.Factory;
 import spoon.reflect.reference.CtTypeReference;
+import spoon.reflect.reference.CtTypeParameterReference;
 
 import java.util.*;
 
@@ -156,6 +157,266 @@ public class ShimGenerator {
         // Apache ZooKeeper shims
         addShim("org.apache.zookeeper", "Watcher", createInterfaceShim("org.apache.zookeeper.Watcher",
             Arrays.asList("process")));
+        
+        // ======================================================================
+        // FRAMEWORK SHIMS - High Priority (from failure logs analysis)
+        // ======================================================================
+        
+        // MyBatis Plus shims (com.baomidou.mybatisplus.*)
+        addShim("com.baomidou.mybatisplus.core.mapper", "BaseMapper", 
+            createInterfaceShim("com.baomidou.mybatisplus.core.mapper.BaseMapper",
+                Arrays.asList("selectById", "selectList", "insert", "updateById", "deleteById")));
+        addShim("com.baomidou.mybatisplus.core.conditions.query", "QueryWrapper", 
+            createClassShim("com.baomidou.mybatisplus.core.conditions.query.QueryWrapper",
+                Arrays.asList("eq", "ne", "gt", "ge", "lt", "le", "like", "in", "isNull", "isNotNull")));
+        addShim("com.baomidou.mybatisplus.core.conditions.query", "LambdaQueryWrapper", 
+            createClassShim("com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper",
+                Arrays.asList("eq", "ne", "gt", "ge", "lt", "le", "like", "in")));
+        addShim("com.baomidou.mybatisplus.core.conditions.update", "UpdateWrapper", 
+            createClassShim("com.baomidou.mybatisplus.core.conditions.update.UpdateWrapper",
+                Arrays.asList("set", "eq", "ne")));
+        addShim("com.baomidou.mybatisplus.annotation", "TableName", createAnnotationShim("com.baomidou.mybatisplus.annotation.TableName"));
+        addShim("com.baomidou.mybatisplus.annotation", "TableId", createAnnotationShim("com.baomidou.mybatisplus.annotation.TableId"));
+        addShim("com.baomidou.mybatisplus.annotation", "TableField", createAnnotationShim("com.baomidou.mybatisplus.annotation.TableField"));
+        addShim("com.baomidou.mybatisplus.extension.plugins", "PaginationInterceptor", 
+            createClassShim("com.baomidou.mybatisplus.extension.plugins.PaginationInterceptor"));
+        addShim("com.baomidou.mybatisplus.extension.plugins.inner", "PaginationInnerInterceptor", 
+            createClassShim("com.baomidou.mybatisplus.extension.plugins.inner.PaginationInnerInterceptor"));
+        addShim("com.baomidou.mybatisplus.extension.plugins.pagination", "Page", 
+            createClassShim("com.baomidou.mybatisplus.extension.plugins.pagination.Page",
+                Arrays.asList("getRecords", "getTotal", "getSize", "getCurrent")));
+        addShim("com.baomidou.mybatisplus.core.metadata", "IPage", 
+            createInterfaceShim("com.baomidou.mybatisplus.core.metadata.IPage",
+                Arrays.asList("getRecords", "getTotal", "getSize", "getCurrent")));
+        addShim("com.baomidou.mybatisplus.core.toolkit", "CollectionUtils", 
+            createClassShim("com.baomidou.mybatisplus.core.toolkit.CollectionUtils",
+                Arrays.asList("isEmpty", "isNotEmpty")));
+        addShim("com.baomidou.mybatisplus.core.toolkit", "StringUtils", 
+            createClassShim("com.baomidou.mybatisplus.core.toolkit.StringUtils",
+                Arrays.asList("isBlank", "isNotBlank")));
+        
+        // Jakarta Servlet API shims (jakarta.servlet.*)
+        addShim("jakarta.servlet", "Servlet", createInterfaceShim("jakarta.servlet.Servlet",
+            Arrays.asList("init", "service", "destroy", "getServletConfig", "getServletInfo")));
+        addShim("jakarta.servlet.http", "HttpServlet", createClassShim("jakarta.servlet.http.HttpServlet",
+            Arrays.asList("doGet", "doPost", "doPut", "doDelete", "doHead", "doOptions", "doTrace")));
+        addShim("jakarta.servlet.http", "HttpServletRequest", createInterfaceShim("jakarta.servlet.http.HttpServletRequest",
+            Arrays.asList("getParameter", "getParameterValues", "getHeader", "getMethod", "getRequestURI", 
+                "getQueryString", "getSession", "getCookies", "getAttribute", "setAttribute")));
+        addShim("jakarta.servlet.http", "HttpServletResponse", createInterfaceShim("jakarta.servlet.http.HttpServletResponse",
+            Arrays.asList("setStatus", "setHeader", "addHeader", "setContentType", "getWriter", "getOutputStream",
+                "sendRedirect", "sendError", "addCookie")));
+        addShim("jakarta.servlet.http", "HttpSession", createInterfaceShim("jakarta.servlet.http.HttpSession",
+            Arrays.asList("getAttribute", "setAttribute", "removeAttribute", "invalidate", "getId")));
+        addShim("jakarta.servlet", "Filter", createInterfaceShim("jakarta.servlet.Filter",
+            Arrays.asList("init", "doFilter", "destroy")));
+        addShim("jakarta.servlet", "FilterChain", createInterfaceShim("jakarta.servlet.FilterChain",
+            Arrays.asList("doFilter")));
+        addShim("jakarta.servlet", "ServletContext", createInterfaceShim("jakarta.servlet.ServletContext",
+            Arrays.asList("getAttribute", "setAttribute", "getInitParameter")));
+        addShim("jakarta.servlet", "RequestDispatcher", createInterfaceShim("jakarta.servlet.RequestDispatcher",
+            Arrays.asList("forward", "include")));
+        addShim("jakarta.servlet", "ServletException", createClassShim("jakarta.servlet.ServletException"));
+        addShim("jakarta.servlet", "ServletInputStream", createClassShim("jakarta.servlet.ServletInputStream",
+            Arrays.asList("read", "readLine")));
+        addShim("jakarta.servlet", "ServletOutputStream", createClassShim("jakarta.servlet.ServletOutputStream",
+            Arrays.asList("write", "print", "println")));
+        addShim("jakarta.servlet.http", "Cookie", createClassShim("jakarta.servlet.http.Cookie",
+            Arrays.asList("getName", "getValue", "setValue", "getMaxAge", "setMaxAge")));
+        
+        // Spring Framework Core shims (org.springframework.*)
+        addShim("org.springframework.web.bind.annotation", "RestController", createAnnotationShim("org.springframework.web.bind.annotation.RestController"));
+        addShim("org.springframework.web.bind.annotation", "Controller", createAnnotationShim("org.springframework.web.bind.annotation.Controller"));
+        addShim("org.springframework.web.bind.annotation", "RequestMapping", createAnnotationShim("org.springframework.web.bind.annotation.RequestMapping"));
+        addShim("org.springframework.web.bind.annotation", "GetMapping", createAnnotationShim("org.springframework.web.bind.annotation.GetMapping"));
+        addShim("org.springframework.web.bind.annotation", "PostMapping", createAnnotationShim("org.springframework.web.bind.annotation.PostMapping"));
+        addShim("org.springframework.web.bind.annotation", "PutMapping", createAnnotationShim("org.springframework.web.bind.annotation.PutMapping"));
+        addShim("org.springframework.web.bind.annotation", "DeleteMapping", createAnnotationShim("org.springframework.web.bind.annotation.DeleteMapping"));
+        addShim("org.springframework.web.bind.annotation", "PatchMapping", createAnnotationShim("org.springframework.web.bind.annotation.PatchMapping"));
+        addShim("org.springframework.web.bind.annotation", "RequestParam", createAnnotationShim("org.springframework.web.bind.annotation.RequestParam"));
+        addShim("org.springframework.web.bind.annotation", "PathVariable", createAnnotationShim("org.springframework.web.bind.annotation.PathVariable"));
+        addShim("org.springframework.web.bind.annotation", "RequestBody", createAnnotationShim("org.springframework.web.bind.annotation.RequestBody"));
+        addShim("org.springframework.web.bind.annotation", "ResponseBody", createAnnotationShim("org.springframework.web.bind.annotation.ResponseBody"));
+        addShim("org.springframework.web.bind.annotation", "ResponseEntity", createClassShim("org.springframework.web.bind.annotation.ResponseEntity",
+            Arrays.asList("ok", "status", "body", "headers")));
+        addShim("org.springframework.web.servlet", "HandlerInterceptor", createInterfaceShim("org.springframework.web.servlet.HandlerInterceptor",
+            Arrays.asList("preHandle", "postHandle", "afterCompletion")));
+        addShim("org.springframework.web.servlet", "ModelAndView", createClassShim("org.springframework.web.servlet.ModelAndView",
+            Arrays.asList("addObject", "setViewName", "getViewName")));
+        addShim("org.springframework.web.servlet.mvc.method.annotation", "ResponseEntityExceptionHandler", 
+            createClassShim("org.springframework.web.servlet.mvc.method.annotation.ResponseEntityExceptionHandler"));
+        addShim("org.springframework.web.multipart", "MultipartFile", createInterfaceShim("org.springframework.web.multipart.MultipartFile",
+            Arrays.asList("getName", "getOriginalFilename", "getContentType", "isEmpty", "getSize", "getBytes", "getInputStream")));
+        addShim("org.springframework.web.cors", "CorsConfiguration", createClassShim("org.springframework.web.cors.CorsConfiguration",
+            Arrays.asList("addAllowedOrigin", "addAllowedMethod", "addAllowedHeader", "setAllowCredentials")));
+        addShim("org.springframework.web.cors", "CorsConfigurationSource", createInterfaceShim("org.springframework.web.cors.CorsConfigurationSource",
+            Arrays.asList("getCorsConfiguration")));
+        addShim("org.springframework.web.filter", "CorsFilter", createClassShim("org.springframework.web.filter.CorsFilter"));
+        addShim("org.springframework.http", "HttpStatus", createEnumShim("org.springframework.http.HttpStatus"));
+        addShim("org.springframework.http", "HttpHeaders", createClassShim("org.springframework.http.HttpHeaders",
+            Arrays.asList("set", "add", "get", "getFirst")));
+        addShim("org.springframework.http", "MediaType", createClassShim("org.springframework.http.MediaType",
+            Arrays.asList("APPLICATION_JSON", "APPLICATION_XML", "TEXT_PLAIN")));
+        addShim("org.springframework.http.client", "ClientHttpRequestFactory", createInterfaceShim("org.springframework.http.client.ClientHttpRequestFactory",
+            Arrays.asList("createRequest")));
+        addShim("org.springframework.web.client", "RestClient", createClassShim("org.springframework.web.client.RestClient",
+            Arrays.asList("create", "get", "post", "put", "delete")));
+        addShim("org.springframework.util", "StringUtils", createClassShim("org.springframework.util.StringUtils",
+            Arrays.asList("hasText", "isEmpty", "trimWhitespace", "commaDelimitedListToSet")));
+        addShim("org.springframework.cache", "CacheManager", createInterfaceShim("org.springframework.cache.CacheManager",
+            Arrays.asList("getCache", "getCacheNames")));
+        addShim("org.springframework.cache", "Cache", createInterfaceShim("org.springframework.cache.Cache",
+            Arrays.asList("get", "put", "evict", "clear")));
+        addShim("org.springframework.cache.caffeine", "CaffeineCacheManager", createClassShim("org.springframework.cache.caffeine.CaffeineCacheManager"));
+        addShim("org.springframework.cache.support", "SimpleCacheManager", createClassShim("org.springframework.cache.support.SimpleCacheManager"));
+        addShim("org.springframework.data.redis.cache", "RedisCacheConfiguration", createClassShim("org.springframework.data.redis.cache.RedisCacheConfiguration",
+            Arrays.asList("defaultCacheConfig", "entryTtl")));
+        addShim("org.springframework.data.redis.cache", "RedisCacheManager", createClassShim("org.springframework.data.redis.cache.RedisCacheManager"));
+        addShim("org.springframework.data.redis.connection", "RedisConnectionFactory", createInterfaceShim("org.springframework.data.redis.connection.RedisConnectionFactory",
+            Arrays.asList("getConnection")));
+        addShim("org.springframework.data.redis.core", "RedisTemplate", createClassShim("org.springframework.data.redis.core.RedisTemplate",
+            Arrays.asList("opsForValue", "opsForHash", "opsForList", "opsForSet", "opsForZSet")));
+        addShim("org.springframework.data.redis.core", "StringRedisTemplate", createClassShim("org.springframework.data.redis.core.StringRedisTemplate"));
+        addShim("org.springframework.data.redis.core", "ValueOperations", createInterfaceShim("org.springframework.data.redis.core.ValueOperations",
+            Arrays.asList("get", "set", "setIfAbsent", "increment", "decrement")));
+        addShim("org.springframework.data.redis.core", "HashOperations", createInterfaceShim("org.springframework.data.redis.core.HashOperations",
+            Arrays.asList("get", "put", "delete", "hasKey")));
+        addShim("org.springframework.data.redis.core", "ListOperations", createInterfaceShim("org.springframework.data.redis.core.ListOperations",
+            Arrays.asList("leftPush", "rightPush", "leftPop", "rightPop", "range")));
+        addShim("org.springframework.data.redis.core", "SetOperations", createInterfaceShim("org.springframework.data.redis.core.SetOperations",
+            Arrays.asList("add", "remove", "members", "isMember")));
+        addShim("org.springframework.data.redis.core", "ZSetOperations", createInterfaceShim("org.springframework.data.redis.core.ZSetOperations",
+            Arrays.asList("add", "remove", "range", "rangeByScore")));
+        addShim("org.springframework.ai.chat.client", "ChatClient", createInterfaceShim("org.springframework.ai.chat.client.ChatClient",
+            Arrays.asList("prompt", "call", "stream")));
+        addShim("org.springframework.ai.chat.client.advisor", "ChatClientAdvisor", createInterfaceShim("org.springframework.ai.chat.client.advisor.ChatClientAdvisor"));
+        addShim("org.springframework.ai.chat.model", "ChatModel", createInterfaceShim("org.springframework.ai.chat.model.ChatModel",
+            Arrays.asList("call", "stream")));
+        addShim("org.springframework.ai.chat.prompt", "Prompt", createClassShim("org.springframework.ai.chat.prompt.Prompt"));
+        addShim("org.springframework.ai.chat.messages", "Message", createInterfaceShim("org.springframework.ai.chat.messages.Message",
+            Arrays.asList("getContent", "getMessageType")));
+        
+        // Lombok shims (lombok.*) - Just annotations, no implementation needed
+        addShim("lombok", "Data", createAnnotationShim("lombok.Data"));
+        addShim("lombok", "Getter", createAnnotationShim("lombok.Getter"));
+        addShim("lombok", "Setter", createAnnotationShim("lombok.Setter"));
+        addShim("lombok", "ToString", createAnnotationShim("lombok.ToString"));
+        addShim("lombok", "EqualsAndHashCode", createAnnotationShim("lombok.EqualsAndHashCode"));
+        addShim("lombok", "NoArgsConstructor", createAnnotationShim("lombok.NoArgsConstructor"));
+        addShim("lombok", "AllArgsConstructor", createAnnotationShim("lombok.AllArgsConstructor"));
+        addShim("lombok", "RequiredArgsConstructor", createAnnotationShim("lombok.RequiredArgsConstructor"));
+        addShim("lombok", "Builder", createAnnotationShim("lombok.Builder"));
+        addShim("lombok", "Slf4j", createAnnotationShim("lombok.Slf4j"));
+        addShim("lombok", "Log", createAnnotationShim("lombok.Log"));
+        addShim("lombok", "Value", createAnnotationShim("lombok.Value"));
+        addShim("lombok", "NonNull", createAnnotationShim("lombok.NonNull"));
+        addShim("lombok", "SneakyThrows", createAnnotationShim("lombok.SneakyThrows"));
+        
+        // AspectJ shims (org.aspectj.lang.*)
+        addShim("org.aspectj.lang", "ProceedingJoinPoint", createInterfaceShim("org.aspectj.lang.ProceedingJoinPoint",
+            Arrays.asList("proceed", "getArgs", "getTarget", "getThis", "getSignature")));
+        addShim("org.aspectj.lang", "JoinPoint", createInterfaceShim("org.aspectj.lang.JoinPoint",
+            Arrays.asList("getArgs", "getTarget", "getThis", "getSignature")));
+        addShim("org.aspectj.lang.annotation", "Around", createAnnotationShim("org.aspectj.lang.annotation.Around"));
+        addShim("org.aspectj.lang.annotation", "Before", createAnnotationShim("org.aspectj.lang.annotation.Before"));
+        addShim("org.aspectj.lang.annotation", "After", createAnnotationShim("org.aspectj.lang.annotation.After"));
+        addShim("org.aspectj.lang.annotation", "AfterReturning", createAnnotationShim("org.aspectj.lang.annotation.AfterReturning"));
+        addShim("org.aspectj.lang.annotation", "AfterThrowing", createAnnotationShim("org.aspectj.lang.annotation.AfterThrowing"));
+        addShim("org.aspectj.lang.annotation", "Pointcut", createAnnotationShim("org.aspectj.lang.annotation.Pointcut"));
+        addShim("org.aspectj.lang.annotation", "Aspect", createAnnotationShim("org.aspectj.lang.annotation.Aspect"));
+        addShim("org.aspectj.lang.reflect", "MethodSignature", createInterfaceShim("org.aspectj.lang.reflect.MethodSignature",
+            Arrays.asList("getMethod", "getReturnType", "getParameterTypes")));
+        addShim("org.aspectj.lang.reflect", "CodeSignature", createInterfaceShim("org.aspectj.lang.reflect.CodeSignature",
+            Arrays.asList("getParameterNames")));
+        
+        // Redisson shims (org.redisson.api.*)
+        addShim("org.redisson.api", "RLock", createInterfaceShim("org.redisson.api.RLock",
+            Arrays.asList("lock", "tryLock", "unlock", "isLocked", "isHeldByCurrentThread")));
+        addShim("org.redisson.api", "RReadWriteLock", createInterfaceShim("org.redisson.api.RReadWriteLock",
+            Arrays.asList("readLock", "writeLock")));
+        addShim("org.redisson.api", "RBucket", createInterfaceShim("org.redisson.api.RBucket",
+            Arrays.asList("get", "set", "trySet", "delete", "isExists")));
+        addShim("org.redisson.api", "RMap", createInterfaceShim("org.redisson.api.RMap",
+            Arrays.asList("get", "put", "remove", "containsKey", "size")));
+        addShim("org.redisson.api", "RList", createInterfaceShim("org.redisson.api.RList",
+            Arrays.asList("get", "add", "remove", "size", "contains")));
+        addShim("org.redisson.api", "RSet", createInterfaceShim("org.redisson.api.RSet",
+            Arrays.asList("add", "remove", "contains", "size")));
+        addShim("org.redisson.api", "RedissonClient", createInterfaceShim("org.redisson.api.RedissonClient",
+            Arrays.asList("getLock", "getBucket", "getMap", "getList", "getSet", "getReadWriteLock", "shutdown")));
+        addShim("org.redisson", "Redisson", createClassShim("org.redisson.Redisson",
+            Arrays.asList("create")));
+        
+        // Caffeine Cache shims (com.github.benmanes.caffeine.cache.*)
+        addShim("com.github.benmanes.caffeine.cache", "Cache", createInterfaceShim("com.github.benmanes.caffeine.cache.Cache",
+            Arrays.asList("get", "put", "invalidate", "invalidateAll", "getIfPresent", "putAll")));
+        addShim("com.github.benmanes.caffeine.cache", "Caffeine", createClassShim("com.github.benmanes.caffeine.cache.Caffeine",
+            Arrays.asList("newBuilder", "maximumSize", "expireAfterWrite", "expireAfterAccess", "build")));
+        addShim("com.github.benmanes.caffeine.cache", "LoadingCache", createInterfaceShim("com.github.benmanes.caffeine.cache.LoadingCache",
+            Arrays.asList("get", "getAll", "refresh", "invalidate")));
+        
+        // JWT shims (io.jsonwebtoken.*)
+        addShim("io.jsonwebtoken", "Jwts", createClassShim("io.jsonwebtoken.Jwts",
+            Arrays.asList("builder", "parser", "parserBuilder")));
+        addShim("io.jsonwebtoken", "JwtBuilder", createInterfaceShim("io.jsonwebtoken.JwtBuilder",
+            Arrays.asList("setSubject", "setIssuedAt", "setExpiration", "signWith", "compact")));
+        addShim("io.jsonwebtoken", "JwtParser", createInterfaceShim("io.jsonwebtoken.JwtParser",
+            Arrays.asList("setSigningKey", "parseClaimsJws", "parse")));
+        addShim("io.jsonwebtoken", "Claims", createInterfaceShim("io.jsonwebtoken.Claims",
+            Arrays.asList("getSubject", "getIssuedAt", "getExpiration", "get", "setSubject")));
+        addShim("io.jsonwebtoken.security", "Keys", createClassShim("io.jsonwebtoken.security.Keys",
+            Arrays.asList("hmacShaKeyFor", "secretKeyFor")));
+        addShim("io.jsonwebtoken.security", "SigningKeyResolver", createInterfaceShim("io.jsonwebtoken.security.SigningKeyResolver",
+            Arrays.asList("resolveSigningKey")));
+        
+        // ShardingSphere shims (org.apache.shardingsphere.*)
+        addShim("org.apache.shardingsphere.driver.api.yaml", "YamlShardingSphereDataSourceFactory", 
+            createClassShim("org.apache.shardingsphere.driver.api.yaml.YamlShardingSphereDataSourceFactory",
+                Arrays.asList("createDataSource")));
+        addShim("org.apache.shardingsphere.infra.url.core", "URLCenter", 
+            createClassShim("org.apache.shardingsphere.infra.url.core.URLCenter"));
+        addShim("org.apache.shardingsphere.infra.url.core", "URLCenterFactory", 
+            createClassShim("org.apache.shardingsphere.infra.url.core.URLCenterFactory",
+                Arrays.asList("newInstance")));
+        
+        // Elasticsearch Client shims (co.elastic.clients.elasticsearch.*)
+        addShim("co.elastic.clients.elasticsearch", "ElasticsearchClient", 
+            createInterfaceShim("co.elastic.clients.elasticsearch.ElasticsearchClient",
+                Arrays.asList("search", "index", "get", "delete", "update")));
+        addShim("co.elastic.clients.elasticsearch._types", "Query", 
+            createClassShim("co.elastic.clients.elasticsearch._types.Query"));
+        addShim("co.elastic.clients.elasticsearch._types", "query_dsl", 
+            createClassShim("co.elastic.clients.elasticsearch._types.query_dsl"));
+        addShim("co.elastic.clients.elasticsearch.core", "SearchRequest", 
+            createClassShim("co.elastic.clients.elasticsearch.core.SearchRequest",
+                Arrays.asList("index", "query")));
+        addShim("co.elastic.clients.elasticsearch.core", "SearchResponse", 
+            createClassShim("co.elastic.clients.elasticsearch.core.SearchResponse",
+                Arrays.asList("hits", "took", "timedOut")));
+        addShim("co.elastic.clients.elasticsearch.core.search", "HitsMetadata", 
+            createClassShim("co.elastic.clients.elasticsearch.core.search.HitsMetadata",
+                Arrays.asList("hits", "total")));
+        addShim("co.elastic.clients.elasticsearch.core.search", "Hit", 
+            createClassShim("co.elastic.clients.elasticsearch.core.search.Hit",
+                Arrays.asList("source", "id", "index")));
+        
+        // Reactor/Reactive Types shims (reactor.core.publisher.*)
+        addShim("reactor.core.publisher", "Mono", createClassShim("reactor.core.publisher.Mono",
+            Arrays.asList("just", "error", "empty", "fromCallable", "zip", "map", "flatMap", "filter", 
+                "block", "subscribe", "doOnNext", "doOnError", "onErrorReturn", "onErrorResume")));
+        addShim("reactor.core.publisher", "Flux", createClassShim("reactor.core.publisher.Flux",
+            Arrays.asList("just", "error", "empty", "fromIterable", "fromArray", "zip", "map", "flatMap", 
+                "filter", "collectList", "blockFirst", "subscribe", "doOnNext", "doOnError")));
+        addShim("reactor.core.publisher", "Publisher", createInterfaceShim("reactor.core.publisher.Publisher",
+            Arrays.asList("subscribe")));
+        addShim("org.reactivestreams", "Publisher", createInterfaceShim("org.reactivestreams.Publisher",
+            Arrays.asList("subscribe")));
+        addShim("org.reactivestreams", "Subscriber", createInterfaceShim("org.reactivestreams.Subscriber",
+            Arrays.asList("onSubscribe", "onNext", "onError", "onComplete")));
+        addShim("reactor.util.context", "Context", createInterfaceShim("reactor.util.context.Context",
+            Arrays.asList("get", "put", "putAll", "isEmpty")));
+        addShim("reactor.util.context", "ContextView", createInterfaceShim("reactor.util.context.ContextView",
+            Arrays.asList("get", "hasKey", "isEmpty")));
     }
     
     /**
@@ -206,6 +467,13 @@ public class ShimGenerator {
      */
     private ShimDefinition createAnnotationShim(String fqn) {
         return new ShimDefinition(fqn, ShimDefinition.Kind.ANNOTATION, Collections.emptyList());
+    }
+    
+    /**
+     * Create an enum shim.
+     */
+    private ShimDefinition createEnumShim(String fqn) {
+        return new ShimDefinition(fqn, ShimDefinition.Kind.ENUM, Collections.emptyList());
     }
     
     /**
@@ -346,6 +614,9 @@ public class ShimGenerator {
                 case ANNOTATION:
                     type = factory.Annotation().create(pkg, className);
                     break;
+                case ENUM:
+                    type = factory.Enum().create(pkg, className);
+                    break;
                 default:
                     return false;
             }
@@ -478,6 +749,9 @@ public class ShimGenerator {
                 case ANNOTATION:
                     type = factory.Annotation().create(pkg, className);
                     break;
+                case ENUM:
+                    type = factory.Enum().create(pkg, className);
+                    break;
                 default:
                     return false;
             }
@@ -496,6 +770,35 @@ public class ShimGenerator {
                 CtTypeParameter typeParam2 = factory.Core().createTypeParameter();
                 typeParam2.setSimpleName("M");
                 cls.addFormalCtTypeParameter(typeParam2);
+            }
+            
+            // Special handling for reactive types - make them generic (Mono<T>, Flux<T>)
+            if (("reactor.core.publisher.Mono".equals(fqn) || 
+                 "reactor.core.publisher.Flux".equals(fqn)) && type instanceof CtClass) {
+                CtClass<?> cls = (CtClass<?>) type;
+                // Add type parameter <T>
+                CtTypeParameter typeParam = factory.Core().createTypeParameter();
+                typeParam.setSimpleName("T");
+                cls.addFormalCtTypeParameter(typeParam);
+            }
+            
+            // Special handling for generic shims - RedisTemplate<K, V>, BaseMapper<T>
+            if ("org.springframework.data.redis.core.RedisTemplate".equals(fqn) && type instanceof CtClass) {
+                CtClass<?> cls = (CtClass<?>) type;
+                // Add type parameters <K, V>
+                CtTypeParameter typeParamK = factory.Core().createTypeParameter();
+                typeParamK.setSimpleName("K");
+                cls.addFormalCtTypeParameter(typeParamK);
+                CtTypeParameter typeParamV = factory.Core().createTypeParameter();
+                typeParamV.setSimpleName("V");
+                cls.addFormalCtTypeParameter(typeParamV);
+            }
+            if ("com.baomidou.mybatisplus.core.mapper.BaseMapper".equals(fqn) && type instanceof CtInterface) {
+                CtInterface<?> iface = (CtInterface<?>) type;
+                // Add type parameter <T>
+                CtTypeParameter typeParam = factory.Core().createTypeParameter();
+                typeParam.setSimpleName("T");
+                iface.addFormalCtTypeParameter(typeParam);
             }
             
             // Add methods if specified
@@ -517,6 +820,12 @@ public class ShimGenerator {
      */
     private void addShimMethod(CtType<?> type, String methodName) {
         try {
+            // IMPORTANT: Annotations should never have methods added to them
+            // Annotation elements are different from methods and are handled separately
+            if (type instanceof CtAnnotationType) {
+                return; // Skip - annotations cannot have methods
+            }
+            
             // Check if method already exists in this type or parent classes
             if (type instanceof CtClass) {
                 CtClass<?> cls = (CtClass<?>) type;
@@ -549,8 +858,68 @@ public class ShimGenerator {
             // Determine return type based on method name
             CtTypeReference<?> returnType = inferReturnType(methodName, type);
             
-            // Special handling for Protocol Buffers methods (both standard and shaded packages)
+            // Special handling for reactive types (Mono, Flux)
             String typeQn = type.getQualifiedName();
+            if (typeQn != null && (typeQn.equals("reactor.core.publisher.Mono") || 
+                                   typeQn.equals("reactor.core.publisher.Flux"))) {
+                if (type instanceof CtClass) {
+                    CtClass<?> reactiveClass = (CtClass<?>) type;
+                    
+                    // Static factory methods (just, error, empty, fromCallable) return Mono<T> or Flux<T>
+                    if ("just".equals(methodName) || "error".equals(methodName) || 
+                        "empty".equals(methodName) || "fromCallable".equals(methodName) ||
+                        "fromIterable".equals(methodName) || "fromArray".equals(methodName)) {
+                        // Return the generic type itself (Mono<T> or Flux<T>)
+                        CtTypeReference<?> genericType = reactiveClass.getReference().clone();
+                        if (genericType != null) {
+                            // Ensure it has the type parameter T
+                            if (genericType.getActualTypeArguments().isEmpty()) {
+                                CtTypeParameterReference typeParamRef = factory.Core().createTypeParameterReference();
+                                typeParamRef.setSimpleName("T");
+                                genericType.addActualTypeArgument(typeParamRef);
+                            }
+                            returnType = genericType;
+                        }
+                    }
+                    // Instance methods that return the same reactive type (map, flatMap, filter, etc.)
+                    else if ("map".equals(methodName) || "flatMap".equals(methodName) || 
+                             "filter".equals(methodName) || "doOnNext".equals(methodName) ||
+                             "doOnError".equals(methodName) || "onErrorReturn".equals(methodName) ||
+                             "onErrorResume".equals(methodName)) {
+                        // Return the generic type itself (Mono<T> or Flux<T>)
+                        CtTypeReference<?> genericType = reactiveClass.getReference().clone();
+                        if (genericType != null) {
+                            // Ensure it has the type parameter T
+                            if (genericType.getActualTypeArguments().isEmpty()) {
+                                CtTypeParameterReference typeParamRef = factory.Core().createTypeParameterReference();
+                                typeParamRef.setSimpleName("T");
+                                genericType.addActualTypeArgument(typeParamRef);
+                            }
+                            returnType = genericType;
+                        }
+                    }
+                    // Blocking methods (block, blockFirst) return T
+                    else if ("block".equals(methodName) || "blockFirst".equals(methodName)) {
+                        // Return the type parameter T
+                        CtTypeParameterReference typeParamRef = factory.Core().createTypeParameterReference();
+                        typeParamRef.setSimpleName("T");
+                        returnType = typeParamRef;
+                    }
+                    // collectList for Flux returns Mono<List<T>>
+                    else if ("collectList".equals(methodName) && typeQn.equals("reactor.core.publisher.Flux")) {
+                        // Return Mono<List<T>>
+                        CtTypeReference<?> monoType = factory.Type().createReference("reactor.core.publisher.Mono");
+                        CtTypeReference<?> listType = factory.Type().createReference("java.util.List");
+                        CtTypeParameterReference typeParamRef = factory.Core().createTypeParameterReference();
+                        typeParamRef.setSimpleName("T");
+                        listType.addActualTypeArgument(typeParamRef);
+                        monoType.addActualTypeArgument(listType);
+                        returnType = monoType;
+                    }
+                }
+            }
+            
+            // Special handling for Protocol Buffers methods (both standard and shaded packages)
             if (typeQn != null && (typeQn.contains("protobuf") || typeQn.contains("thirdparty"))) {
                 if ("toByteArray".equals(methodName)) {
                     returnType = factory.Type().createArrayReference(factory.Type().BYTE_PRIMITIVE);
@@ -572,7 +941,7 @@ public class ShimGenerator {
             }
             
             // Determine parameter types based on method name
-            List<CtTypeReference<?>> paramTypes = inferParameterTypes(methodName);
+            List<CtTypeReference<?>> paramTypes = inferParameterTypes(methodName, typeQn);
             
             Set<ModifierKind> mods = new HashSet<>();
             mods.add(ModifierKind.PUBLIC);
@@ -606,8 +975,58 @@ public class ShimGenerator {
                 Collections.emptySet()
             );
             
+            // For static factory methods on reactive types, make the method generic
+            if (typeQn != null && (typeQn.equals("reactor.core.publisher.Mono") || 
+                                   typeQn.equals("reactor.core.publisher.Flux"))) {
+                // Check if this is a static factory method (just, error, empty, etc.)
+                boolean isStaticFactory = ("just".equals(methodName) || "error".equals(methodName) || 
+                     "empty".equals(methodName) || "fromCallable".equals(methodName) ||
+                     "fromIterable".equals(methodName) || "fromArray".equals(methodName));
+                
+                // Check if method is static (either from mods or from isUtilityClass check)
+                boolean isStatic = mods.contains(ModifierKind.STATIC) || 
+                    (isUtilityClass && type instanceof CtClass);
+                
+                if (isStatic && isStaticFactory) {
+                    // Make the method generic: public static <T> Mono<T> just(T arg0)
+                    CtTypeParameter methodTypeParam = factory.Core().createTypeParameter();
+                    methodTypeParam.setSimpleName("T");
+                    method.addFormalCtTypeParameter(methodTypeParam);
+                    
+                    // Update return type to use the method's type parameter
+                    // IMPORTANT: Create a new type reference without class-level type parameters
+                    // Static methods cannot use class-level type parameters
+                    CtTypeReference<?> baseTypeRef = factory.Type().createReference(type.getQualifiedName());
+                    CtTypeParameterReference methodTypeParamRef = factory.Core().createTypeParameterReference();
+                    methodTypeParamRef.setSimpleName("T");
+                    baseTypeRef.addActualTypeArgument(methodTypeParamRef);
+                    method.setType(baseTypeRef);
+                    
+                    // Update parameter types to use T for just() method
+                    if ("just".equals(methodName) && !params.isEmpty()) {
+                        CtParameter<?> firstParam = params.get(0);
+                        firstParam.setType(methodTypeParamRef);
+                    }
+                }
+                // For instance methods that use Function<T, R>, add R as method-level type parameter
+                else if (!isStatic && ("map".equals(methodName) || "flatMap".equals(methodName))) {
+                    // Add R as method-level type parameter for Function<T, R>
+                    CtTypeParameter methodTypeParamR = factory.Core().createTypeParameter();
+                    methodTypeParamR.setSimpleName("R");
+                    method.addFormalCtTypeParameter(methodTypeParamR);
+                    
+                    // Update return type to use R: Mono<R> or Flux<R>
+                    CtTypeReference<?> genericReturnType = type.getReference().clone();
+                    CtTypeParameterReference methodTypeParamRefR = factory.Core().createTypeParameterReference();
+                    methodTypeParamRefR.setSimpleName("R");
+                    genericReturnType.addActualTypeArgument(methodTypeParamRefR);
+                    method.setType(genericReturnType);
+                }
+            }
+            
             // For classes, add a default body with return statement
-            if (type instanceof CtClass) {
+            // IMPORTANT: Annotations cannot have method bodies - they can only have default values
+            if (type instanceof CtClass && !(type instanceof CtAnnotationType)) {
                 CtBlock<?> body = factory.Core().createBlock();
                 if (!returnType.equals(factory.Type().VOID_PRIMITIVE)) {
                     CtReturn<?> ret = factory.Core().createReturn();
@@ -618,6 +1037,8 @@ public class ShimGenerator {
                 }
                 method.setBody(body);
             }
+            // For annotations, methods should not have bodies - they're annotation elements
+            // Annotation elements can have default values, but that's handled differently
         } catch (Exception e) {
             // Ignore method creation failures
         }
@@ -633,8 +1054,10 @@ public class ShimGenerator {
         if (fqn == null) return false;
         // Common utility class patterns
         return fqn.contains("Utils") || fqn.contains("Helper") || fqn.contains("Util") ||
+               fqn.contains("Factory") || // LoggerFactory, etc.
                fqn.equals("org.apache.commons.lang3.StringUtils") ||
-               fqn.equals("org.apache.commons.lang3.ObjectUtils");
+               fqn.equals("org.apache.commons.lang3.ObjectUtils") ||
+               fqn.equals("org.slf4j.LoggerFactory");
     }
     
     /**
@@ -681,8 +1104,64 @@ public class ShimGenerator {
     /**
      * Infer parameter types based on method name.
      */
-    private List<CtTypeReference<?>> inferParameterTypes(String methodName) {
+    private List<CtTypeReference<?>> inferParameterTypes(String methodName, String typeQn) {
         List<CtTypeReference<?>> params = new ArrayList<>();
+        
+        // Special handling for reactive types (Mono, Flux)
+        if (typeQn != null && (typeQn.equals("reactor.core.publisher.Mono") || 
+                               typeQn.equals("reactor.core.publisher.Flux"))) {
+            if ("map".equals(methodName)) {
+                // map takes Function<T, R>
+                CtTypeReference<?> functionType = factory.Type().createReference("java.util.function.Function");
+                CtTypeParameterReference typeParamT = factory.Core().createTypeParameterReference();
+                typeParamT.setSimpleName("T");
+                CtTypeParameterReference typeParamR = factory.Core().createTypeParameterReference();
+                typeParamR.setSimpleName("R");
+                functionType.addActualTypeArgument(typeParamT);
+                functionType.addActualTypeArgument(typeParamR);
+                params.add(functionType);
+            } else if ("flatMap".equals(methodName)) {
+                // flatMap takes Function<T, Mono<R>> or Function<T, Flux<R>>
+                // The function returns a Publisher (Mono or Flux), not just R
+                CtTypeReference<?> functionType = factory.Type().createReference("java.util.function.Function");
+                CtTypeParameterReference typeParamT = factory.Core().createTypeParameterReference();
+                typeParamT.setSimpleName("T");
+                // The return type of the function is Mono<R> or Flux<R>
+                CtTypeReference<?> publisherType = factory.Type().createReference(typeQn);
+                CtTypeParameterReference typeParamR = factory.Core().createTypeParameterReference();
+                typeParamR.setSimpleName("R");
+                publisherType.addActualTypeArgument(typeParamR);
+                functionType.addActualTypeArgument(typeParamT);
+                functionType.addActualTypeArgument(publisherType);
+                params.add(functionType);
+            } else if ("filter".equals(methodName)) {
+                // filter takes Predicate<T>
+                CtTypeReference<?> predicateType = factory.Type().createReference("java.util.function.Predicate");
+                CtTypeParameterReference typeParamT = factory.Core().createTypeParameterReference();
+                typeParamT.setSimpleName("T");
+                predicateType.addActualTypeArgument(typeParamT);
+                params.add(predicateType);
+            } else if ("just".equals(methodName)) {
+                // just(T value) - takes one parameter of type T
+                CtTypeParameterReference typeParamT = factory.Core().createTypeParameterReference();
+                typeParamT.setSimpleName("T");
+                params.add(typeParamT);
+            } else if ("error".equals(methodName)) {
+                // error(Throwable) - takes Throwable
+                params.add(factory.Type().createReference("java.lang.Throwable"));
+            } else if ("fromCallable".equals(methodName)) {
+                // fromCallable(Callable<T>) - takes Callable
+                params.add(factory.Type().createReference("java.util.concurrent.Callable"));
+            } else if ("fromIterable".equals(methodName)) {
+                // fromIterable(Iterable<T>) - takes Iterable
+                params.add(factory.Type().createReference("java.lang.Iterable"));
+            } else if ("fromArray".equals(methodName)) {
+                // fromArray(T[]) - takes array
+                CtTypeParameterReference typeParamT = factory.Core().createTypeParameterReference();
+                typeParamT.setSimpleName("T");
+                params.add(factory.Type().createArrayReference(typeParamT));
+            }
+        }
         
         // Special cases for common methods
         if ("equals".equals(methodName)) {

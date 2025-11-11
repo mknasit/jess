@@ -93,6 +93,12 @@ public final class SpoonStubbingRunner implements Stubber {
         
         // Collect referenced types that need shims
         Set<String> referencedTypes = collectReferencedTypes(model, plans);
+        
+        // Always ensure LoggerFactory and Logger are collected (they're used in field initializations)
+        // Field initializations happen after shim generation, so we need to pre-collect them
+        referencedTypes.add("org.slf4j.LoggerFactory");
+        referencedTypes.add("org.slf4j.Logger");
+        
         int shimsGenerated = shimGenerator.generateShimsForReferencedTypes(referencedTypes);
         if (shimsGenerated > 0) {
             System.out.println("Generated " + shimsGenerated + " shim classes for common libraries");
@@ -105,6 +111,10 @@ public final class SpoonStubbingRunner implements Stubber {
         int created = 0;
         // Pass method plans to applyTypePlans so it can infer type parameter names (T, R, U, etc.)
         created += stubber.applyTypePlans(plans.typePlans, plans.methodPlans);       // types (classes/interfaces/annotations)
+
+        // Pre-create Builder classes that are referenced in method plans
+        // This ensures Builder classes exist before we try to apply methods to them
+        stubber.ensureBuilderClassesFromMethodPlans(plans.methodPlans);
 
         created += stubber.applyFieldPlans(plans.fieldPlans);     // fields
         created += stubber.applyConstructorPlans(plans.ctorPlans);// constructors
@@ -131,6 +141,12 @@ public final class SpoonStubbingRunner implements Stubber {
             stubber.addStreamApiMethods();                    // Fix: Stream API interface methods
             stubber.fixTypeConversionIssues();               // Fix: Unknown type conversion issues
             stubber.fixSyntaxErrors();                       // Fix: Syntax generation errors
+            stubber.fixConstructorParameterHandling();       // Fix: Constructor parameter handling
+            stubber.fixReactiveTypes();                       // Fix: Reactive types (Mono, Flux)
+            stubber.preventDuplicateClasses();                // Fix: Duplicate class prevention
+            stubber.fixEnumConstantsFromSwitches();           // Fix: Enum constants from switches
+            stubber.fixPackageClassNameClashes();            // Fix: Package/class name clashes
+            stubber.fixAmbiguousReferences();                // Fix: Ambiguous references
             fixConstructorCallTypeArguments(model, f);        // Fix: Constructor calls to match variable declarations
         }
 
@@ -1008,6 +1024,54 @@ public final class SpoonStubbingRunner implements Stubber {
                 for (var paramType : methodPlan.paramTypes) {
                     String paramQn = safeQN(paramType);
                     if (paramQn != null) referenced.add(paramQn);
+                }
+            }
+        }
+        
+        // Also collect from static method invocations (e.g., LoggerFactory.getLogger())
+        for (CtInvocation<?> inv : model.getElements(new TypeFilter<>(CtInvocation.class))) {
+            try {
+                spoon.reflect.reference.CtExecutableReference<?> ex = inv.getExecutable();
+                if (ex != null && ex.isStatic()) {
+                    spoon.reflect.reference.CtTypeReference<?> owner = ex.getDeclaringType();
+                    if (owner != null) {
+                        String ownerQn = safeQN(owner);
+                        if (ownerQn != null && !ownerQn.startsWith("java.") && !ownerQn.startsWith("javax.") && !ownerQn.startsWith("jakarta.")) {
+                            referenced.add(ownerQn);
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {}
+        }
+        
+        // Also collect from field assignments that use static method calls (e.g., LoggerFactory.getLogger())
+        for (spoon.reflect.code.CtAssignment<?, ?> assignment : model.getElements(new TypeFilter<>(spoon.reflect.code.CtAssignment.class))) {
+            try {
+                spoon.reflect.code.CtExpression<?> assigned = assignment.getAssigned();
+                if (assigned instanceof CtInvocation<?>) {
+                    CtInvocation<?> inv = (CtInvocation<?>) assigned;
+                    spoon.reflect.reference.CtExecutableReference<?> ex = inv.getExecutable();
+                    if (ex != null && ex.isStatic()) {
+                        spoon.reflect.reference.CtTypeReference<?> owner = ex.getDeclaringType();
+                        if (owner != null) {
+                            String ownerQn = safeQN(owner);
+                            if (ownerQn != null && !ownerQn.startsWith("java.") && !ownerQn.startsWith("javax.") && !ownerQn.startsWith("jakarta.")) {
+                                referenced.add(ownerQn);
+                            }
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {}
+        }
+        
+        // Also collect parameter types from method plans (for shims like jakarta.servlet.*)
+        for (var methodPlan : plans.methodPlans) {
+            if (methodPlan.paramTypes != null) {
+                for (var paramType : methodPlan.paramTypes) {
+                    String paramQn = safeQN(paramType);
+                    if (paramQn != null && !paramQn.startsWith("java.") && !paramQn.startsWith("javax.")) {
+                        referenced.add(paramQn);
+                    }
                 }
             }
         }

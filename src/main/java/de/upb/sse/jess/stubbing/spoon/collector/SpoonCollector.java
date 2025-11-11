@@ -239,15 +239,34 @@ public final class SpoonCollector {
             // Ignore enum constants inside annotations.
             if (fa.getParent(CtAnnotation.class) != null) continue;
 
-            // Standalone 'x.f;' is ambiguous in strict mode.
-            if (isStandaloneFieldStatement(fa)) {
-                if (cfg.isFailOnAmbiguity()) {
-                    String owner = Optional.ofNullable(resolveOwnerTypeFromFieldAccess(fa))
-                            .map(CtTypeReference::getQualifiedName).orElse("<unknown>");
-                    String name = (fa.getVariable() != null ? fa.getVariable().getSimpleName() : "<missing>");
-                    throw new AmbiguityException("Ambiguous field access with no type context: " + owner + "#" + name);
-                } else {
-                    continue; // lenient: skip
+            // Check if this is an enum constant in a switch statement
+            // Enum constants in switch cases should be handled specially
+            CtElement parent = fa.getParent();
+            boolean isInSwitchCase = false;
+            while (parent != null) {
+                if (parent instanceof spoon.reflect.code.CtCase) {
+                    isInSwitchCase = true;
+                    break;
+                }
+                parent = parent.getParent();
+            }
+            
+            // If it's an enum constant in a switch, don't throw ambiguity exception
+            // Instead, collect it as a field (enum constant)
+            if (isInSwitchCase && simple != null && Character.isUpperCase(simple.charAt(0))) {
+                // This is likely an enum constant - handle it as a field
+                // Don't throw ambiguity exception for enum constants in switches
+            } else {
+                // Standalone 'x.f;' is ambiguous in strict mode.
+                if (isStandaloneFieldStatement(fa)) {
+                    if (cfg.isFailOnAmbiguity()) {
+                        String owner = Optional.ofNullable(resolveOwnerTypeFromFieldAccess(fa))
+                                .map(CtTypeReference::getQualifiedName).orElse("<unknown>");
+                        String name = (fa.getVariable() != null ? fa.getVariable().getSimpleName() : "<missing>");
+                        throw new AmbiguityException("Ambiguous field access with no type context: " + owner + "#" + name);
+                    } else {
+                        continue; // lenient: skip
+                    }
                 }
             }
 
@@ -260,12 +279,28 @@ public final class SpoonCollector {
             CtTypeReference<?> fieldType = inferFieldTypeFromUsage(fa);
 
             if (fieldType == null) {
-                if (cfg.isFailOnAmbiguity()) {
-                    String ownerQN = ownerRef != null ? ownerRef.getQualifiedName() : "<unknown>";
-                    String simplename = (fa.getVariable() != null ? fa.getVariable().getSimpleName() : "<missing>");
-                   throw new AmbiguityException("Ambiguous field (no usable type context): " + ownerQN + "#" + simplename);
+                // Check if this is an enum constant in a switch statement
+                // If so, use the enum type as the field type
+                if (isInSwitchCase && simple != null && Character.isUpperCase(simple.charAt(0))) {
+                    // This is an enum constant - infer type from the enum
+                    if (ownerRef != null) {
+                        CtType<?> ownerType = ownerRef.getTypeDeclaration();
+                        if (ownerType instanceof spoon.reflect.declaration.CtEnum) {
+                            fieldType = ownerRef; // Use the enum type itself
+                        } else {
+                            fieldType = f.Type().createReference(UNKNOWN_TYPE_FQN);
+                        }
+                    } else {
+                        fieldType = f.Type().createReference(UNKNOWN_TYPE_FQN);
+                    }
+                } else {
+                    if (cfg.isFailOnAmbiguity()) {
+                        String ownerQN = ownerRef != null ? ownerRef.getQualifiedName() : "<unknown>";
+                        String simplename = (fa.getVariable() != null ? fa.getVariable().getSimpleName() : "<missing>");
+                       throw new AmbiguityException("Ambiguous field (no usable type context): " + ownerQN + "#" + simplename);
+                    }
+                    fieldType = f.Type().createReference(UNKNOWN_TYPE_FQN);
                 }
-                fieldType = f.Type().createReference(UNKNOWN_TYPE_FQN);
             }
 
             out.fieldPlans.add(new FieldStubPlan(ownerRef, fieldName, fieldType, isStatic));
@@ -939,6 +974,48 @@ public final class SpoonCollector {
             // parameter types (collapse anonymous classes)
             List<CtTypeReference<?>> paramTypes = inferParamTypesFromCall(ex, inv.getArguments());
             List<CtExpression<?>> args = inv.getArguments();
+            
+            // EARLY CHECK: If there's a null argument and an existing method with matching parameter count,
+            // skip creating the method plan to avoid ambiguity
+            // This must happen BEFORE we convert Unknown to Object
+            if (argsContainNullLiteral(args) && owner != null && args.size() > 0) {
+                String ownerQn = safeQN(owner);
+                if (ownerQn != null) {
+                    CtType<?> ownerType = owner.getTypeDeclaration();
+                    if (ownerType == null) {
+                        try {
+                            ownerType = f.Type().get(ownerQn);
+                        } catch (Throwable ignored) {
+                        }
+                        if (ownerType == null) {
+                            try {
+                                ownerType = model.getAllTypes().stream()
+                                    .filter(t -> ownerQn.equals(safeQN(t.getReference())))
+                                    .findFirst()
+                                    .orElse(null);
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    }
+                    if (ownerType != null) {
+                        final int argCount = args.size();
+                        boolean hasMatchingMethod = false;
+                        if (ownerType instanceof CtClass) {
+                            hasMatchingMethod = ((CtClass<?>) ownerType).getMethods().stream()
+                                .anyMatch(m -> name.equals(m.getSimpleName()) && m.getParameters().size() == argCount);
+                        } else if (ownerType instanceof CtInterface) {
+                            hasMatchingMethod = ((CtInterface<?>) ownerType).getMethods().stream()
+                                .anyMatch(m -> name.equals(m.getSimpleName()) && m.getParameters().size() == argCount);
+                        }
+                        // If there's an existing method with matching parameter count, skip creating the plan
+                        // The existing method should handle the call (Java's method resolution will handle null arguments)
+                        // This prevents creating ambiguous methods like getMetadata(Object, ...) when getMetadata(Message, ...) exists
+                        if (hasMatchingMethod) {
+                            continue;
+                        }
+                    }
+                }
+            }
             // collapse anonymous classes to nominal super (first interface, else superclass),
 // then coerce functional args (lambda/method-ref), then fix varargs element type
             for (int i = 0; i < args.size() && i < paramTypes.size(); i++) {
@@ -1003,9 +1080,197 @@ public final class SpoonCollector {
             
             List<CtTypeReference<?>> fromRef = (ex != null ? ex.getParameters() : Collections.emptyList());
             boolean refSane = fromRef != null && !fromRef.isEmpty() && fromRef.stream().allMatch(this::isSaneType);
+            
+            // Check if there are existing methods that could cause ambiguity
+            // If there are existing methods and we're creating one with Unknown for null,
+            // we should use Object to avoid ambiguity at call site
+            // This applies regardless of failOnAmbiguity to prevent compilation errors
+            boolean hasExistingMethods = false;
+            if (!hasObjectParams && argsContainNullLiteral(inv.getArguments())) {
+                // Check methods in the model (both classes and interfaces)
+                if (owner != null) {
+                    CtType<?> ownerType = owner.getTypeDeclaration();
+                    // If getTypeDeclaration() returns null, try multiple ways to find the type
+                    if (ownerType == null) {
+                        String ownerQn = safeQN(owner);
+                        if (ownerQn != null) {
+                            // Try 1: Get from factory
+                            try {
+                                ownerType = f.Type().get(ownerQn);
+                            } catch (Throwable ignored) {
+                            }
+                            // Try 2: Search in model directly (for source code types)
+                            if (ownerType == null) {
+                                try {
+                                    ownerType = model.getAllTypes().stream()
+                                        .filter(t -> {
+                                            String tQn = safeQN(t.getReference());
+                                            return ownerQn.equals(tQn);
+                                        })
+                                        .findFirst()
+                                        .orElse(null);
+                                } catch (Throwable ignored) {
+                                }
+                            }
+                        }
+                    }
+                    if (ownerType != null) {
+                        // Check both classes and interfaces
+                        // IMPORTANT: Only count methods that are from source code (have a position),
+                        // not methods we're about to create (which don't have positions yet)
+                        if (ownerType instanceof CtClass) {
+                            CtClass<?> ownerClass = (CtClass<?>) ownerType;
+                            long methodCount = ownerClass.getMethods().stream()
+                                .filter(m -> {
+                                    if (!name.equals(m.getSimpleName())) return false;
+                                    // Only count source code methods (they have positions)
+                                    // Methods we create don't have positions yet
+                                    try {
+                                        return m.getPosition() != null && m.getPosition().getSourceStart() >= 0;
+                                    } catch (Throwable e) {
+                                        // If we can't check position, assume it's a source method
+                                        return true;
+                                    }
+                                })
+                                .count();
+                            hasExistingMethods = methodCount > 0;
+                        } else if (ownerType instanceof CtInterface) {
+                            CtInterface<?> ownerInterface = (CtInterface<?>) ownerType;
+                            long methodCount = ownerInterface.getMethods().stream()
+                                .filter(m -> {
+                                    if (!name.equals(m.getSimpleName())) return false;
+                                    // Only count source code methods (they have positions)
+                                    try {
+                                        return m.getPosition() != null && m.getPosition().getSourceStart() >= 0;
+                                    } catch (Throwable e) {
+                                        return true;
+                                    }
+                                })
+                                .count();
+                            hasExistingMethods = methodCount > 0;
+                        }
+                    }
+                }
+                
+                // Also check method plans that have already been collected
+                if (!hasExistingMethods && owner != null) {
+                    String ownerQn = safeQN(owner);
+                    if (ownerQn != null) {
+                        long planCount = out.methodPlans.stream()
+                            .filter(p -> name.equals(p.name) && ownerQn.equals(safeQN(p.ownerType)))
+                            .count();
+                        hasExistingMethods = planCount > 0;
+                    }
+                }
+                
+                // Use Object if there are existing methods (to avoid ambiguity with null arguments)
+                if (hasExistingMethods) {
+                    List<CtTypeReference<?>> resolvedParamTypes = new ArrayList<>();
+                    for (int i = 0; i < paramTypes.size(); i++) {
+                        CtTypeReference<?> paramType = paramTypes.get(i);
+                        // If this is Unknown and the argument is null, use Object instead
+                        if (i < inv.getArguments().size()) {
+                            CtExpression<?> arg = inv.getArguments().get(i);
+                            if (arg instanceof CtLiteral && ((CtLiteral<?>) arg).getValue() == null) {
+                                String paramTypeQn = safeQN(paramType);
+                                if (paramTypeQn == null || paramTypeQn.equals("unknown.Unknown") || 
+                                    paramTypeQn.contains("Unknown") || paramType == null) {
+                                    resolvedParamTypes.add(f.Type().createReference("java.lang.Object"));
+                                    continue;
+                                }
+                            }
+                        }
+                        resolvedParamTypes.add(paramType);
+                    }
+                    paramTypes = resolvedParamTypes;
+                    
+                    // Re-check if we now have Object params
+                    hasObjectParams = resolvedParamTypes.stream().anyMatch(t -> {
+                        if (t == null) return false;
+                        try {
+                            String qn = t.getQualifiedName();
+                            return qn != null && ("java.lang.Object".equals(qn) || 
+                                    t.equals(f.Type().OBJECT) || 
+                                    (t.getSimpleName() != null && "Object".equals(t.getSimpleName()) && 
+                                     (t.getPackage() == null || "java.lang".equals(t.getPackage().getQualifiedName()))));
+                        } catch (Throwable e) {
+                            return false;
+                        }
+                    });
+                }
+            }
+            
+            // IMPORTANT: If we found existing source methods and converted to Object,
+            // check if any existing source method has the same parameter count
+            // If so, skip creating the method plan to avoid ambiguity
+            // The existing method should handle the call (Java will handle type checking)
+            if (hasObjectParams && hasExistingMethods && owner != null) {
+                String ownerQn = safeQN(owner);
+                if (ownerQn != null) {
+                    // Check if any existing source method has the same parameter count
+                    CtType<?> ownerType = owner.getTypeDeclaration();
+                    if (ownerType == null) {
+                        try {
+                            ownerType = f.Type().get(ownerQn);
+                        } catch (Throwable ignored) {
+                        }
+                        if (ownerType == null) {
+                            try {
+                                ownerType = model.getAllTypes().stream()
+                                    .filter(t -> ownerQn.equals(safeQN(t.getReference())))
+                                    .findFirst()
+                                    .orElse(null);
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    }
+                    if (ownerType != null) {
+                        // Use final variable for lambda
+                        final int paramCount = paramTypes.size();
+                        boolean hasMatchingParamCount = false;
+                        if (ownerType instanceof CtClass) {
+                            hasMatchingParamCount = ((CtClass<?>) ownerType).getMethods().stream()
+                                .filter(m -> {
+                                    if (!name.equals(m.getSimpleName())) return false;
+                                    try {
+                                        // Only count source methods
+                                        if (m.getPosition() == null || m.getPosition().getSourceStart() < 0) return false;
+                                    } catch (Throwable e) {
+                                        return true; // Assume source method if we can't check
+                                    }
+                                    return m.getParameters().size() == paramCount;
+                                })
+                                .findAny()
+                                .isPresent();
+                        } else if (ownerType instanceof CtInterface) {
+                            hasMatchingParamCount = ((CtInterface<?>) ownerType).getMethods().stream()
+                                .filter(m -> {
+                                    if (!name.equals(m.getSimpleName())) return false;
+                                    try {
+                                        if (m.getPosition() == null || m.getPosition().getSourceStart() < 0) return false;
+                                    } catch (Throwable e) {
+                                        return true;
+                                    }
+                                    return m.getParameters().size() == paramCount;
+                                })
+                                .findAny()
+                                .isPresent();
+                        }
+                        // If there's an existing source method with matching parameter count, skip creating the plan
+                        // This prevents creating ambiguous methods like getMetadata(Object, ...) when getMetadata(Message, ...) exists
+                        if (hasMatchingParamCount) {
+                            // Skip creating this method plan - the existing method should handle the call
+                            continue;
+                        }
+                    }
+                }
+            }
+            
             // Only throw ambiguity exception if we can't resolve types AND failOnAmbiguity is true
+            // AND there are no existing methods (if there were, we would have converted to Object)
             // If we're using Object for null args, we can proceed (Object is less ambiguous than Unknown)
-            if (!refSane && !hasObjectParams && argsContainNullLiteral(inv.getArguments()) && cfg.isFailOnAmbiguity()) {
+            // This matches the original working version logic, but also checks for existing methods
+            if (!refSane && !hasObjectParams && argsContainNullLiteral(inv.getArguments()) && cfg.isFailOnAmbiguity() && !hasExistingMethods) {
                 String ownerQN = (owner != null ? owner.getQualifiedName() : "<unknown>");
                 throw new AmbiguityException("Ambiguous method parameters (null argument): " + ownerQN + "#" + name + "(...)");
             }
@@ -2002,6 +2267,47 @@ public final class SpoonCollector {
 
             CtExecutableReference<?> ex = inv.getExecutable();
             String name = (ex != null ? ex.getSimpleName() : "m");
+            
+            // EARLY CHECK: If there's a null argument and an existing method with matching parameter count,
+            // skip creating the method plan to avoid ambiguity
+            List<CtExpression<?>> invArgs = inv.getArguments();
+            if (argsContainNullLiteral(invArgs) && owner != null && invArgs.size() > 0) {
+                String ownerQn = safeQN(owner);
+                if (ownerQn != null) {
+                    CtType<?> ownerType = owner.getTypeDeclaration();
+                    if (ownerType == null) {
+                        try {
+                            ownerType = f.Type().get(ownerQn);
+                        } catch (Throwable ignored) {
+                        }
+                        if (ownerType == null) {
+                            try {
+                                ownerType = model.getAllTypes().stream()
+                                    .filter(t -> ownerQn.equals(safeQN(t.getReference())))
+                                    .findFirst()
+                                    .orElse(null);
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    }
+                    if (ownerType != null) {
+                        final int argCount = invArgs.size();
+                        boolean hasMatchingMethod = false;
+                        if (ownerType instanceof CtClass) {
+                            hasMatchingMethod = ((CtClass<?>) ownerType).getMethods().stream()
+                                .anyMatch(m -> name.equals(m.getSimpleName()) && m.getParameters().size() == argCount);
+                        } else if (ownerType instanceof CtInterface) {
+                            hasMatchingMethod = ((CtInterface<?>) ownerType).getMethods().stream()
+                                .anyMatch(m -> name.equals(m.getSimpleName()) && m.getParameters().size() == argCount);
+                        }
+                        // If there's an existing method with matching parameter count, skip creating the plan
+                        // This prevents creating ambiguous methods when calling with null arguments
+                        if (hasMatchingMethod) {
+                            continue;
+                        }
+                    }
+                }
+            }
 
             boolean isStatic = inv.getTarget() instanceof CtTypeAccess<?>;
             boolean isSuperCall = inv.getTarget() instanceof CtSuperAccess<?>;
@@ -2505,7 +2811,18 @@ public final class SpoonCollector {
      * Derive a parameter type from an argument expression; returns Object for null/unknown-ish to avoid ambiguity.
      */
     private CtTypeReference<?> paramTypeOrObject(CtExpression<?> arg) {
-        if (arg == null) return f.Type().OBJECT;
+        if (arg == null) return f.Type().createReference(UnknownType.CLASS);
+        
+        // Check if argument is null literal
+        if (arg instanceof CtLiteral) {
+            CtLiteral<?> literal = (CtLiteral<?>) arg;
+            if (literal.getValue() == null) {
+                // Null literal - return Unknown by default
+                // The logic in collectUnresolvedMethodCalls will convert to Object
+                // only when failOnAmbiguity=false AND there are multiple overloads
+                return f.Type().createReference(UnknownType.CLASS);
+            }
+        }
 
         // collapse anonymous classes to nominal supertype (first interface, else superclass)
         if (arg instanceof CtNewClass) {
