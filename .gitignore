@@ -6,3 +6,8 @@ input
 jars
 repos
 gen
+.md
+experiment
+experiment_result
+.experiment
+.experiment_result

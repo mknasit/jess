@@ -43,10 +43,13 @@ public final class SpoonStubbingRunner implements Stubber {
             cfg.setFailOnAmbiguity(Boolean.parseBoolean(sys));
         }
 
-        // 1) Configure Spoon for Java 11
+        // 1) Configure Spoon with dynamic Java compliance level
         Launcher launcher = new Launcher();
         var env = launcher.getEnvironment();
-        env.setComplianceLevel(11);
+        
+        // Determine Java compliance level from targetVersion or default to 17 (supports records, modern APIs)
+        int complianceLevel = determineComplianceLevel(cfg.getTargetVersion());
+        env.setComplianceLevel(complianceLevel);
         env.setAutoImports(false); // Disable auto-imports to prevent invalid imports like "import Unknown;"
         env.setSourceOutputDirectory(slicedSrcDir.toFile());
 
@@ -1394,6 +1397,51 @@ public final class SpoonStubbingRunner implements Stubber {
             }
         } catch (IOException e) {
             System.err.println("[postProcess] Error scanning output directory: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Determines Java compliance level from targetVersion string.
+     * Defaults to 17 (supports records, modern APIs) if version is unknown or null.
+     * 
+     * Java 19+ Support:
+     * - Java 19 (class file version 63) → compliance level 17
+     * - Java 20 (class file version 64) → compliance level 17
+     * - Java 21+ (class file version 65+) → compliance level 21
+     * 
+     * Note: Spoon supports compliance levels 8, 9, 10, 11, 17, 21.
+     * Java 19-20 features are mostly compatible with level 17, while Java 21+
+     * requires level 21 for full support.
+     * 
+     * @param targetVersion Version string (e.g., "11", "17", "19", "21", "1.8", null)
+     * @return Compliance level (8, 9, 10, 11, 17, 21)
+     */
+    private int determineComplianceLevel(String targetVersion) {
+        if (targetVersion == null || targetVersion.isEmpty() || targetVersion.equals("unknown")) {
+            // Default to 17 for modern Java features (records, sealed classes, etc.)
+            return 17;
+        }
+        
+        // Normalize version string (remove "1." prefix for Java 8 and earlier)
+        String normalized = targetVersion.trim();
+        if (normalized.startsWith("1.")) {
+            normalized = normalized.substring(2);
+        }
+        
+        try {
+            int version = Integer.parseInt(normalized);
+            // Spoon supports compliance levels: 8, 9, 10, 11, 17, 21, etc.
+            // Map to nearest supported level
+            if (version <= 8) return 8;
+            if (version <= 11) return 11;
+            if (version <= 16) return 11; // Use 11 for 12-16
+            if (version <= 20) return 17; // Use 17 for 17-20 (includes Java 19)
+            if (version <= 22) return 21; // Use 21 for 21-22
+            return 21; // Default to 21 for newer versions (23+)
+        } catch (NumberFormatException e) {
+            // If parsing fails, default to 17
+            System.err.println("Warning: Could not parse targetVersion '" + targetVersion + "', defaulting to Java 17");
+            return 17;
         }
     }
 }

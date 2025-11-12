@@ -12,7 +12,9 @@ public final class SpoonEnv {
     public static Launcher createJava11Launcher(Path outDir, List<Path> classpathJars) {
         Launcher launcher = new Launcher();
         var env = launcher.getEnvironment();
-        env.setComplianceLevel(11);
+        // Default to 17 for modern Java features (records, sealed classes, etc.)
+        // This method name is kept for backward compatibility but now defaults to 17
+        env.setComplianceLevel(17);
         env.setAutoImports(true);
         env.setSourceOutputDirectory(outDir.toFile());
 

@@ -27,12 +27,46 @@ public class PackageFinder {
                 String packageName = getPackageRoot(javaFile);
                 if (packageName == null) continue;
                 if (blacklistEnabled && isBlacklisted(packageName)) continue;
+                
+                // Validate the source root path before adding
+                if (!isValidSourceRoot(packageName)) {
+                    System.err.println("Warning: Skipping invalid source root: " + packageName);
+                    continue;
+                }
 
                 packages.add(packageName);
             } catch (IOException ignored) {}
         }
 
         return packages;
+    }
+    
+    /**
+     * Validates that a source root path is valid and exists.
+     * Filters out invalid paths like those ending with '-' or '_', empty paths, or non-existent directories.
+     * 
+     * @param path The source root path to validate
+     * @return true if the path is valid, false otherwise
+     */
+    private static boolean isValidSourceRoot(String path) {
+        if (path == null || path.isEmpty()) {
+            return false;
+        }
+        
+        // Filter out suspicious paths (ending with '-' or '_' suggests incomplete parsing)
+        String trimmed = path.trim();
+        if (trimmed.endsWith("-") || trimmed.endsWith("_") || trimmed.endsWith(".")) {
+            return false;
+        }
+        
+        // Check if path exists and is a directory
+        try {
+            Path p = Paths.get(path);
+            return Files.exists(p) && Files.isDirectory(p);
+        } catch (Exception e) {
+            // Invalid path format
+            return false;
+        }
     }
 
     private static String getPackageRoot(String javaFile) throws IOException {

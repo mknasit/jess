@@ -87,9 +87,26 @@ public class Jess {
         combinedTypeSolver.add(reflectiveSolver);
 
         for (String packageRoot : packageRoots) {
-            JavaParserTypeSolver javaSolver = new JavaParserTypeSolver(Paths.get(packageRoot));
-            combinedTypeSolver.add(javaSolver);
-            this.packageRoots.add(packageRoot);
+            try {
+                Path rootPath = Paths.get(packageRoot);
+                // Validate path exists and is a directory before creating solver
+                if (!Files.exists(rootPath) || !Files.isDirectory(rootPath)) {
+                    System.err.println("Warning: Skipping invalid source root (does not exist or is not a directory): " + packageRoot);
+                    continue;
+                }
+                
+                JavaParserTypeSolver javaSolver = new JavaParserTypeSolver(rootPath);
+                combinedTypeSolver.add(javaSolver);
+                this.packageRoots.add(packageRoot);
+            } catch (IllegalStateException e) {
+                // JavaParserTypeSolver throws IllegalStateException if path is invalid
+                System.err.println("Warning: Skipping invalid source root: " + packageRoot + " - " + e.getMessage());
+                continue;
+            } catch (Exception e) {
+                // Catch any other exceptions (e.g., invalid path format)
+                System.err.println("Warning: Skipping source root due to error: " + packageRoot + " - " + e.getMessage());
+                continue;
+            }
         }
 
         for (String jar : jars) {
