@@ -226,6 +226,11 @@ public class Jess {
         } catch (Throwable e) {
             if (e instanceof StackOverflowError) {
                 System.err.println("Stackoverflow");
+            } else if (e instanceof OutOfMemoryError) {
+                System.err.println("OutOfMemoryError: " + e.getMessage());
+                System.err.println("Heap memory exhausted. Consider increasing JVM heap size with -Xmx option.");
+                // Try to free some memory
+                System.gc();
             } else {
                 e.printStackTrace();
             }
