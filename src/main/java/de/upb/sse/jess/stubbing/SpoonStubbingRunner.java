@@ -95,13 +95,20 @@ public final class SpoonStubbingRunner implements Stubber {
             new de.upb.sse.jess.stubbing.spoon.shim.ShimGenerator(f);
         
         // Collect referenced types that need shims
+        // MINIMAL STUBBING: Only types actually referenced in the target method/file are collected
+        // This ensures we only generate shims for what's needed, not everything
         Set<String> referencedTypes = collectReferencedTypes(model, plans);
         
-        // Always ensure LoggerFactory and Logger are collected (they're used in field initializations)
-        // Field initializations happen after shim generation, so we need to pre-collect them
-        referencedTypes.add("org.slf4j.LoggerFactory");
-        referencedTypes.add("org.slf4j.Logger");
+        // Only add SLF4J types if they're actually referenced (minimal stubbing)
+        // Check for: direct references, logger fields, or LoggerFactory calls
+        if (isSlf4jNeeded(model, referencedTypes)) {
+            referencedTypes.add("org.slf4j.LoggerFactory");
+            referencedTypes.add("org.slf4j.Logger");
+            referencedTypes.add("org.slf4j.Marker");
+        }
         
+        // Generate shims ONLY for referenced types (minimal stubbing)
+        // generateShimsForReferencedTypes() will skip any shim definitions that aren't in referencedTypes
         int shimsGenerated = shimGenerator.generateShimsForReferencedTypes(referencedTypes);
         if (shimsGenerated > 0) {
             System.out.println("Generated " + shimsGenerated + " shim classes for common libraries");
@@ -796,6 +803,22 @@ public final class SpoonStubbingRunner implements Stubber {
                 return;
             }
             
+            // Special handling for "Marker" - should be org.slf4j.Marker
+            if ("Marker".equals(simple)) {
+                // Check if it already has the correct package
+                CtPackageReference pkgRef = ref.getPackage();
+                String pkgName = (pkgRef != null ? pkgRef.getQualifiedName() : null);
+                
+                // If no package or wrong package, set it to "org.slf4j"
+                if (pkgName == null || !pkgName.equals("org.slf4j")) {
+                    ref.setPackage(f.Package().createReference("org.slf4j"));
+                }
+                // Force FQN printing for Marker
+                ref.setSimplyQualified(true);
+                ref.setImplicit(false);
+                return;
+            }
+            
             // If qualified name is null or empty, try to infer from simple name
             if (qn == null || qn.isEmpty()) {
                 return; // Can't fix without qualified name
@@ -1035,12 +1058,80 @@ public final class SpoonStubbingRunner implements Stubber {
         for (CtInvocation<?> inv : model.getElements(new TypeFilter<>(CtInvocation.class))) {
             try {
                 spoon.reflect.reference.CtExecutableReference<?> ex = inv.getExecutable();
-                if (ex != null && ex.isStatic()) {
+                if (ex != null) {
+                    // Collect declaring type (for both static and instance methods)
                     spoon.reflect.reference.CtTypeReference<?> owner = ex.getDeclaringType();
                     if (owner != null) {
                         String ownerQn = safeQN(owner);
                         if (ownerQn != null && !ownerQn.startsWith("java.") && !ownerQn.startsWith("javax.") && !ownerQn.startsWith("jakarta.")) {
                             referenced.add(ownerQn);
+                        }
+                        // Also collect type arguments from declaring type
+                        if (owner.getActualTypeArguments() != null) {
+                            for (CtTypeReference<?> typeArg : owner.getActualTypeArguments()) {
+                                if (!(typeArg instanceof spoon.reflect.reference.CtTypeParameterReference)) {
+                                    String typeArgQn = safeQN(typeArg);
+                                    if (typeArgQn != null && !typeArgQn.startsWith("java.") && 
+                                        !typeArgQn.startsWith("javax.") && !typeArgQn.startsWith("jakarta.")) {
+                                        referenced.add(typeArgQn);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Collect return type from method invocation
+                    CtTypeReference<?> returnType = ex.getType();
+                    if (returnType != null) {
+                        String returnQn = safeQN(returnType);
+                        if (returnQn != null && !returnQn.startsWith("java.") && 
+                            !returnQn.startsWith("javax.") && !returnQn.startsWith("jakarta.")) {
+                            referenced.add(returnQn);
+                        }
+                        // Collect type arguments from return type
+                        if (returnType.getActualTypeArguments() != null) {
+                            for (CtTypeReference<?> typeArg : returnType.getActualTypeArguments()) {
+                                if (!(typeArg instanceof spoon.reflect.reference.CtTypeParameterReference)) {
+                                    String typeArgQn = safeQN(typeArg);
+                                    if (typeArgQn != null && !typeArgQn.startsWith("java.") && 
+                                        !typeArgQn.startsWith("javax.") && !typeArgQn.startsWith("jakarta.")) {
+                                        referenced.add(typeArgQn);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {}
+        }
+        
+        // Also collect from field accesses (e.g., obj.field, Class.staticField)
+        for (CtFieldAccess<?> fieldAccess : model.getElements(new TypeFilter<>(CtFieldAccess.class))) {
+            try {
+                CtTypeReference<?> accessedType = fieldAccess.getVariable().getDeclaringType();
+                if (accessedType != null) {
+                    String accessedQn = safeQN(accessedType);
+                    if (accessedQn != null && !accessedQn.startsWith("java.") && 
+                        !accessedQn.startsWith("javax.") && !accessedQn.startsWith("jakarta.")) {
+                        referenced.add(accessedQn);
+                    }
+                }
+                CtTypeReference<?> fieldType = fieldAccess.getVariable().getType();
+                if (fieldType != null) {
+                    String fieldTypeQn = safeQN(fieldType);
+                    if (fieldTypeQn != null && !fieldTypeQn.startsWith("java.") && 
+                        !fieldTypeQn.startsWith("javax.") && !fieldTypeQn.startsWith("jakarta.")) {
+                        referenced.add(fieldTypeQn);
+                    }
+                    // Collect type arguments from field type generics
+                    if (fieldType.getActualTypeArguments() != null) {
+                        for (CtTypeReference<?> typeArg : fieldType.getActualTypeArguments()) {
+                            if (!(typeArg instanceof spoon.reflect.reference.CtTypeParameterReference)) {
+                                String typeArgQn = safeQN(typeArg);
+                                if (typeArgQn != null && !typeArgQn.startsWith("java.") && 
+                                    !typeArgQn.startsWith("javax.") && !typeArgQn.startsWith("jakarta.")) {
+                                    referenced.add(typeArgQn);
+                                }
+                            }
                         }
                     }
                 }
@@ -1125,6 +1216,22 @@ public final class SpoonStubbingRunner implements Stubber {
                     !qn.startsWith("javax.") && !qn.startsWith("jakarta.")) {
                     referenced.add(qn);
                 }
+                
+                // Also collect type arguments from generic types (transitive dependencies)
+                // e.g., List<String> -> collect String, Map<K, V> -> collect K and V if they're concrete types
+                if (typeRef.getActualTypeArguments() != null && !typeRef.getActualTypeArguments().isEmpty()) {
+                    for (CtTypeReference<?> typeArg : typeRef.getActualTypeArguments()) {
+                        // Skip type parameters (T, K, V, etc.) - only collect concrete types
+                        if (!(typeArg instanceof spoon.reflect.reference.CtTypeParameterReference)) {
+                            String typeArgQn = safeQN(typeArg);
+                            if (typeArgQn != null && !typeArgQn.isEmpty() && 
+                                !typeArgQn.startsWith("java.") && !typeArgQn.startsWith("javax.") && 
+                                !typeArgQn.startsWith("jakarta.")) {
+                                referenced.add(typeArgQn);
+                            }
+                        }
+                    }
+                }
             } catch (Throwable ignored) {}
         }
         
@@ -1136,17 +1243,160 @@ public final class SpoonStubbingRunner implements Stubber {
                     if (superQn != null && !superQn.startsWith("java.")) {
                         referenced.add(superQn);
                     }
+                    // Also collect type arguments from superclass generics
+                    if (type.getSuperclass().getActualTypeArguments() != null) {
+                        for (CtTypeReference<?> typeArg : type.getSuperclass().getActualTypeArguments()) {
+                            if (!(typeArg instanceof spoon.reflect.reference.CtTypeParameterReference)) {
+                                String typeArgQn = safeQN(typeArg);
+                                if (typeArgQn != null && !typeArgQn.startsWith("java.") && 
+                                    !typeArgQn.startsWith("javax.") && !typeArgQn.startsWith("jakarta.")) {
+                                    referenced.add(typeArgQn);
+                                }
+                            }
+                        }
+                    }
                 }
                 for (CtTypeReference<?> iface : type.getSuperInterfaces()) {
                     String ifaceQn = safeQN(iface);
                     if (ifaceQn != null && !ifaceQn.startsWith("java.")) {
                         referenced.add(ifaceQn);
                     }
+                    // Also collect type arguments from interface generics
+                    if (iface.getActualTypeArguments() != null) {
+                        for (CtTypeReference<?> typeArg : iface.getActualTypeArguments()) {
+                            if (!(typeArg instanceof spoon.reflect.reference.CtTypeParameterReference)) {
+                                String typeArgQn = safeQN(typeArg);
+                                if (typeArgQn != null && !typeArgQn.startsWith("java.") && 
+                                    !typeArgQn.startsWith("javax.") && !typeArgQn.startsWith("jakarta.")) {
+                                    referenced.add(typeArgQn);
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // Collect from field types
+                for (CtField<?> field : type.getFields()) {
+                    if (field.getType() != null) {
+                        String fieldTypeQn = safeQN(field.getType());
+                        if (fieldTypeQn != null && !fieldTypeQn.startsWith("java.") && 
+                            !fieldTypeQn.startsWith("javax.") && !fieldTypeQn.startsWith("jakarta.")) {
+                            referenced.add(fieldTypeQn);
+                        }
+                        // Also collect type arguments from field type generics
+                        if (field.getType().getActualTypeArguments() != null) {
+                            for (CtTypeReference<?> typeArg : field.getType().getActualTypeArguments()) {
+                                if (!(typeArg instanceof spoon.reflect.reference.CtTypeParameterReference)) {
+                                    String typeArgQn = safeQN(typeArg);
+                                    if (typeArgQn != null && !typeArgQn.startsWith("java.") && 
+                                        !typeArgQn.startsWith("javax.") && !typeArgQn.startsWith("jakarta.")) {
+                                        referenced.add(typeArgQn);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // Collect from method return types and parameter types
+                for (CtMethod<?> method : type.getMethods()) {
+                    if (method.getType() != null) {
+                        String returnTypeQn = safeQN(method.getType());
+                        if (returnTypeQn != null && !returnTypeQn.startsWith("java.") && 
+                            !returnTypeQn.startsWith("javax.") && !returnTypeQn.startsWith("jakarta.")) {
+                            referenced.add(returnTypeQn);
+                        }
+                        // Collect type arguments from return type generics
+                        if (method.getType().getActualTypeArguments() != null) {
+                            for (CtTypeReference<?> typeArg : method.getType().getActualTypeArguments()) {
+                                if (!(typeArg instanceof spoon.reflect.reference.CtTypeParameterReference)) {
+                                    String typeArgQn = safeQN(typeArg);
+                                    if (typeArgQn != null && !typeArgQn.startsWith("java.") && 
+                                        !typeArgQn.startsWith("javax.") && !typeArgQn.startsWith("jakarta.")) {
+                                        referenced.add(typeArgQn);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Collect from parameter types
+                    for (CtParameter<?> param : method.getParameters()) {
+                        if (param.getType() != null) {
+                            String paramTypeQn = safeQN(param.getType());
+                            if (paramTypeQn != null && !paramTypeQn.startsWith("java.") && 
+                                !paramTypeQn.startsWith("javax.") && !paramTypeQn.startsWith("jakarta.")) {
+                                referenced.add(paramTypeQn);
+                            }
+                            // Collect type arguments from parameter type generics
+                            if (param.getType().getActualTypeArguments() != null) {
+                                for (CtTypeReference<?> typeArg : param.getType().getActualTypeArguments()) {
+                                    if (!(typeArg instanceof spoon.reflect.reference.CtTypeParameterReference)) {
+                                        String typeArgQn = safeQN(typeArg);
+                                        if (typeArgQn != null && !typeArgQn.startsWith("java.") && 
+                                            !typeArgQn.startsWith("javax.") && !typeArgQn.startsWith("jakarta.")) {
+                                            referenced.add(typeArgQn);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             } catch (Throwable ignored) {}
         }
         
         return referenced;
+    }
+
+    /**
+     * Check if SLF4J types (LoggerFactory, Logger, Marker) are actually needed.
+     * They're needed if:
+     * 1. Already referenced in the code (direct usage, static calls, etc.)
+     * 2. There are logger fields in the model that need initialization
+     * 3. LoggerFactory.getLogger() is called (already collected by collectReferencedTypes)
+     * 
+     * This ensures minimal stubbing - we only generate SLF4J shims when actually needed.
+     */
+    private boolean isSlf4jNeeded(CtModel model, Set<String> referencedTypes) {
+        // Check if SLF4J types are already referenced
+        boolean hasSlf4jReference = referencedTypes.stream()
+            .anyMatch(ref -> ref != null && (
+                ref.contains("slf4j") || 
+                ref.contains("LoggerFactory") || 
+                (ref.contains("Logger") && ref.contains("org.slf4j"))
+            ));
+        
+        if (hasSlf4jReference) {
+            return true;
+        }
+        
+        // Check if there are logger fields in the model that need initialization
+        try {
+            for (CtType<?> type : model.getAllTypes()) {
+                if (!(type instanceof CtClass)) continue;
+                
+                CtClass<?> cls = (CtClass<?>) type;
+                for (CtField<?> field : cls.getFields()) {
+                    CtTypeReference<?> fieldType = field.getType();
+                    if (fieldType == null) continue;
+                    
+                    String fieldTypeQn = safeQN(fieldType);
+                    if (fieldTypeQn != null && (
+                        fieldTypeQn.contains("Logger") || 
+                        fieldTypeQn.contains("slf4j") ||
+                        // Check for common logger field names
+                        (field.getSimpleName().toLowerCase().contains("log") && 
+                         fieldTypeQn.contains("org.slf4j"))
+                    )) {
+                        return true;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+            // If we can't check, be safe and return false (don't generate unnecessary shims)
+        }
+        
+        return false;
     }
 
     private static boolean isPrimitiveTypeName(String simpleName) {

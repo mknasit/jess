@@ -38,12 +38,26 @@ public class ShimGenerator {
         addShim("org.antlr.v4.runtime", "ParserRuleContext", createClassShim("org.antlr.v4.runtime.ParserRuleContext"));
         addShim("org.antlr.v4.runtime.tree", "ParseTree", createInterfaceShim("org.antlr.v4.runtime.tree.ParseTree"));
         addShim("org.antlr.v4.runtime.tree", "ParseTreeVisitor", createInterfaceShim("org.antlr.v4.runtime.tree.ParseTreeVisitor"));
+        // Additional ANTLR shims
+        addShim("org.antlr.v4.runtime", "CharStream", createInterfaceShim("org.antlr.v4.runtime.CharStream",
+            Arrays.asList("getText", "getSourceName")));
+        addShim("org.antlr.v4.runtime", "TokenStream", createInterfaceShim("org.antlr.v4.runtime.TokenStream",
+            Arrays.asList("get", "consume", "LA", "mark", "release", "reset")));
+        addShim("org.antlr.v4.runtime", "CommonTokenStream", createClassShim("org.antlr.v4.runtime.CommonTokenStream",
+            Arrays.asList("get", "consume", "LA", "mark", "release", "reset")));
+        addShim("org.antlr.v4.runtime", "Recognizer", createClassShim("org.antlr.v4.runtime.Recognizer",
+            Arrays.asList("getTokenTypeMap", "getRuleIndexMap")));
+        addShim("org.antlr.v4.runtime", "BaseErrorListener", createClassShim("org.antlr.v4.runtime.BaseErrorListener",
+            Arrays.asList("syntaxError")));
 
         // SLF4J shims
+        addShim("org.slf4j", "Marker", createInterfaceShim("org.slf4j.Marker")); // Needed for Logger overloads
         addShim("org.slf4j", "Logger", createInterfaceShim("org.slf4j.Logger",
                 Arrays.asList("info", "debug", "warn", "error", "trace")));
+        // Overloads will be added automatically after shim generation
         addShim("org.slf4j", "LoggerFactory", createClassShim("org.slf4j.LoggerFactory",
                 Arrays.asList("getLogger")));
+        // Overloads will be added automatically after shim generation
         addShim("org.slf4j", "MDC", createClassShim("org.slf4j.MDC",
                 Arrays.asList("put", "get", "remove", "clear", "getCopyOfContextMap", "setContextMap")));
 
@@ -85,6 +99,11 @@ public class ShimGenerator {
         addShim("org.mockito", "Mock", createAnnotationShim("org.mockito.Mock"));
         addShim("org.mockito", "Mockito", createClassShim("org.mockito.Mockito",
                 Arrays.asList("mock", "when", "verify", "verify", "any")));
+        // Mockito supporting types (needed for overloads)
+        addShim("org.mockito.stubbing", "OngoingStubbing", createInterfaceShim("org.mockito.stubbing.OngoingStubbing",
+            Arrays.asList("thenReturn", "thenThrow", "thenAnswer")));
+        addShim("org.mockito.stubbing", "Answer", createInterfaceShim("org.mockito.stubbing.Answer",
+            Arrays.asList("answer")));
 
         // Guava shims (common types)
         addShim("com.google.common.base", "Optional", createClassShim("com.google.common.base.Optional",
@@ -95,6 +114,17 @@ public class ShimGenerator {
                 Arrays.asList("of", "copyOf")));
         addShim("com.google.common.collect", "ImmutableMap", createClassShim("com.google.common.collect.ImmutableMap",
                 Arrays.asList("of", "copyOf")));
+        // Guava utility classes
+        addShim("com.google.common.base", "Preconditions", createClassShim("com.google.common.base.Preconditions",
+            Arrays.asList("checkNotNull", "checkArgument", "checkState", "checkElementIndex")));
+        addShim("com.google.common.base", "MoreObjects", createClassShim("com.google.common.base.MoreObjects",
+            Arrays.asList("toStringHelper", "firstNonNull")));
+        addShim("com.google.common.collect", "Lists", createClassShim("com.google.common.collect.Lists",
+            Arrays.asList("newArrayList", "newLinkedList", "asList")));
+        addShim("com.google.common.collect", "Sets", createClassShim("com.google.common.collect.Sets",
+            Arrays.asList("newHashSet", "newLinkedHashSet", "newTreeSet")));
+        addShim("com.google.common.collect", "Maps", createClassShim("com.google.common.collect.Maps",
+            Arrays.asList("newHashMap", "newLinkedHashMap", "newTreeMap", "newConcurrentMap")));
 
         // gRPC shims
         addShim("io.grpc", "MethodDescriptor", createClassShim("io.grpc.MethodDescriptor"));
@@ -178,6 +208,18 @@ public class ShimGenerator {
         addShim("com.baomidou.mybatisplus.annotation", "TableName", createAnnotationShim("com.baomidou.mybatisplus.annotation.TableName"));
         addShim("com.baomidou.mybatisplus.annotation", "TableId", createAnnotationShim("com.baomidou.mybatisplus.annotation.TableId"));
         addShim("com.baomidou.mybatisplus.annotation", "TableField", createAnnotationShim("com.baomidou.mybatisplus.annotation.TableField"));
+        
+        // MyBatis Plus Extension sub-packages (missing from logs - 400+ errors)
+        addShim("com.baomidou.mybatisplus.extension.service", "IService", createInterfaceShim("com.baomidou.mybatisplus.extension.service.IService",
+                Arrays.asList("save", "saveBatch", "updateById", "updateBatchById", "removeById", "removeByIds",
+                        "getById", "listByIds", "list", "page", "count")));
+        addShim("com.baomidou.mybatisplus.extension.service.impl", "ServiceImpl", createClassShim("com.baomidou.mybatisplus.extension.service.impl.ServiceImpl",
+                Arrays.asList("save", "saveBatch", "updateById", "updateBatchById", "removeById", "removeByIds",
+                        "getById", "listByIds", "list", "page", "count", "getBaseMapper")));
+        addShim("com.baomidou.mybatisplus.extension.activerecord", "Model", createClassShim("com.baomidou.mybatisplus.extension.activerecord.Model",
+                Arrays.asList("save", "updateById", "deleteById", "selectById", "selectList", "selectPage")));
+        addShim("com.baomidou.mybatisplus.extension.api", "IBaseService", createInterfaceShim("com.baomidou.mybatisplus.extension.api.IBaseService",
+                Arrays.asList("save", "updateById", "removeById", "getById", "list")));
         addShim("com.baomidou.mybatisplus.extension.plugins", "PaginationInterceptor",
                 createClassShim("com.baomidou.mybatisplus.extension.plugins.PaginationInterceptor"));
         addShim("com.baomidou.mybatisplus.extension.plugins.inner", "PaginationInnerInterceptor",
@@ -224,7 +266,108 @@ public class ShimGenerator {
         addShim("jakarta.servlet.http", "Cookie", createClassShim("jakarta.servlet.http.Cookie",
                 Arrays.asList("getName", "getValue", "setValue", "getMaxAge", "setMaxAge")));
 
+        // javax.servlet shims (javax.servlet.*) - 346 errors from logs (Jakarta exists but javax.servlet still used)
+        addShim("javax.servlet", "Servlet", createInterfaceShim("javax.servlet.Servlet",
+                Arrays.asList("init", "service", "destroy", "getServletConfig", "getServletInfo")));
+        addShim("javax.servlet.http", "HttpServlet", createClassShim("javax.servlet.http.HttpServlet",
+                Arrays.asList("doGet", "doPost", "doPut", "doDelete", "doHead", "doOptions", "doTrace")));
+        addShim("javax.servlet.http", "HttpServletRequest", createInterfaceShim("javax.servlet.http.HttpServletRequest",
+                Arrays.asList("getParameter", "getParameterValues", "getHeader", "getMethod", "getRequestURI",
+                        "getQueryString", "getSession", "getCookies", "getAttribute", "setAttribute")));
+        addShim("javax.servlet.http", "HttpServletResponse", createInterfaceShim("javax.servlet.http.HttpServletResponse",
+                Arrays.asList("setStatus", "setHeader", "addHeader", "setContentType", "getWriter", "getOutputStream",
+                        "sendRedirect", "sendError", "addCookie")));
+        addShim("javax.servlet.http", "HttpSession", createInterfaceShim("javax.servlet.http.HttpSession",
+                Arrays.asList("getAttribute", "setAttribute", "removeAttribute", "invalidate", "getId")));
+        addShim("javax.servlet", "Filter", createInterfaceShim("javax.servlet.Filter",
+                Arrays.asList("init", "doFilter", "destroy")));
+        addShim("javax.servlet", "FilterChain", createInterfaceShim("javax.servlet.FilterChain",
+                Arrays.asList("doFilter")));
+        addShim("javax.servlet", "ServletContext", createInterfaceShim("javax.servlet.ServletContext",
+                Arrays.asList("getAttribute", "setAttribute", "getInitParameter")));
+        addShim("javax.servlet", "RequestDispatcher", createInterfaceShim("javax.servlet.RequestDispatcher",
+                Arrays.asList("forward", "include")));
+        addShim("javax.servlet", "ServletException", createClassShim("javax.servlet.ServletException"));
+        addShim("javax.servlet", "ServletInputStream", createClassShim("javax.servlet.ServletInputStream",
+                Arrays.asList("read", "readLine")));
+        addShim("javax.servlet", "ServletOutputStream", createClassShim("javax.servlet.ServletOutputStream",
+                Arrays.asList("write", "print", "println")));
+        addShim("javax.servlet.http", "Cookie", createClassShim("javax.servlet.http.Cookie",
+                Arrays.asList("getName", "getValue", "setValue", "getMaxAge", "setMaxAge")));
+
         // Spring Framework Core shims (org.springframework.*)
+        // Spring Core - ApplicationContext, BeanFactory
+        addShim("org.springframework.context", "ApplicationContext", createInterfaceShim("org.springframework.context.ApplicationContext",
+                Arrays.asList("getBean", "getBeanNamesForType", "containsBean", "isSingleton")));
+        addShim("org.springframework.context", "ConfigurableApplicationContext", createInterfaceShim("org.springframework.context.ConfigurableApplicationContext",
+                Arrays.asList("refresh", "close", "registerShutdownHook")));
+        addShim("org.springframework.beans.factory", "BeanFactory", createInterfaceShim("org.springframework.beans.factory.BeanFactory",
+                Arrays.asList("getBean", "getBeanNamesForType", "containsBean", "isSingleton")));
+        addShim("org.springframework.beans.factory", "ListableBeanFactory", createInterfaceShim("org.springframework.beans.factory.ListableBeanFactory",
+                Arrays.asList("getBeanNamesForType", "getBeansOfType")));
+        addShim("org.springframework.core.env", "Environment", createInterfaceShim("org.springframework.core.env.Environment",
+                Arrays.asList("getProperty", "getRequiredProperty", "containsProperty")));
+        addShim("org.springframework.core.env", "PropertySource", createClassShim("org.springframework.core.env.PropertySource"));
+        addShim("org.springframework.core.env", "MutablePropertySources", createClassShim("org.springframework.core.env.MutablePropertySources",
+                Arrays.asList("addFirst", "addLast", "addBefore", "addAfter")));
+        addShim("org.springframework.beans", "BeanUtils", createClassShim("org.springframework.beans.BeanUtils",
+                Arrays.asList("copyProperties", "instantiateClass")));
+        addShim("org.springframework.core", "Ordered", createInterfaceShim("org.springframework.core.Ordered"));
+        addShim("org.springframework.core.annotation", "Order", createAnnotationShim("org.springframework.core.annotation.Order"));
+        
+        // Spring Data JPA
+        addShim("org.springframework.data.jpa.repository", "JpaRepository", createInterfaceShim("org.springframework.data.jpa.repository.JpaRepository",
+                Arrays.asList("save", "findById", "findAll", "delete", "count")));
+        addShim("org.springframework.data.repository", "CrudRepository", createInterfaceShim("org.springframework.data.repository.CrudRepository",
+                Arrays.asList("save", "findById", "findAll", "delete", "count", "existsById")));
+        addShim("org.springframework.data.repository", "PagingAndSortingRepository", createInterfaceShim("org.springframework.data.repository.PagingAndSortingRepository",
+                Arrays.asList("findAll", "findAllById")));
+        addShim("org.springframework.data.repository.query", "Param", createAnnotationShim("org.springframework.data.repository.query.Param"));
+        addShim("org.springframework.data.jpa.repository", "Query", createAnnotationShim("org.springframework.data.jpa.repository.Query"));
+        
+        // Spring Security
+        addShim("org.springframework.security.core", "SecurityContext", createInterfaceShim("org.springframework.security.core.SecurityContext",
+                Arrays.asList("getAuthentication", "setAuthentication")));
+        addShim("org.springframework.security.core", "Authentication", createInterfaceShim("org.springframework.security.core.Authentication",
+                Arrays.asList("getPrincipal", "getAuthorities", "isAuthenticated", "getCredentials")));
+        addShim("org.springframework.security.core.userdetails", "UserDetails", createInterfaceShim("org.springframework.security.core.userdetails.UserDetails",
+                Arrays.asList("getUsername", "getPassword", "getAuthorities", "isAccountNonExpired", "isAccountNonLocked")));
+        addShim("org.springframework.security.core.userdetails", "UserDetailsService", createInterfaceShim("org.springframework.security.core.userdetails.UserDetailsService",
+                Arrays.asList("loadUserByUsername")));
+        addShim("org.springframework.security.authentication", "AuthenticationManager", createInterfaceShim("org.springframework.security.authentication.AuthenticationManager",
+                Arrays.asList("authenticate")));
+        addShim("org.springframework.security.authentication", "UsernamePasswordAuthenticationToken", createClassShim("org.springframework.security.authentication.UsernamePasswordAuthenticationToken"));
+        addShim("org.springframework.security.core.context", "SecurityContextHolder", createClassShim("org.springframework.security.core.context.SecurityContextHolder",
+                Arrays.asList("getContext", "setContext", "clearContext")));
+        
+        // Spring UI/Model
+        addShim("org.springframework.ui", "Model", createInterfaceShim("org.springframework.ui.Model",
+                Arrays.asList("addAttribute", "addAllAttributes", "containsAttribute", "getAttribute")));
+        addShim("org.springframework.ui", "ModelMap", createClassShim("org.springframework.ui.ModelMap",
+                Arrays.asList("addAttribute", "put", "get")));
+        
+        // Spring Boot
+        addShim("org.springframework.boot", "SpringApplication", createClassShim("org.springframework.boot.SpringApplication",
+                Arrays.asList("run", "setDefaultProperties")));
+        addShim("org.springframework.boot.autoconfigure", "SpringBootApplication", createAnnotationShim("org.springframework.boot.autoconfigure.SpringBootApplication"));
+        addShim("org.springframework.boot.context.properties", "ConfigurationProperties", createAnnotationShim("org.springframework.boot.context.properties.ConfigurationProperties"));
+        
+        // Spring Context Events
+        addShim("org.springframework.context.event", "ApplicationEvent", createClassShim("org.springframework.context.event.ApplicationEvent"));
+        addShim("org.springframework.context.event", "ApplicationListener", createInterfaceShim("org.springframework.context.event.ApplicationListener",
+                Arrays.asList("onApplicationEvent")));
+        addShim("org.springframework.context", "ApplicationEventPublisher", createInterfaceShim("org.springframework.context.ApplicationEventPublisher",
+                Arrays.asList("publishEvent")));
+        
+        // Spring Web Server
+        addShim("org.springframework.web.server", "ServerWebExchange", createInterfaceShim("org.springframework.web.server.ServerWebExchange",
+                Arrays.asList("getRequest", "getResponse", "getAttributes")));
+        addShim("org.springframework.web.server", "WebFilter", createInterfaceShim("org.springframework.web.server.WebFilter",
+                Arrays.asList("filter")));
+        addShim("org.springframework.web.server", "WebFilterChain", createInterfaceShim("org.springframework.web.server.WebFilterChain",
+                Arrays.asList("filter")));
+        
+        // Spring Framework Web annotations
         addShim("org.springframework.web.bind.annotation", "RestController", createAnnotationShim("org.springframework.web.bind.annotation.RestController"));
         addShim("org.springframework.web.bind.annotation", "Controller", createAnnotationShim("org.springframework.web.bind.annotation.Controller"));
         addShim("org.springframework.web.bind.annotation", "RequestMapping", createAnnotationShim("org.springframework.web.bind.annotation.RequestMapping"));
@@ -542,6 +685,368 @@ public class ShimGenerator {
         addShim("cn.hippo4j.core.toolkit", "ThreadPoolExecutorBuilder",
                 createClassShim("cn.hippo4j.core.toolkit.ThreadPoolExecutorBuilder",
                         Arrays.asList("build", "corePoolSize", "maximumPoolSize", "keepAliveTime")));
+
+        // ======================================================================
+        // ADDITIONAL FRAMEWORK SHIMS - Based on Real Repository Analysis
+        // ======================================================================
+
+        // Netty shims (io.netty.*) - Very common in repositories
+        addShim("io.netty.buffer", "ByteBuf", createClassShim("io.netty.buffer.ByteBuf",
+            Arrays.asList("readableBytes", "readByte", "writeByte", "readInt", "writeInt", "readBytes", "writeBytes")));
+        addShim("io.netty.channel", "Channel", createInterfaceShim("io.netty.channel.Channel",
+            Arrays.asList("write", "flush", "close", "isActive", "isOpen")));
+        addShim("io.netty.channel", "ChannelHandler", createInterfaceShim("io.netty.channel.ChannelHandler"));
+        addShim("io.netty.channel", "ChannelHandlerContext", createInterfaceShim("io.netty.channel.ChannelHandlerContext",
+            Arrays.asList("write", "flush", "fireChannelRead", "fireChannelReadComplete")));
+        addShim("io.netty.channel", "ChannelInboundHandler", createInterfaceShim("io.netty.channel.ChannelInboundHandler",
+            Arrays.asList("channelRead", "channelActive", "channelInactive", "exceptionCaught")));
+        addShim("io.netty.channel", "ChannelOutboundHandler", createInterfaceShim("io.netty.channel.ChannelOutboundHandler",
+            Arrays.asList("write", "flush", "close")));
+        addShim("io.netty.channel", "ChannelPipeline", createInterfaceShim("io.netty.channel.ChannelPipeline",
+            Arrays.asList("addFirst", "addLast", "remove", "fireChannelRead")));
+        addShim("io.netty.channel", "EventLoopGroup", createInterfaceShim("io.netty.channel.EventLoopGroup",
+            Arrays.asList("shutdownGracefully")));
+        addShim("io.netty.bootstrap", "ServerBootstrap", createClassShim("io.netty.bootstrap.ServerBootstrap",
+            Arrays.asList("group", "channel", "childHandler", "bind")));
+        addShim("io.netty.bootstrap", "Bootstrap", createClassShim("io.netty.bootstrap.Bootstrap",
+            Arrays.asList("group", "channel", "handler", "connect")));
+
+        // Vert.x shims (io.vertx.*) - Common in reactive applications
+        addShim("io.vertx.core", "Vertx", createClassShim("io.vertx.core.Vertx",
+            Arrays.asList("createHttpServer", "createNetServer", "deployVerticle", "close")));
+        addShim("io.vertx.core", "Verticle", createInterfaceShim("io.vertx.core.Verticle",
+            Arrays.asList("start", "stop")));
+        addShim("io.vertx.core.http", "HttpServer", createInterfaceShim("io.vertx.core.http.HttpServer",
+            Arrays.asList("requestHandler", "listen", "close")));
+        addShim("io.vertx.core.http", "HttpServerRequest", createInterfaceShim("io.vertx.core.http.HttpServerRequest",
+            Arrays.asList("method", "uri", "path", "headers", "bodyHandler")));
+        addShim("io.vertx.core.http", "HttpServerResponse", createInterfaceShim("io.vertx.core.http.HttpServerResponse",
+            Arrays.asList("setStatusCode", "putHeader", "end", "write")));
+        addShim("io.vertx.core", "Handler", createInterfaceShim("io.vertx.core.Handler",
+            Arrays.asList("handle")));
+        addShim("io.vertx.core", "Future", createInterfaceShim("io.vertx.core.Future",
+            Arrays.asList("succeeded", "failed", "result", "cause", "onComplete", "onSuccess", "onFailure")));
+        addShim("io.vertx.core", "Promise", createInterfaceShim("io.vertx.core.Promise",
+            Arrays.asList("complete", "fail", "future")));
+
+        // Jedis shims (redis.clients.jedis.*) - Common Redis client
+        addShim("redis.clients.jedis", "Jedis", createClassShim("redis.clients.jedis.Jedis",
+            Arrays.asList("get", "set", "del", "exists", "keys", "hget", "hset", "hdel", "close")));
+        addShim("redis.clients.jedis", "JedisPool", createClassShim("redis.clients.jedis.JedisPool",
+            Arrays.asList("getResource", "close")));
+        addShim("redis.clients.jedis", "JedisPoolConfig", createClassShim("redis.clients.jedis.JedisPoolConfig"));
+        addShim("redis.clients.jedis", "Transaction", createInterfaceShim("redis.clients.jedis.Transaction",
+            Arrays.asList("get", "set", "exec", "discard")));
+        addShim("redis.clients.jedis", "Pipeline", createInterfaceShim("redis.clients.jedis.Pipeline",
+            Arrays.asList("get", "set", "sync", "close")));
+
+        // MyBatis shims (org.apache.ibatis.*) - Common ORM framework
+        addShim("org.apache.ibatis", "SqlSession", createInterfaceShim("org.apache.ibatis.SqlSession",
+            Arrays.asList("selectOne", "selectList", "insert", "update", "delete", "commit", "rollback", "close")));
+        addShim("org.apache.ibatis", "SqlSessionFactory", createInterfaceShim("org.apache.ibatis.SqlSessionFactory",
+            Arrays.asList("openSession", "getConfiguration")));
+        addShim("org.apache.ibatis.session", "SqlSessionFactoryBuilder", createClassShim("org.apache.ibatis.session.SqlSessionFactoryBuilder",
+            Arrays.asList("build")));
+        addShim("org.apache.ibatis.annotations", "Select", createAnnotationShim("org.apache.ibatis.annotations.Select"));
+        addShim("org.apache.ibatis.annotations", "Insert", createAnnotationShim("org.apache.ibatis.annotations.Insert"));
+        addShim("org.apache.ibatis.annotations", "Update", createAnnotationShim("org.apache.ibatis.annotations.Update"));
+        addShim("org.apache.ibatis.annotations", "Delete", createAnnotationShim("org.apache.ibatis.annotations.Delete"));
+        addShim("org.apache.ibatis.annotations", "Param", createAnnotationShim("org.apache.ibatis.annotations.Param"));
+        addShim("org.apache.ibatis.annotations", "Mapper", createAnnotationShim("org.apache.ibatis.annotations.Mapper"));
+        addShim("org.apache.ibatis.mapping", "MappedStatement", createClassShim("org.apache.ibatis.mapping.MappedStatement"));
+        addShim("org.apache.ibatis.mapping", "SqlCommandType", createEnumShim("org.apache.ibatis.mapping.SqlCommandType"));
+
+        // Alibaba Druid shims (com.alibaba.druid.*) - Database connection pool
+        addShim("com.alibaba.druid.pool", "DruidDataSource", createClassShim("com.alibaba.druid.pool.DruidDataSource",
+            Arrays.asList("getConnection", "close", "setUrl", "setUsername", "setPassword", "setDriverClassName")));
+        addShim("com.alibaba.druid.pool", "DruidConnectionHolder", createClassShim("com.alibaba.druid.pool.DruidConnectionHolder"));
+        addShim("com.alibaba.druid.filter", "Filter", createInterfaceShim("com.alibaba.druid.filter.Filter"));
+
+        // Alibaba FastJSON shims (com.alibaba.fastjson.*) - JSON library
+        addShim("com.alibaba.fastjson", "JSON", createClassShim("com.alibaba.fastjson.JSON",
+            Arrays.asList("toJSONString", "parseObject", "parseArray")));
+        addShim("com.alibaba.fastjson.annotation", "JSONField", createAnnotationShim("com.alibaba.fastjson.annotation.JSONField"));
+        addShim("com.alibaba.fastjson.serializer", "SerializeFilter", createClassShim("com.alibaba.fastjson.serializer.SerializeFilter"));
+
+        // Alibaba Nacos shims (com.alibaba.nacos.*) - Service discovery
+        addShim("com.alibaba.nacos.api", "NacosFactory", createClassShim("com.alibaba.nacos.api.NacosFactory",
+            Arrays.asList("createNamingService", "createConfigService")));
+        addShim("com.alibaba.nacos.api.naming", "NamingService", createInterfaceShim("com.alibaba.nacos.api.naming.NamingService",
+            Arrays.asList("registerInstance", "deregisterInstance", "getAllInstances", "selectInstances")));
+        addShim("com.alibaba.nacos.api.config", "ConfigService", createInterfaceShim("com.alibaba.nacos.api.config.ConfigService",
+            Arrays.asList("getConfig", "publishConfig", "removeConfig", "addListener")));
+
+        // Alibaba Sentinel shims (com.alibaba.csp.sentinel.*) - Flow control
+        addShim("com.alibaba.csp.sentinel", "SphU", createClassShim("com.alibaba.csp.sentinel.SphU",
+            Arrays.asList("entry")));
+        addShim("com.alibaba.csp.sentinel", "Entry", createInterfaceShim("com.alibaba.csp.sentinel.Entry",
+            Arrays.asList("exit")));
+        addShim("com.alibaba.csp.sentinel.annotation", "SentinelResource", createAnnotationShim("com.alibaba.csp.sentinel.annotation.SentinelResource"));
+
+        // Apache Commons IO shims (org.apache.commons.io.*)
+        addShim("org.apache.commons.io", "IOUtils", createClassShim("org.apache.commons.io.IOUtils",
+            Arrays.asList("copy", "toString", "toByteArray", "closeQuietly")));
+        addShim("org.apache.commons.io", "FileUtils", createClassShim("org.apache.commons.io.FileUtils",
+            Arrays.asList("readFileToString", "writeStringToFile", "copyFile", "deleteQuietly")));
+
+        // Apache Commons Codec shims (org.apache.commons.codec.*)
+        addShim("org.apache.commons.codec.digest", "DigestUtils", createClassShim("org.apache.commons.codec.digest.DigestUtils",
+            Arrays.asList("md5Hex", "sha256Hex", "sha1Hex")));
+        addShim("org.apache.commons.codec.binary", "Base64", createClassShim("org.apache.commons.codec.binary.Base64",
+            Arrays.asList("encodeBase64String", "decodeBase64")));
+
+        // Apache Commons Collections shims (org.apache.commons.collections4.*)
+        addShim("org.apache.commons.collections4", "CollectionUtils", createClassShim("org.apache.commons.collections4.CollectionUtils",
+            Arrays.asList("isEmpty", "isNotEmpty", "addAll", "union", "intersection")));
+        addShim("org.apache.commons.collections4", "MapUtils", createClassShim("org.apache.commons.collections4.MapUtils",
+            Arrays.asList("isEmpty", "isNotEmpty", "getString", "getInteger")));
+
+        // Jackson shims (com.fasterxml.jackson.*) - JSON library
+        addShim("com.fasterxml.jackson.databind", "ObjectMapper", createClassShim("com.fasterxml.jackson.databind.ObjectMapper",
+            Arrays.asList("readValue", "writeValueAsString", "writeValueAsBytes", "convertValue")));
+        addShim("com.fasterxml.jackson.annotation", "JsonProperty", createAnnotationShim("com.fasterxml.jackson.annotation.JsonProperty"));
+        addShim("com.fasterxml.jackson.annotation", "JsonIgnore", createAnnotationShim("com.fasterxml.jackson.annotation.JsonIgnore"));
+        addShim("com.fasterxml.jackson.annotation", "JsonFormat", createAnnotationShim("com.fasterxml.jackson.annotation.JsonFormat"));
+
+        // Gson shims (com.google.gson.*) - JSON library
+        addShim("com.google.gson", "Gson", createClassShim("com.google.gson.Gson",
+            Arrays.asList("toJson", "fromJson")));
+        addShim("com.google.gson.annotations", "SerializedName", createAnnotationShim("com.google.gson.annotations.SerializedName"));
+        addShim("com.google.gson.annotations", "Expose", createAnnotationShim("com.google.gson.annotations.Expose"));
+
+        // Joda Time shims (org.joda.time.*) - Date/time library
+        addShim("org.joda.time", "DateTime", createClassShim("org.joda.time.DateTime",
+            Arrays.asList("now", "toString", "plusDays", "minusDays", "toDate", "getMillis")));
+        addShim("org.joda.time.format", "DateTimeFormatter", createClassShim("org.joda.time.format.DateTimeFormatter",
+            Arrays.asList("forPattern", "print", "parseDateTime")));
+
+        // Apache Kafka shims (org.apache.kafka.*) - Messaging
+        addShim("org.apache.kafka.clients.producer", "KafkaProducer", createClassShim("org.apache.kafka.clients.producer.KafkaProducer",
+            Arrays.asList("send", "flush", "close")));
+        addShim("org.apache.kafka.clients.consumer", "KafkaConsumer", createClassShim("org.apache.kafka.clients.consumer.KafkaConsumer",
+            Arrays.asList("subscribe", "poll", "commitSync", "close")));
+        addShim("org.apache.kafka.clients.producer", "ProducerRecord", createClassShim("org.apache.kafka.clients.producer.ProducerRecord",
+            Arrays.asList("topic", "key", "value")));
+        addShim("org.apache.kafka.clients.consumer", "ConsumerRecord", createClassShim("org.apache.kafka.clients.consumer.ConsumerRecord",
+            Arrays.asList("topic", "key", "value", "offset", "partition")));
+
+        // Apache Flink shims (org.apache.flink.*) - Stream processing
+        addShim("org.apache.flink.streaming.api", "StreamExecutionEnvironment", createClassShim("org.apache.flink.streaming.api.StreamExecutionEnvironment",
+            Arrays.asList("getExecutionEnvironment", "addSource", "execute", "setParallelism")));
+        addShim("org.apache.flink.streaming.api.functions", "SourceFunction", createInterfaceShim("org.apache.flink.streaming.api.functions.SourceFunction",
+            Arrays.asList("run", "cancel")));
+        addShim("org.apache.flink.streaming.api.datastream", "DataStream", createClassShim("org.apache.flink.streaming.api.datastream.DataStream",
+            Arrays.asList("map", "filter", "keyBy", "print", "addSink")));
+
+        // Apache Camel shims (org.apache.camel.*) - Integration framework
+        addShim("org.apache.camel", "CamelContext", createInterfaceShim("org.apache.camel.CamelContext",
+            Arrays.asList("addRoutes", "start", "stop", "createProducerTemplate", "createConsumerTemplate")));
+        addShim("org.apache.camel.builder", "RouteBuilder", createClassShim("org.apache.camel.builder.RouteBuilder",
+            Arrays.asList("configure", "from", "to")));
+        addShim("org.apache.camel", "Exchange", createInterfaceShim("org.apache.camel.Exchange",
+            Arrays.asList("getIn", "getOut", "getProperty", "setProperty")));
+        addShim("org.apache.camel", "Message", createInterfaceShim("org.apache.camel.Message",
+            Arrays.asList("getBody", "setBody", "getHeader", "setHeader")));
+
+        // Apache Shiro shims (org.apache.shiro.*) - Security framework
+        addShim("org.apache.shiro", "SecurityUtils", createClassShim("org.apache.shiro.SecurityUtils",
+            Arrays.asList("getSubject")));
+        addShim("org.apache.shiro.subject", "Subject", createInterfaceShim("org.apache.shiro.subject.Subject",
+            Arrays.asList("login", "logout", "isAuthenticated", "hasRole", "checkRole", "isPermitted", "checkPermission")));
+        addShim("org.apache.shiro.authc", "AuthenticationToken", createInterfaceShim("org.apache.shiro.authc.AuthenticationToken",
+            Arrays.asList("getPrincipal", "getCredentials")));
+        addShim("org.apache.shiro.authc", "UsernamePasswordToken", createClassShim("org.apache.shiro.authc.UsernamePasswordToken"));
+
+        // Apache RocketMQ shims (org.apache.rocketmq.*) - Messaging
+        addShim("org.apache.rocketmq.client.producer", "DefaultMQProducer", createClassShim("org.apache.rocketmq.client.producer.DefaultMQProducer",
+            Arrays.asList("start", "send", "shutdown")));
+        addShim("org.apache.rocketmq.client.consumer", "DefaultMQPushConsumer", createClassShim("org.apache.rocketmq.client.consumer.DefaultMQPushConsumer",
+            Arrays.asList("subscribe", "registerMessageListener", "start", "shutdown")));
+        addShim("org.apache.rocketmq.common.message", "Message", createClassShim("org.apache.rocketmq.common.message.Message",
+            Arrays.asList("getBody", "setBody", "getTopic", "setTopic")));
+
+        // Apache Dubbo shims (org.apache.dubbo.*) - RPC framework
+        addShim("org.apache.dubbo.config", "ServiceConfig", createClassShim("org.apache.dubbo.config.ServiceConfig",
+            Arrays.asList("setInterface", "setRef", "export")));
+        addShim("org.apache.dubbo.config", "ReferenceConfig", createClassShim("org.apache.dubbo.config.ReferenceConfig",
+            Arrays.asList("setInterface", "get")));
+        addShim("org.apache.dubbo.rpc", "RpcContext", createClassShim("org.apache.dubbo.rpc.RpcContext",
+            Arrays.asList("getContext", "getRequest", "getResponse")));
+
+        // Hutool shims (cn.hutool.*) - Common utilities (very popular in Chinese repos)
+        addShim("cn.hutool.core.util", "StrUtil", createClassShim("cn.hutool.core.util.StrUtil",
+            Arrays.asList("isEmpty", "isNotEmpty", "isBlank", "isNotBlank", "trim", "format")));
+        addShim("cn.hutool.core.util", "DateUtil", createClassShim("cn.hutool.core.util.DateUtil",
+            Arrays.asList("now", "format", "parse", "offsetDay", "offsetMonth")));
+        addShim("cn.hutool.core.collection", "CollUtil", createClassShim("cn.hutool.core.collection.CollUtil",
+            Arrays.asList("isEmpty", "isNotEmpty", "newArrayList", "newHashSet")));
+        addShim("cn.hutool.http", "HttpUtil", createClassShim("cn.hutool.http.HttpUtil",
+            Arrays.asList("get", "post", "downloadFile")));
+        addShim("cn.hutool.json", "JSONUtil", createClassShim("cn.hutool.json.JSONUtil",
+            Arrays.asList("toJsonStr", "parseObj", "parseArray")));
+
+        // Seata shims (io.seata.*) - Distributed transaction
+        addShim("io.seata.rm", "GlobalTransaction", createInterfaceShim("io.seata.rm.GlobalTransaction",
+            Arrays.asList("begin", "commit", "rollback")));
+        addShim("io.seata.spring.annotation", "GlobalTransactional", createAnnotationShim("io.seata.spring.annotation.GlobalTransactional"));
+
+        // XXL-Job shims (com.xxl.job.*) - Job scheduling
+        addShim("com.xxl.job.core.handler", "IJobHandler", createClassShim("com.xxl.job.core.handler.IJobHandler",
+            Arrays.asList("execute")));
+        addShim("com.xxl.job.core.handler.annotation", "XxlJob", createAnnotationShim("com.xxl.job.core.handler.annotation.XxlJob"));
+
+        // PowerJob shims (tech.powerjob.*) - Job scheduling
+        addShim("tech.powerjob.worker", "PowerJobWorker", createClassShim("tech.powerjob.worker.PowerJobWorker",
+            Arrays.asList("init", "destroy")));
+        addShim("tech.powerjob.worker.core", "Processor", createInterfaceShim("tech.powerjob.worker.core.Processor",
+            Arrays.asList("process")));
+        addShim("tech.powerjob.worker.core", "TaskContext", createInterfaceShim("tech.powerjob.worker.core.TaskContext",
+            Arrays.asList("getJobId", "getInstanceId", "getJobParams", "getInstanceParams")));
+        addShim("tech.powerjob.common", "PowerJob", createClassShim("tech.powerjob.common.PowerJob",
+                Arrays.asList("init", "run")));
+        
+        // JPA shims (javax.persistence.*) - 333 errors from logs
+        addShim("javax.persistence", "Entity", createAnnotationShim("javax.persistence.Entity"));
+        addShim("javax.persistence", "Table", createAnnotationShim("javax.persistence.Table"));
+        addShim("javax.persistence", "Id", createAnnotationShim("javax.persistence.Id"));
+        addShim("javax.persistence", "GeneratedValue", createAnnotationShim("javax.persistence.GeneratedValue"));
+        addShim("javax.persistence", "Column", createAnnotationShim("javax.persistence.Column"));
+        addShim("javax.persistence", "OneToMany", createAnnotationShim("javax.persistence.OneToMany"));
+        addShim("javax.persistence", "ManyToOne", createAnnotationShim("javax.persistence.ManyToOne"));
+        addShim("javax.persistence", "ManyToMany", createAnnotationShim("javax.persistence.ManyToMany"));
+        addShim("javax.persistence", "OneToOne", createAnnotationShim("javax.persistence.OneToOne"));
+        addShim("javax.persistence", "JoinColumn", createAnnotationShim("javax.persistence.JoinColumn"));
+        addShim("javax.persistence", "EntityManager", createInterfaceShim("javax.persistence.EntityManager",
+                Arrays.asList("persist", "merge", "remove", "find", "createQuery", "getTransaction")));
+        addShim("javax.persistence", "EntityManagerFactory", createInterfaceShim("javax.persistence.EntityManagerFactory",
+                Arrays.asList("createEntityManager", "close")));
+        addShim("javax.persistence", "Query", createInterfaceShim("javax.persistence.Query",
+                Arrays.asList("getResultList", "getSingleResult", "executeUpdate", "setParameter")));
+        addShim("javax.persistence", "TypedQuery", createInterfaceShim("javax.persistence.TypedQuery",
+                Arrays.asList("getResultList", "getSingleResult", "setParameter")));
+        addShim("javax.persistence", "EntityTransaction", createInterfaceShim("javax.persistence.EntityTransaction",
+                Arrays.asList("begin", "commit", "rollback", "isActive")));
+        
+        // Jackson shims (com.fasterxml.jackson.databind.*) - 387 errors from logs
+        addShim("com.fasterxml.jackson.databind", "ObjectMapper", createClassShim("com.fasterxml.jackson.databind.ObjectMapper",
+                Arrays.asList("readValue", "writeValueAsString", "writeValueAsBytes", "convertValue", "readTree")));
+        addShim("com.fasterxml.jackson.databind", "JsonNode", createClassShim("com.fasterxml.jackson.databind.JsonNode",
+                Arrays.asList("get", "getTextValue", "asText", "asInt", "asLong", "asBoolean", "isNull", "isArray", "isObject")));
+        addShim("com.fasterxml.jackson.databind.node", "ObjectNode", createClassShim("com.fasterxml.jackson.databind.node.ObjectNode",
+                Arrays.asList("put", "putIfAbsent", "remove", "set", "get")));
+        addShim("com.fasterxml.jackson.databind.node", "ArrayNode", createClassShim("com.fasterxml.jackson.databind.node.ArrayNode",
+                Arrays.asList("add", "addAll", "insert", "remove", "get")));
+        addShim("com.fasterxml.jackson.annotation", "JsonProperty", createAnnotationShim("com.fasterxml.jackson.annotation.JsonProperty"));
+        addShim("com.fasterxml.jackson.annotation", "JsonIgnore", createAnnotationShim("com.fasterxml.jackson.annotation.JsonIgnore"));
+        addShim("com.fasterxml.jackson.annotation", "JsonIgnoreProperties", createAnnotationShim("com.fasterxml.jackson.annotation.JsonIgnoreProperties"));
+        addShim("com.fasterxml.jackson.annotation", "JsonFormat", createAnnotationShim("com.fasterxml.jackson.annotation.JsonFormat"));
+        addShim("com.fasterxml.jackson.core", "JsonProcessingException", createClassShim("com.fasterxml.jackson.core.JsonProcessingException"));
+        
+        // Netty shims (io.netty.*) - 821 errors from logs
+        addShim("io.netty.channel", "Channel", createInterfaceShim("io.netty.channel.Channel",
+                Arrays.asList("write", "writeAndFlush", "flush", "close", "isActive", "isOpen")));
+        addShim("io.netty.channel", "ChannelHandlerContext", createInterfaceShim("io.netty.channel.ChannelHandlerContext",
+                Arrays.asList("write", "writeAndFlush", "flush", "fireChannelRead", "fireChannelReadComplete")));
+        addShim("io.netty.channel", "ChannelInboundHandler", createInterfaceShim("io.netty.channel.ChannelInboundHandler",
+                Arrays.asList("channelRead", "channelActive", "channelInactive", "exceptionCaught")));
+        addShim("io.netty.channel", "ChannelOutboundHandler", createInterfaceShim("io.netty.channel.ChannelOutboundHandler",
+                Arrays.asList("write", "flush", "close")));
+        addShim("io.netty.channel", "ChannelPipeline", createInterfaceShim("io.netty.channel.ChannelPipeline",
+                Arrays.asList("addFirst", "addLast", "addBefore", "addAfter", "remove", "get")));
+        addShim("io.netty.channel", "EventLoopGroup", createInterfaceShim("io.netty.channel.EventLoopGroup",
+                Arrays.asList("next", "shutdownGracefully")));
+        addShim("io.netty.channel.nio", "NioEventLoopGroup", createClassShim("io.netty.channel.nio.NioEventLoopGroup"));
+        addShim("io.netty.bootstrap", "ServerBootstrap", createClassShim("io.netty.bootstrap.ServerBootstrap",
+                Arrays.asList("group", "channel", "childHandler", "bind")));
+        addShim("io.netty.bootstrap", "Bootstrap", createClassShim("io.netty.bootstrap.Bootstrap",
+                Arrays.asList("group", "channel", "handler", "connect")));
+        addShim("io.netty.handler.codec.http", "FullHttpRequest", createInterfaceShim("io.netty.handler.codec.http.FullHttpRequest",
+                Arrays.asList("method", "uri", "protocolVersion", "headers", "content")));
+        addShim("io.netty.handler.codec.http", "FullHttpResponse", createInterfaceShim("io.netty.handler.codec.http.FullHttpResponse",
+                Arrays.asList("status", "protocolVersion", "headers", "content")));
+        addShim("io.netty.handler.codec.http", "HttpRequest", createInterfaceShim("io.netty.handler.codec.http.HttpRequest",
+                Arrays.asList("method", "uri", "protocolVersion", "headers")));
+        addShim("io.netty.handler.codec.http", "HttpResponse", createInterfaceShim("io.netty.handler.codec.http.HttpResponse",
+                Arrays.asList("status", "protocolVersion", "headers")));
+        addShim("io.netty.handler.codec.http", "HttpHeaders", createClassShim("io.netty.handler.codec.http.HttpHeaders",
+                Arrays.asList("get", "set", "add", "contains")));
+        addShim("io.netty.handler.codec.http", "DefaultFullHttpRequest", createClassShim("io.netty.handler.codec.http.DefaultFullHttpRequest"));
+        addShim("io.netty.handler.codec.http", "DefaultFullHttpResponse", createClassShim("io.netty.handler.codec.http.DefaultFullHttpResponse"));
+        
+        // Complete Guava shims (com.google.common.*) - 842 errors from logs
+        // Note: ImmutableList, ImmutableSet, ImmutableMap, Preconditions, MoreObjects, Lists, Sets, Maps already exist
+        // Adding missing Guava sub-packages
+        addShim("com.google.common.collect", "Multimap", createInterfaceShim("com.google.common.collect.Multimap",
+                Arrays.asList("put", "get", "remove", "containsKey", "size")));
+        addShim("com.google.common.collect", "ListMultimap", createInterfaceShim("com.google.common.collect.ListMultimap",
+                Arrays.asList("put", "get", "remove", "containsKey")));
+        addShim("com.google.common.collect", "SetMultimap", createInterfaceShim("com.google.common.collect.SetMultimap",
+                Arrays.asList("put", "get", "remove", "containsKey")));
+        addShim("com.google.common.collect", "Multimaps", createClassShim("com.google.common.collect.Multimaps",
+                Arrays.asList("newListMultimap", "newSetMultimap", "asMap")));
+        addShim("com.google.common.collect", "Range", createClassShim("com.google.common.collect.Range",
+                Arrays.asList("closed", "open", "closedOpen", "openClosed", "all", "contains")));
+        addShim("com.google.common.collect", "Table", createInterfaceShim("com.google.common.collect.Table",
+                Arrays.asList("put", "get", "remove", "contains", "row", "column")));
+        addShim("com.google.common.collect", "HashBasedTable", createClassShim("com.google.common.collect.HashBasedTable",
+                Arrays.asList("create", "put", "get", "remove")));
+        addShim("com.google.common.base", "Optional", createClassShim("com.google.common.base.Optional",
+                Arrays.asList("of", "absent", "fromNullable", "isPresent", "get", "or", "orNull")));
+        addShim("com.google.common.base", "Stopwatch", createClassShim("com.google.common.base.Stopwatch",
+                Arrays.asList("createStarted", "start", "stop", "elapsed")));
+        addShim("com.google.common.base", "Splitter", createClassShim("com.google.common.base.Splitter",
+                Arrays.asList("on", "onPattern", "split", "splitToList")));
+        addShim("com.google.common.base", "Joiner", createClassShim("com.google.common.base.Joiner",
+                Arrays.asList("on", "join", "appendTo")));
+        addShim("com.google.common.cache", "Cache", createInterfaceShim("com.google.common.cache.Cache",
+                Arrays.asList("get", "put", "invalidate", "invalidateAll", "size")));
+        addShim("com.google.common.cache", "CacheBuilder", createClassShim("com.google.common.cache.CacheBuilder",
+                Arrays.asList("newBuilder", "maximumSize", "expireAfterWrite", "expireAfterAccess", "build")));
+        addShim("com.google.common.cache", "LoadingCache", createInterfaceShim("com.google.common.cache.LoadingCache",
+                Arrays.asList("get", "getUnchecked", "invalidate", "size")));
+        addShim("com.google.common.util.concurrent", "ListenableFuture", createInterfaceShim("com.google.common.util.concurrent.ListenableFuture",
+                Arrays.asList("addListener")));
+        addShim("com.google.common.util.concurrent", "Futures", createClassShim("com.google.common.util.concurrent.Futures",
+                Arrays.asList("successfulAsList", "allAsList", "transform", "transformAsync")));
+        
+        // Jedis shims (redis.clients.jedis.*) - 378 errors from logs
+        addShim("redis.clients.jedis", "Jedis", createClassShim("redis.clients.jedis.Jedis",
+                Arrays.asList("get", "set", "del", "exists", "keys", "hget", "hset", "hgetAll", "lpush", "rpush", "lpop", "rpop", "sadd", "smembers", "close")));
+        addShim("redis.clients.jedis", "JedisPool", createClassShim("redis.clients.jedis.JedisPool",
+                Arrays.asList("getResource", "close")));
+        addShim("redis.clients.jedis", "JedisPoolConfig", createClassShim("redis.clients.jedis.JedisPoolConfig",
+                Arrays.asList("setMaxTotal", "setMaxIdle", "setMinIdle", "setTestOnBorrow")));
+        addShim("redis.clients.jedis", "BinaryJedis", createClassShim("redis.clients.jedis.BinaryJedis",
+                Arrays.asList("get", "set", "del", "exists")));
+        addShim("redis.clients.jedis.params", "SetParams", createClassShim("redis.clients.jedis.params.SetParams",
+                Arrays.asList("ex", "px", "nx", "xx")));
+        addShim("redis.clients.jedis.params", "GetExParams", createClassShim("redis.clients.jedis.params.GetExParams",
+                Arrays.asList("ex", "px")));
+        addShim("redis.clients.jedis", "Transaction", createInterfaceShim("redis.clients.jedis.Transaction",
+                Arrays.asList("get", "set", "del", "exec", "discard")));
+        addShim("redis.clients.jedis", "Pipeline", createInterfaceShim("redis.clients.jedis.Pipeline",
+                Arrays.asList("get", "set", "del", "sync")));
+        addShim("redis.clients.jedis", "ScanParams", createClassShim("redis.clients.jedis.ScanParams",
+                Arrays.asList("match", "count")));
+        addShim("redis.clients.jedis", "ScanResult", createClassShim("redis.clients.jedis.ScanResult",
+                Arrays.asList("getResult", "getCursor")));
+        
+        // Reactor sub-packages (reactor.core.publisher.*) - 353 errors from logs (Mono/Flux exist but missing sub-packages)
+        // Note: Mono and Flux already exist, but adding missing sub-packages
+        addShim("reactor.core.publisher", "FluxSink", createInterfaceShim("reactor.core.publisher.FluxSink",
+                Arrays.asList("next", "complete", "error")));
+        addShim("reactor.core.publisher", "MonoSink", createInterfaceShim("reactor.core.publisher.MonoSink",
+                Arrays.asList("success", "error", "empty")));
+        addShim("reactor.core.publisher", "ConnectableFlux", createClassShim("reactor.core.publisher.ConnectableFlux",
+                Arrays.asList("connect", "autoConnect")));
+        addShim("reactor.core.scheduler", "Scheduler", createInterfaceShim("reactor.core.scheduler.Scheduler",
+                Arrays.asList("schedule", "schedulePeriodically")));
+        addShim("reactor.core.scheduler", "Schedulers", createClassShim("reactor.core.scheduler.Schedulers",
+                Arrays.asList("immediate", "single", "parallel", "elastic", "boundedElastic")));
+        addShim("reactor.util.context", "Context", createInterfaceShim("reactor.util.context.Context",
+                Arrays.asList("get", "hasKey", "put", "putAll", "delete")));
+        addShim("reactor.util.context", "ContextView", createInterfaceShim("reactor.util.context.ContextView",
+                Arrays.asList("get", "hasKey")));
     }
 
     /**
@@ -995,6 +1500,9 @@ public class ShimGenerator {
                 }
             }
 
+            // Add overloads for specific shims after initial generation
+            addOverloadsForShim(type, fqn);
+
             return true;
         } catch (Exception e) {
             System.err.println("Failed to generate shim for " + shim.getFqn() + ": " + e.getMessage());
@@ -1260,6 +1768,473 @@ public class ShimGenerator {
         } catch (Exception e) {
             // Ignore method creation failures
         }
+    }
+
+    /**
+     * Add overloads for specific shim types that need multiple method signatures.
+     * This is called after the initial shim is generated.
+     */
+    private void addOverloadsForShim(CtType<?> type, String fqn) {
+        if (type == null || fqn == null) return;
+
+        try {
+            if ("org.slf4j.Logger".equals(fqn)) {
+                addLoggerOverloads(type);
+            } else if ("org.slf4j.LoggerFactory".equals(fqn)) {
+                addLoggerFactoryOverloads(type);
+            } else if ("org.apache.commons.lang3.StringUtils".equals(fqn)) {
+                addStringUtilsOverloads(type);
+            } else if ("org.mockito.Mockito".equals(fqn)) {
+                addMockitoOverloads(type);
+            } else if (fqn.startsWith("com.google.common.base.Preconditions")) {
+                addPreconditionsMethods(type);
+            } else if (fqn.startsWith("com.google.common.base.MoreObjects")) {
+                addMoreObjectsMethods(type);
+            } else if (fqn.startsWith("com.google.common.collect.Lists")) {
+                addListsMethods(type);
+            } else if (fqn.startsWith("com.google.common.collect.Sets")) {
+                addSetsMethods(type);
+            } else if (fqn.startsWith("com.google.common.collect.Maps")) {
+                addMapsMethods(type);
+            } else if (fqn.startsWith("org.antlr.v4.runtime.CharStream")) {
+                addCharStreamMethods(type);
+            } else if (fqn.startsWith("org.antlr.v4.runtime.TokenStream")) {
+                addTokenStreamMethods(type);
+            } else if (fqn.startsWith("org.antlr.v4.runtime.CommonTokenStream")) {
+                addCommonTokenStreamMethods(type);
+            }
+        } catch (Exception e) {
+            // Ignore overload addition failures
+        }
+    }
+
+    /**
+     * Add a method to a shim type with a specific signature (for overloads).
+     */
+    private void addShimMethodWithSignature(CtType<?> type, String methodName,
+            CtTypeReference<?> returnType, List<CtTypeReference<?>> paramTypes) {
+        try {
+            if (type instanceof CtAnnotationType) {
+                return; // Skip annotations
+            }
+
+            // Check if method with exact signature already exists
+            if (type instanceof CtClass) {
+                CtClass<?> cls = (CtClass<?>) type;
+                Collection<CtMethod<?>> existingMethods = cls.getMethods().stream()
+                    .filter(m -> m.getSimpleName().equals(methodName))
+                    .collect(java.util.stream.Collectors.toList());
+
+                // Check if exact signature exists
+                for (CtMethod<?> existing : existingMethods) {
+                    if (existing.getParameters().size() == paramTypes.size()) {
+                        boolean signatureMatches = true;
+                        for (int i = 0; i < paramTypes.size(); i++) {
+                            if (!existing.getParameters().get(i).getType().equals(paramTypes.get(i))) {
+                                signatureMatches = false;
+                                break;
+                            }
+                        }
+                        if (signatureMatches) {
+                            return; // Exact signature already exists
+                        }
+                    }
+                }
+            } else if (type instanceof CtInterface) {
+                CtInterface<?> iface = (CtInterface<?>) type;
+                Collection<CtMethod<?>> existingMethods = iface.getMethods().stream()
+                    .filter(m -> m.getSimpleName().equals(methodName))
+                    .collect(java.util.stream.Collectors.toList());
+
+                for (CtMethod<?> existing : existingMethods) {
+                    if (existing.getParameters().size() == paramTypes.size()) {
+                        boolean signatureMatches = true;
+                        for (int i = 0; i < paramTypes.size(); i++) {
+                            if (!existing.getParameters().get(i).getType().equals(paramTypes.get(i))) {
+                                signatureMatches = false;
+                                break;
+                            }
+                        }
+                        if (signatureMatches) {
+                            return; // Exact signature already exists
+                        }
+                    }
+                }
+            }
+
+            // Create parameters
+            List<CtParameter<?>> params = new ArrayList<>();
+            for (int i = 0; i < paramTypes.size(); i++) {
+                CtParameter<?> param = factory.Core().createParameter();
+                CtTypeReference<?> paramType = paramTypes.get(i);
+                param.setType(paramType);
+                // Ensure the type reference uses fully qualified name if it's a non-JDK type
+                if (paramType != null && !paramType.isPrimitive()) {
+                    String qn = paramType.getQualifiedName();
+                    if (qn != null && !qn.startsWith("java.") && !qn.startsWith("javax.")
+                        && !qn.startsWith("jakarta.") && !qn.startsWith("sun.")
+                        && !qn.startsWith("jdk.")) {
+                        // Ensure package is set from qualified name
+                        if (paramType.getPackage() == null && qn.contains(".")) {
+                            int lastDot = qn.lastIndexOf('.');
+                            if (lastDot > 0) {
+                                String pkgName = qn.substring(0, lastDot);
+                                paramType.setPackage(factory.Package().createReference(pkgName));
+                            }
+                        }
+                        // Force FQN printing for non-JDK types to avoid import/simple name issues
+                        paramType.setSimplyQualified(true);
+                        paramType.setImplicit(false);
+                    }
+                }
+                param.setSimpleName("arg" + i);
+                params.add(param);
+            }
+
+            Set<ModifierKind> mods = new HashSet<>();
+            mods.add(ModifierKind.PUBLIC);
+
+            boolean isUtilityClass = isUtilityClass(type);
+            if (isUtilityClass && type instanceof CtClass) {
+                mods.add(ModifierKind.STATIC);
+            }
+
+            if (type instanceof CtInterface && !(type instanceof CtAnnotationType)) {
+                mods.add(ModifierKind.ABSTRACT);
+            }
+
+            // Create method
+            CtMethod<?> method = factory.Method().create(
+                type,
+                mods,
+                returnType,
+                methodName,
+                params,
+                Collections.emptySet()
+            );
+
+            // Add body for classes
+            if (type instanceof CtClass && !(type instanceof CtAnnotationType)) {
+                CtBlock<?> body = factory.Core().createBlock();
+                if (!returnType.equals(factory.Type().VOID_PRIMITIVE)) {
+                    CtReturn<?> ret = factory.Core().createReturn();
+                    @SuppressWarnings({"unchecked", "rawtypes"})
+                    CtExpression defaultValue = (CtExpression) createDefaultValueForType(returnType);
+                    ret.setReturnedExpression(defaultValue);
+                    body.addStatement(ret);
+                }
+                method.setBody(body);
+            }
+        } catch (Exception e) {
+            // Ignore method creation failures
+        }
+    }
+
+    /**
+     * Add overloads for SLF4J Logger interface.
+     */
+    private void addLoggerOverloads(CtType<?> type) {
+        if (!(type instanceof CtInterface)) return;
+        CtInterface<?> logger = (CtInterface<?>) type;
+
+        CtTypeReference<?> stringType = factory.Type().createReference("java.lang.String");
+        CtTypeReference<?> objectType = factory.Type().createReference("java.lang.Object");
+        CtTypeReference<?> throwableType = factory.Type().createReference("java.lang.Throwable");
+        CtTypeReference<?> booleanType = factory.Type().BOOLEAN_PRIMITIVE;
+        CtTypeReference<?> voidType = factory.Type().VOID_PRIMITIVE;
+
+        // Add isXxxEnabled() methods
+        addShimMethodWithSignature(logger, "isTraceEnabled", booleanType, Collections.emptyList());
+        addShimMethodWithSignature(logger, "isDebugEnabled", booleanType, Collections.emptyList());
+        addShimMethodWithSignature(logger, "isInfoEnabled", booleanType, Collections.emptyList());
+        addShimMethodWithSignature(logger, "isWarnEnabled", booleanType, Collections.emptyList());
+        addShimMethodWithSignature(logger, "isErrorEnabled", booleanType, Collections.emptyList());
+
+        // Add parameterized logging overloads: info(String, Object), info(String, Object, Object), etc.
+        addShimMethodWithSignature(logger, "info", voidType, Arrays.asList(stringType, objectType));
+        addShimMethodWithSignature(logger, "info", voidType, Arrays.asList(stringType, objectType, objectType));
+        addShimMethodWithSignature(logger, "info", voidType, Arrays.asList(stringType, throwableType));
+
+        // Same for debug, warn, error, trace
+        for (String level : Arrays.asList("debug", "warn", "error", "trace")) {
+            addShimMethodWithSignature(logger, level, voidType, Arrays.asList(stringType, objectType));
+            addShimMethodWithSignature(logger, level, voidType, Arrays.asList(stringType, objectType, objectType));
+            addShimMethodWithSignature(logger, level, voidType, Arrays.asList(stringType, throwableType));
+        }
+
+        // Ensure Marker shim exists before using it (it's needed for Logger overloads)
+        String markerFqn = "org.slf4j.Marker";
+        if (factory.Type().get(markerFqn) == null) {
+            ShimDefinition markerShim = shimDefinitions.get(markerFqn);
+            if (markerShim != null) {
+                generateShim(markerShim);
+            }
+        }
+
+        // Add Marker variants
+        CtTypeReference<?> markerType = factory.Type().createReference(markerFqn);
+        // Explicitly set the package to ensure it's preserved
+        markerType.setPackage(factory.Package().createReference("org.slf4j"));
+        markerType.setSimplyQualified(true);
+        markerType.setImplicit(false);
+
+        // info(Marker, String), info(Marker, String, Object), etc.
+        addShimMethodWithSignature(logger, "info", voidType, Arrays.asList(markerType, stringType));
+        addShimMethodWithSignature(logger, "info", voidType, Arrays.asList(markerType, stringType, objectType));
+        addShimMethodWithSignature(logger, "info", voidType, Arrays.asList(markerType, stringType, throwableType));
+
+        for (String level : Arrays.asList("debug", "warn", "error", "trace")) {
+            addShimMethodWithSignature(logger, level, voidType, Arrays.asList(markerType, stringType));
+            addShimMethodWithSignature(logger, level, voidType, Arrays.asList(markerType, stringType, objectType));
+            addShimMethodWithSignature(logger, level, voidType, Arrays.asList(markerType, stringType, throwableType));
+        }
+    }
+
+    /**
+     * Add overloads for LoggerFactory.
+     */
+    private void addLoggerFactoryOverloads(CtType<?> type) {
+        if (!(type instanceof CtClass)) return;
+        CtClass<?> loggerFactory = (CtClass<?>) type;
+
+        // Add getLogger(Class<?>) variant
+        CtTypeReference<?> classType = factory.Type().createReference("java.lang.Class");
+        CtTypeReference<?> loggerType = factory.Type().createReference("org.slf4j.Logger");
+        addShimMethodWithSignature(loggerFactory, "getLogger", loggerType, Arrays.asList(classType));
+    }
+
+    /**
+     * Add overloads for Commons Lang3 StringUtils.
+     */
+    private void addStringUtilsOverloads(CtType<?> type) {
+        if (!(type instanceof CtClass)) return;
+        CtClass<?> stringUtils = (CtClass<?>) type;
+
+        CtTypeReference<?> stringType = factory.Type().createReference("java.lang.String");
+        CtTypeReference<?> charType = factory.Type().CHARACTER_PRIMITIVE;
+        CtTypeReference<?> objectType = factory.Type().createReference("java.lang.Object");
+        CtTypeReference<?> booleanType = factory.Type().BOOLEAN_PRIMITIVE;
+        CtTypeReference<?> intType = factory.Type().INTEGER_PRIMITIVE;
+
+        // startsWithIgnoreCase(String, String)
+        addShimMethodWithSignature(stringUtils, "startsWithIgnoreCase", booleanType,
+            Arrays.asList(stringType, stringType));
+        // endsWithIgnoreCase(String, String)
+        addShimMethodWithSignature(stringUtils, "endsWithIgnoreCase", booleanType,
+            Arrays.asList(stringType, stringType));
+        // equalsIgnoreCase(String, String)
+        addShimMethodWithSignature(stringUtils, "equalsIgnoreCase", booleanType,
+            Arrays.asList(stringType, stringType));
+        // join(Object[], String)
+        addShimMethodWithSignature(stringUtils, "join", stringType,
+            Arrays.asList(factory.Type().createArrayReference(objectType), stringType));
+        // join(Iterable<?>, String)
+        addShimMethodWithSignature(stringUtils, "join", stringType,
+            Arrays.asList(factory.Type().createReference("java.lang.Iterable"), stringType));
+        // split(String, String)
+        addShimMethodWithSignature(stringUtils, "split", factory.Type().createArrayReference(stringType),
+            Arrays.asList(stringType, stringType));
+        // replace(String, String, String)
+        addShimMethodWithSignature(stringUtils, "replace", stringType,
+            Arrays.asList(stringType, stringType, stringType));
+        // substring(String, int)
+        addShimMethodWithSignature(stringUtils, "substring", stringType,
+            Arrays.asList(stringType, intType));
+        // substring(String, int, int)
+        addShimMethodWithSignature(stringUtils, "substring", stringType,
+            Arrays.asList(stringType, intType, intType));
+    }
+
+    /**
+     * Add overloads for Mockito.
+     */
+    private void addMockitoOverloads(CtType<?> type) {
+        if (!(type instanceof CtClass)) return;
+        CtClass<?> mockito = (CtClass<?>) type;
+
+        CtTypeReference<?> objectType = factory.Type().createReference("java.lang.Object");
+        CtTypeReference<?> classType = factory.Type().createReference("java.lang.Class");
+        CtTypeReference<?> ongoingStubbingType = factory.Type().createReference("org.mockito.stubbing.OngoingStubbing");
+        CtTypeReference<?> answerType = factory.Type().createReference("org.mockito.stubbing.Answer");
+        CtTypeReference<?> throwableType = factory.Type().createReference("java.lang.Throwable");
+        CtTypeReference<?> voidType = factory.Type().VOID_PRIMITIVE;
+
+        // spy(Object)
+        addShimMethodWithSignature(mockito, "spy", objectType, Arrays.asList(objectType));
+        // spy(Class<T>)
+        addShimMethodWithSignature(mockito, "spy", objectType, Arrays.asList(classType));
+
+        // doReturn(Object)
+        addShimMethodWithSignature(mockito, "doReturn", ongoingStubbingType, Arrays.asList(objectType));
+        // doThrow(Class<? extends Throwable>)
+        addShimMethodWithSignature(mockito, "doThrow", ongoingStubbingType, Arrays.asList(classType));
+        // doThrow(Throwable)
+        addShimMethodWithSignature(mockito, "doThrow", ongoingStubbingType, Arrays.asList(throwableType));
+        // doAnswer(Answer<?>)
+        addShimMethodWithSignature(mockito, "doAnswer", ongoingStubbingType, Arrays.asList(answerType));
+        // reset(Object...)
+        addShimMethodWithSignature(mockito, "reset", voidType,
+            Arrays.asList(factory.Type().createArrayReference(objectType)));
+    }
+
+    /**
+     * Add methods for Guava Preconditions.
+     */
+    private void addPreconditionsMethods(CtType<?> type) {
+        if (!(type instanceof CtClass)) return;
+        CtClass<?> preconditions = (CtClass<?>) type;
+
+        CtTypeReference<?> objectType = factory.Type().createReference("java.lang.Object");
+        CtTypeReference<?> stringType = factory.Type().createReference("java.lang.String");
+        CtTypeReference<?> booleanType = factory.Type().BOOLEAN_PRIMITIVE;
+        CtTypeReference<?> voidType = factory.Type().VOID_PRIMITIVE;
+
+        // checkNotNull(T)
+        CtTypeParameter methodTypeParam = factory.Core().createTypeParameter();
+        methodTypeParam.setSimpleName("T");
+        // For simplicity, we'll use Object for now
+        addShimMethodWithSignature(preconditions, "checkNotNull", objectType, Arrays.asList(objectType));
+        // checkNotNull(T, String)
+        addShimMethodWithSignature(preconditions, "checkNotNull", objectType, Arrays.asList(objectType, stringType));
+        // checkArgument(boolean)
+        addShimMethodWithSignature(preconditions, "checkArgument", voidType, Arrays.asList(booleanType));
+        // checkArgument(boolean, String)
+        addShimMethodWithSignature(preconditions, "checkArgument", voidType, Arrays.asList(booleanType, stringType));
+        // checkState(boolean)
+        addShimMethodWithSignature(preconditions, "checkState", voidType, Arrays.asList(booleanType));
+        // checkState(boolean, String)
+        addShimMethodWithSignature(preconditions, "checkState", voidType, Arrays.asList(booleanType, stringType));
+    }
+
+    /**
+     * Add methods for Guava MoreObjects.
+     */
+    private void addMoreObjectsMethods(CtType<?> type) {
+        if (!(type instanceof CtClass)) return;
+        CtClass<?> moreObjects = (CtClass<?>) type;
+
+        CtTypeReference<?> objectType = factory.Type().createReference("java.lang.Object");
+        CtTypeReference<?> stringType = factory.Type().createReference("java.lang.String");
+
+        // toStringHelper(Object)
+        CtTypeReference<?> toStringHelperType = factory.Type().createReference("com.google.common.base.MoreObjects.ToStringHelper");
+        addShimMethodWithSignature(moreObjects, "toStringHelper", toStringHelperType, Arrays.asList(objectType));
+        // toStringHelper(String)
+        addShimMethodWithSignature(moreObjects, "toStringHelper", toStringHelperType, Arrays.asList(stringType));
+        // firstNonNull(T, T)
+        addShimMethodWithSignature(moreObjects, "firstNonNull", objectType, Arrays.asList(objectType, objectType));
+    }
+
+    /**
+     * Add methods for Guava Lists.
+     */
+    private void addListsMethods(CtType<?> type) {
+        if (!(type instanceof CtClass)) return;
+        CtClass<?> lists = (CtClass<?>) type;
+
+        CtTypeReference<?> listType = factory.Type().createReference("java.util.List");
+        CtTypeReference<?> arrayListType = factory.Type().createReference("java.util.ArrayList");
+        CtTypeReference<?> linkedListType = factory.Type().createReference("java.util.LinkedList");
+
+        // newArrayList()
+        addShimMethodWithSignature(lists, "newArrayList", arrayListType, Collections.emptyList());
+        // newLinkedList()
+        addShimMethodWithSignature(lists, "newLinkedList", linkedListType, Collections.emptyList());
+        // asList(T...)
+        CtTypeReference<?> objectType = factory.Type().createReference("java.lang.Object");
+        addShimMethodWithSignature(lists, "asList", listType,
+            Arrays.asList(factory.Type().createArrayReference(objectType)));
+    }
+
+    /**
+     * Add methods for Guava Sets.
+     */
+    private void addSetsMethods(CtType<?> type) {
+        if (!(type instanceof CtClass)) return;
+        CtClass<?> sets = (CtClass<?>) type;
+
+        CtTypeReference<?> hashSetType = factory.Type().createReference("java.util.HashSet");
+        CtTypeReference<?> linkedHashSetType = factory.Type().createReference("java.util.LinkedHashSet");
+        CtTypeReference<?> treeSetType = factory.Type().createReference("java.util.TreeSet");
+
+        // newHashSet()
+        addShimMethodWithSignature(sets, "newHashSet", hashSetType, Collections.emptyList());
+        // newLinkedHashSet()
+        addShimMethodWithSignature(sets, "newLinkedHashSet", linkedHashSetType, Collections.emptyList());
+        // newTreeSet()
+        addShimMethodWithSignature(sets, "newTreeSet", treeSetType, Collections.emptyList());
+    }
+
+    /**
+     * Add methods for Guava Maps.
+     */
+    private void addMapsMethods(CtType<?> type) {
+        if (!(type instanceof CtClass)) return;
+        CtClass<?> maps = (CtClass<?>) type;
+
+        CtTypeReference<?> hashMapType = factory.Type().createReference("java.util.HashMap");
+        CtTypeReference<?> linkedHashMapType = factory.Type().createReference("java.util.LinkedHashMap");
+        CtTypeReference<?> treeMapType = factory.Type().createReference("java.util.TreeMap");
+        CtTypeReference<?> concurrentMapType = factory.Type().createReference("java.util.concurrent.ConcurrentMap");
+
+        // newHashMap()
+        addShimMethodWithSignature(maps, "newHashMap", hashMapType, Collections.emptyList());
+        // newLinkedHashMap()
+        addShimMethodWithSignature(maps, "newLinkedHashMap", linkedHashMapType, Collections.emptyList());
+        // newTreeMap()
+        addShimMethodWithSignature(maps, "newTreeMap", treeMapType, Collections.emptyList());
+        // newConcurrentMap()
+        addShimMethodWithSignature(maps, "newConcurrentMap", concurrentMapType, Collections.emptyList());
+    }
+
+    /**
+     * Add methods for ANTLR CharStream.
+     */
+    private void addCharStreamMethods(CtType<?> type) {
+        if (!(type instanceof CtInterface)) return;
+        CtInterface<?> charStream = (CtInterface<?>) type;
+
+        CtTypeReference<?> stringType = factory.Type().createReference("java.lang.String");
+        CtTypeReference<?> intType = factory.Type().INTEGER_PRIMITIVE;
+
+        // getText()
+        addShimMethodWithSignature(charStream, "getText", stringType, Collections.emptyList());
+        // getSourceName()
+        addShimMethodWithSignature(charStream, "getSourceName", stringType, Collections.emptyList());
+    }
+
+    /**
+     * Add methods for ANTLR TokenStream.
+     */
+    private void addTokenStreamMethods(CtType<?> type) {
+        if (!(type instanceof CtInterface)) return;
+        CtInterface<?> tokenStream = (CtInterface<?>) type;
+
+        CtTypeReference<?> tokenType = factory.Type().createReference("org.antlr.v4.runtime.Token");
+        CtTypeReference<?> intType = factory.Type().INTEGER_PRIMITIVE;
+        CtTypeReference<?> voidType = factory.Type().VOID_PRIMITIVE;
+
+        // get(int)
+        addShimMethodWithSignature(tokenStream, "get", tokenType, Arrays.asList(intType));
+        // consume()
+        addShimMethodWithSignature(tokenStream, "consume", voidType, Collections.emptyList());
+        // LA(int)
+        addShimMethodWithSignature(tokenStream, "LA", intType, Arrays.asList(intType));
+        // mark()
+        addShimMethodWithSignature(tokenStream, "mark", intType, Collections.emptyList());
+        // release(int)
+        addShimMethodWithSignature(tokenStream, "release", voidType, Arrays.asList(intType));
+        // reset()
+        addShimMethodWithSignature(tokenStream, "reset", voidType, Collections.emptyList());
+    }
+
+    /**
+     * Add methods for ANTLR CommonTokenStream.
+     */
+    private void addCommonTokenStreamMethods(CtType<?> type) {
+        // CommonTokenStream extends TokenStream, so it inherits those methods
+        // Add any specific methods if needed
+        addTokenStreamMethods(type);
     }
 
     /**
