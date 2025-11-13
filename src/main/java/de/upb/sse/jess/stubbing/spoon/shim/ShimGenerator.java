@@ -1148,6 +1148,15 @@ public class ShimGenerator {
             // Generate the shim
             if (generateShim(shim)) {
                 generated++;
+                // Log shim generation if verbose mode enabled
+                if (Boolean.getBoolean("jess.verboseShims")) {
+                    System.out.println("    Generated shim: " + fqn);
+                }
+            } else if (Boolean.getBoolean("jess.verboseShims")) {
+                // Log why shim wasn't generated (already exists, etc.)
+                if (factory.Type().get(fqn) != null) {
+                    System.out.println("    Skipped shim (already exists): " + fqn);
+                }
             }
         }
 
@@ -1358,13 +1367,38 @@ public class ShimGenerator {
 
     /**
      * Generate a single shim class.
+     * Returns true if shim was successfully generated, false otherwise.
+     * Handles edge cases gracefully to prevent failures from cascading.
      */
     private boolean generateShim(ShimDefinition shim) {
         try {
             String fqn = shim.getFqn();
+            if (fqn == null || fqn.isEmpty()) {
+                if (Boolean.getBoolean("jess.verboseShims")) {
+                    System.err.println("    Warning: Skipping shim with null/empty FQN");
+                }
+                return false;
+            }
+            
             int lastDot = fqn.lastIndexOf('.');
             String packageName = lastDot >= 0 ? fqn.substring(0, lastDot) : "";
             String className = lastDot >= 0 ? fqn.substring(lastDot + 1) : fqn;
+            
+            // Validate package and class names
+            if (className == null || className.isEmpty()) {
+                if (Boolean.getBoolean("jess.verboseShims")) {
+                    System.err.println("    Warning: Skipping shim with invalid class name: " + fqn);
+                }
+                return false;
+            }
+            
+            // Skip if class name is a Java keyword or invalid identifier
+            if (isJavaKeyword(className) || !isValidJavaIdentifier(className)) {
+                if (Boolean.getBoolean("jess.verboseShims")) {
+                    System.err.println("    Warning: Skipping shim with invalid identifier: " + fqn);
+                }
+                return false;
+            }
 
             CtPackage pkg = factory.Package().getOrCreate(packageName);
 
@@ -1804,7 +1838,10 @@ public class ShimGenerator {
                 addCommonTokenStreamMethods(type);
             }
         } catch (Exception e) {
-            // Ignore overload addition failures
+            // Ignore overload addition failures - log only in verbose mode
+            if (Boolean.getBoolean("jess.verboseShims")) {
+                System.err.println("    Warning: Failed to add overloads for " + fqn + ": " + e.getMessage());
+            }
         }
     }
 
@@ -1926,8 +1963,46 @@ public class ShimGenerator {
                 method.setBody(body);
             }
         } catch (Exception e) {
-            // Ignore method creation failures
+            // Ignore method creation failures - log only in verbose mode
+            if (Boolean.getBoolean("jess.verboseShims")) {
+                System.err.println("    Warning: Failed to add method " + methodName + " to " + type.getQualifiedName() + ": " + e.getMessage());
+            }
         }
+    }
+    
+    /**
+     * Check if a string is a Java keyword.
+     */
+    private boolean isJavaKeyword(String str) {
+        if (str == null) return false;
+        // Common Java keywords that could cause issues
+        String[] keywords = {
+            "abstract", "assert", "boolean", "break", "byte", "case", "catch", "char", "class",
+            "const", "continue", "default", "do", "double", "else", "enum", "extends", "final",
+            "finally", "float", "for", "goto", "if", "implements", "import", "instanceof", "int",
+            "interface", "long", "native", "new", "package", "private", "protected", "public",
+            "return", "short", "static", "strictfp", "super", "switch", "synchronized", "this",
+            "throw", "throws", "transient", "try", "void", "volatile", "while"
+        };
+        for (String keyword : keywords) {
+            if (keyword.equals(str)) return true;
+        }
+        return false;
+    }
+    
+    /**
+     * Check if a string is a valid Java identifier.
+     */
+    private boolean isValidJavaIdentifier(String str) {
+        if (str == null || str.isEmpty()) return false;
+        // Must start with letter, underscore, or dollar sign
+        char first = str.charAt(0);
+        if (!Character.isJavaIdentifierStart(first)) return false;
+        // Rest must be valid identifier part
+        for (int i = 1; i < str.length(); i++) {
+            if (!Character.isJavaIdentifierPart(str.charAt(i))) return false;
+        }
+        return true;
     }
 
     /**

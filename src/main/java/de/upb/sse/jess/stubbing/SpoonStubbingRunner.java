@@ -112,6 +112,16 @@ public final class SpoonStubbingRunner implements Stubber {
         int shimsGenerated = shimGenerator.generateShimsForReferencedTypes(referencedTypes);
         if (shimsGenerated > 0) {
             System.out.println("Generated " + shimsGenerated + " shim classes for common libraries");
+            // Log which shims were generated for debugging (only if verbose)
+            if (Boolean.getBoolean("jess.verboseShims")) {
+                System.out.println("  Referenced types count: " + referencedTypes.size());
+                System.out.println("  Generated shims: " + shimsGenerated);
+            }
+        } else if (referencedTypes.size() > 0) {
+            // Log if we had referenced types but generated no shims (might indicate an issue)
+            if (Boolean.getBoolean("jess.verboseShims")) {
+                System.out.println("  Note: " + referencedTypes.size() + " referenced types, but no shims generated (may already exist in model)");
+            }
         }
         
         // 5) Generate stubs
