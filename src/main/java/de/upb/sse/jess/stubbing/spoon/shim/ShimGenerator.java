@@ -455,6 +455,22 @@ public class ShimGenerator {
         addShim("lombok", "NonNull", createAnnotationShim("lombok.NonNull"));
         addShim("lombok", "SneakyThrows", createAnnotationShim("lombok.SneakyThrows"));
 
+        // Vavr functional interfaces (io.vavr.*)
+        addShim("io.vavr", "Function1", createInterfaceShim("io.vavr.Function1",
+                Arrays.asList("apply")));
+        addShim("io.vavr", "Function2", createInterfaceShim("io.vavr.Function2",
+                Arrays.asList("apply")));
+        addShim("io.vavr", "Function3", createInterfaceShim("io.vavr.Function3",
+                Arrays.asList("apply")));
+        addShim("io.vavr", "Function4", createInterfaceShim("io.vavr.Function4",
+                Arrays.asList("apply")));
+        addShim("io.vavr", "Function5", createInterfaceShim("io.vavr.Function5",
+                Arrays.asList("apply")));
+        addShim("io.vavr", "CheckedFunction1", createInterfaceShim("io.vavr.CheckedFunction1",
+                Arrays.asList("apply")));
+        addShim("io.vavr", "CheckedFunction2", createInterfaceShim("io.vavr.CheckedFunction2",
+                Arrays.asList("apply")));
+
         // AspectJ shims (org.aspectj.lang.*)
         addShim("org.aspectj.lang", "ProceedingJoinPoint", createInterfaceShim("org.aspectj.lang.ProceedingJoinPoint",
                 Arrays.asList("proceed", "getArgs", "getTarget", "getThis", "getSignature")));
@@ -1444,6 +1460,54 @@ public class ShimGenerator {
                 CtTypeParameter typeParam = factory.Core().createTypeParameter();
                 typeParam.setSimpleName("T");
                 cls.addFormalCtTypeParameter(typeParam);
+            }
+
+            // Special handling for Vavr Function interfaces - make them generic
+            if (type instanceof CtInterface) {
+                CtInterface<?> iface = (CtInterface<?>) type;
+                if ("io.vavr.Function1".equals(fqn)) {
+                    // Function1<T, R> - takes T, returns R
+                    CtTypeParameter typeParamT = factory.Core().createTypeParameter();
+                    typeParamT.setSimpleName("T");
+                    iface.addFormalCtTypeParameter(typeParamT);
+                    CtTypeParameter typeParamR = factory.Core().createTypeParameter();
+                    typeParamR.setSimpleName("R");
+                    iface.addFormalCtTypeParameter(typeParamR);
+                } else if ("io.vavr.Function2".equals(fqn)) {
+                    // Function2<T1, T2, R> - takes T1, T2, returns R
+                    CtTypeParameter typeParamT1 = factory.Core().createTypeParameter();
+                    typeParamT1.setSimpleName("T1");
+                    iface.addFormalCtTypeParameter(typeParamT1);
+                    CtTypeParameter typeParamT2 = factory.Core().createTypeParameter();
+                    typeParamT2.setSimpleName("T2");
+                    iface.addFormalCtTypeParameter(typeParamT2);
+                    CtTypeParameter typeParamR = factory.Core().createTypeParameter();
+                    typeParamR.setSimpleName("R");
+                    iface.addFormalCtTypeParameter(typeParamR);
+                } else if ("io.vavr.Function3".equals(fqn)) {
+                    // Function3<T1, T2, T3, R>
+                    CtTypeParameter typeParamT1 = factory.Core().createTypeParameter();
+                    typeParamT1.setSimpleName("T1");
+                    iface.addFormalCtTypeParameter(typeParamT1);
+                    CtTypeParameter typeParamT2 = factory.Core().createTypeParameter();
+                    typeParamT2.setSimpleName("T2");
+                    iface.addFormalCtTypeParameter(typeParamT2);
+                    CtTypeParameter typeParamT3 = factory.Core().createTypeParameter();
+                    typeParamT3.setSimpleName("T3");
+                    iface.addFormalCtTypeParameter(typeParamT3);
+                    CtTypeParameter typeParamR = factory.Core().createTypeParameter();
+                    typeParamR.setSimpleName("R");
+                    iface.addFormalCtTypeParameter(typeParamR);
+                } else if ("io.vavr.Function4".equals(fqn) || "io.vavr.Function5".equals(fqn) ||
+                           "io.vavr.CheckedFunction1".equals(fqn) || "io.vavr.CheckedFunction2".equals(fqn)) {
+                    // Add generic type parameters for other function types
+                    CtTypeParameter typeParamT = factory.Core().createTypeParameter();
+                    typeParamT.setSimpleName("T");
+                    iface.addFormalCtTypeParameter(typeParamT);
+                    CtTypeParameter typeParamR = factory.Core().createTypeParameter();
+                    typeParamR.setSimpleName("R");
+                    iface.addFormalCtTypeParameter(typeParamR);
+                }
             }
 
             // Special handling for generic shims - RedisTemplate<K, V>, BaseMapper<T>

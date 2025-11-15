@@ -66,9 +66,39 @@ public final class SpoonStubber {
         int created = 0;
         if (plans == null || plans.isEmpty()) return created;
 
+        // (0) Deduplicate type plans - merge plans with same base qualified name (without generics)
+        // This prevents creating the same nested type multiple times (e.g., XYChart$Series and XYChart$Series<>)
+        Map<String, TypeStubPlan> deduplicatedPlans = new LinkedHashMap<>();
+        for (TypeStubPlan p : plans) {
+            String qn = p.qualifiedName;
+            if (qn == null || qn.isEmpty() || qn.endsWith(".")) continue;
+            
+            // Strip generics to get base qualified name for deduplication
+            String baseQn = qn;
+            if (baseQn.contains("<")) {
+                baseQn = baseQn.substring(0, baseQn.indexOf('<'));
+            }
+            
+            // If we already have a plan for this base QN, prefer the one with generics (contains <>)
+            TypeStubPlan existing = deduplicatedPlans.get(baseQn);
+            if (existing == null) {
+                deduplicatedPlans.put(baseQn, p);
+            } else {
+                // Prefer the plan with generics if available
+                String existingQn = existing.qualifiedName;
+                boolean existingHasGenerics = existingQn != null && (existingQn.contains("<>") || existingQn.contains("<"));
+                boolean currentHasGenerics = qn.contains("<>") || qn.contains("<");
+                if (currentHasGenerics && !existingHasGenerics) {
+                    // Replace with the one that has generics
+                    deduplicatedPlans.put(baseQn, p);
+                }
+                // Otherwise keep the existing one
+            }
+        }
+
         // (1) collect simple names that have a non-unknown plan
         Set<String> concretePlannedSimples = new HashSet<>();
-        for (TypeStubPlan p : plans) {
+        for (TypeStubPlan p : deduplicatedPlans.values()) {
             String qn = p.qualifiedName;
             // Validate FQN: reject null, empty, or invalid FQNs
             if (qn == null || qn.isEmpty() || qn.endsWith(".")) continue;
@@ -82,11 +112,17 @@ public final class SpoonStubber {
             }
         }
 
-        // (2) create types, skipping unknown twins
-        for (TypeStubPlan p : plans) {
+        // (2) create types, skipping unknown twins and array types
+        for (TypeStubPlan p : deduplicatedPlans.values()) {
             String qn = p.qualifiedName;
             // Validate FQN: reject null, empty, or invalid FQNs
             if (qn == null || qn.isEmpty() || qn.endsWith(".")) continue;
+            
+            // Filter out array types - arrays should never be generated as classes
+            if (isArrayType(qn)) {
+                continue; // Skip array types
+            }
+            
             int lastDot = qn.lastIndexOf('.');
             String simpleName = (lastDot >= 0 ? qn.substring(lastDot + 1) : qn);
             if (simpleName == null || simpleName.isEmpty()) continue;
@@ -110,6 +146,67 @@ public final class SpoonStubber {
 
 
     /**
+     * Check if a type name represents an array type (should not be generated as a class).
+     */
+    private static boolean isArrayType(String typeName) {
+        if (typeName == null || typeName.isEmpty()) return false;
+        // Check for array brackets in the name
+        return typeName.contains("[]") || typeName.endsWith("]") || 
+               typeName.matches(".*\\[\\d*\\].*"); // Also matches multi-dimensional arrays
+    }
+    
+    /**
+     * Check if a type name is an invalid Java identifier that should not be generated.
+     * This includes wildcards (?), type parameters with bounds (? extends T), etc.
+     */
+    private static boolean isInvalidJavaIdentifier(String typeName) {
+        if (typeName == null || typeName.isEmpty()) return true;
+        
+        // Wildcard types (?, ? extends X, ? super X)
+        if (typeName.equals("?") || typeName.startsWith("? ") || typeName.contains(" ?")) {
+            return true;
+        }
+        
+        // Contains illegal characters for Java identifiers
+        if (typeName.contains(" ") || typeName.contains("<") || typeName.contains(">") ||
+            typeName.contains(",") || typeName.contains("*") || typeName.contains("[") ||
+            typeName.contains("]")) {
+            return true;
+        }
+        
+        // Check if it's a keyword
+        if (isJavaKeyword(typeName)) {
+            return true;
+        }
+        
+        return false;
+    }
+    
+    /**
+     * Check if a string is a Java keyword that cannot be used as a class name.
+     */
+    private static boolean isJavaKeyword(String name) {
+        if (name == null) return false;
+        // Java keywords that cannot be class names
+        switch (name) {
+            case "abstract": case "assert": case "boolean": case "break": case "byte":
+            case "case": case "catch": case "char": case "class": case "const":
+            case "continue": case "default": case "do": case "double": case "else":
+            case "enum": case "extends": case "final": case "finally": case "float":
+            case "for": case "goto": case "if": case "implements": case "import":
+            case "instanceof": case "int": case "interface": case "long": case "native":
+            case "new": case "package": case "private": case "protected": case "public":
+            case "return": case "short": case "static": case "strictfp": case "super":
+            case "switch": case "synchronized": case "this": case "throw": case "throws":
+            case "transient": case "try": case "void": case "volatile": case "while":
+            case "true": case "false": case "null":
+                return true;
+            default:
+                return false;
+        }
+    }
+    
+    /**
      * Ensure a type exists for the given plan (class/interface/annotation).
      * Handles generic arity inference and exception/error superclasses.
      *
@@ -126,9 +223,22 @@ public final class SpoonStubber {
         // Validate FQN: reject null, empty, or invalid FQNs
         if (qn == null || qn.isEmpty()) return false;
         if (qn.endsWith(".")) return false; // Invalid: ends with dot but no simple name
+        
+        // Filter out array types - arrays should never be generated as classes
+        if (isArrayType(qn)) {
+            return false; // Skip array types
+        }
+        
         int lastDot = qn.lastIndexOf('.');
         String simpleName = (lastDot >= 0 ? qn.substring(lastDot + 1) : qn);
         if (simpleName == null || simpleName.isEmpty()) return false; // Invalid: no simple name
+        
+        // CRITICAL FIX #1: Filter out wildcard types and invalid identifiers
+        // This prevents errors like "unknown/?.java:2:13: <identifier> expected"
+        if (isInvalidJavaIdentifier(simpleName)) {
+            System.err.println("[BUG#1-FIX] Skipping invalid identifier: " + qn);
+            return false;
+        }
         
         if (qn.startsWith("java.")
                 || qn.startsWith("javax.")
@@ -189,16 +299,110 @@ public final class SpoonStubber {
 
             String[] parts = afterPkg.split("\\$");
             if (parts.length >= 2) {
+                // Pre-check: if we've already created a type with this base qualified name (without generics),
+                // try to find it and ensure it has the right properties, but don't create a duplicate
+                String baseQn = qn;
+                if (baseQn.contains("<")) {
+                    baseQn = baseQn.substring(0, baseQn.indexOf('<'));
+                }
+                // Quick check: see if this exact type was already created
+                if (createdTypes.contains(baseQn)) {
+                    // Type already exists - try to find it and update it if needed, but don't create duplicate
+                    // We'll let the nested level loop handle finding and updating the existing type
+                }
+                
                 // 1) ensure outer (top-level) exists as a CLASS
                 String outerFqn = (pkg.isEmpty() ? parts[0] : pkg + "." + parts[0]);
                 CtClass<?> outer = ensurePublicClass(f.Type().createReference(outerFqn));
 
                 // 2) walk/create each nested level under the previous
                 CtType<?> parent = outer;
-                for (int i = 1; i < parts.length; i++) {
+                nestedLevelLoop: for (int i = 1; i < parts.length; i++) {
                     String simple = parts[i];
+                    // Strip generic indicators like <> or <T,R> from simple name
+                    if (simple.contains("<")) {
+                        simple = simple.substring(0, simple.indexOf('<'));
+                    }
+                    // First check: use getNestedType (faster) - but this might only find static nested types
                     CtType<?> existing = parent.getNestedType(simple);
+                    // Second check: search all nested types to catch any duplicates (static/non-static)
+                    if (existing == null) {
+                        for (CtType<?> nestedType : parent.getNestedTypes()) {
+                            if (simple.equals(nestedType.getSimpleName())) {
+                                existing = nestedType;
+                                break;
+                            }
+                        }
+                    }
+                    // Third check: check if we've already created a type with this simple name in this parent
+                    // This catches cases where getNestedTypes() doesn't return the type yet
+                    if (existing == null && parent.getQualifiedName() != null) {
+                        String parentQn = parent.getQualifiedName();
+                        String nestedBaseQn = parentQn + "$" + simple; // Base QN without generics
+                        // Check if we've created any nested type with this simple name in this parent
+                        // Strip generics from createdQn for comparison (e.g., "XYChart$Series<>" -> "XYChart$Series")
+                        for (String createdQn : createdTypes) {
+                            if (createdQn != null) {
+                                // Strip generics from createdQn for comparison
+                                String createdBaseQn = createdQn;
+                                if (createdBaseQn.contains("<")) {
+                                    createdBaseQn = createdBaseQn.substring(0, createdBaseQn.indexOf('<'));
+                                }
+                                // Check if base qualified names match (exact match or starts with)
+                                if (createdBaseQn.equals(nestedBaseQn) || createdBaseQn.startsWith(nestedBaseQn + "$") || nestedBaseQn.equals(createdBaseQn)) {
+                                    // Found a created type - try to get it from parent
+                                    try {
+                                        existing = parent.getNestedType(simple);
+                                        if (existing == null) {
+                                            // Try searching again in case it was just added
+                                            for (CtType<?> nestedType : parent.getNestedTypes()) {
+                                                if (simple.equals(nestedType.getSimpleName())) {
+                                                    existing = nestedType;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    } catch (Throwable ignored) {
+                                        // If we can't get it, continue searching
+                                    }
+                                    if (existing != null) {
+                                        break; // Found it, stop searching
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Fourth check: search the entire Spoon model for this type
+                    if (existing == null && parent.getQualifiedName() != null) {
+                        String parentQn = parent.getQualifiedName();
+                        String searchQn = parentQn + "$" + simple;
+                        try {
+                            // Search all types in the model for this qualified name
+                            for (CtType<?> modelType : f.getModel().getAllTypes()) {
+                                String modelQn = safeQN(modelType.getReference());
+                                if (modelQn != null) {
+                                    // Strip generics for comparison
+                                    String modelBaseQn = modelQn;
+                                    if (modelBaseQn.contains("<")) {
+                                        modelBaseQn = modelBaseQn.substring(0, modelBaseQn.indexOf('<'));
+                                    }
+                                    if (modelBaseQn.equals(searchQn)) {
+                                        // Found it in the model - check if it's nested in the right parent
+                                        Object typeParent = modelType.getParent();
+                                        if (typeParent == parent || (typeParent instanceof CtType && ((CtType<?>) typeParent).getQualifiedName().equals(parentQn))) {
+                                            existing = modelType;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        } catch (Throwable ignored) {
+                            // If search fails, continue
+                        }
+                    }
                     if (existing != null) {
+                        // Type with same name already exists - ALWAYS reuse it to avoid duplicates
                         // Upgrade/downgrade if the existing kind is wrong
                         if (p.kind == TypeStubPlan.Kind.INTERFACE && existing instanceof CtClass) {
                             existing.delete();
@@ -209,12 +413,56 @@ public final class SpoonStubber {
                         } else if (p.kind == TypeStubPlan.Kind.ANNOTATION && !(existing instanceof CtAnnotationType)) {
                             existing.delete();
                             existing = null; // Force creation below
-                    } else {
-                        parent = existing;
-                            continue; // Type exists and is correct kind
+                        } else {
+                            // Type exists and is correct kind - ALWAYS reuse it, don't create duplicate
+                            // Update static/non-static modifier if needed (prefer static for nested classes)
+                            if (existing instanceof CtClass && parent instanceof CtClass) {
+                                // If existing is non-static but we want static (or vice versa), keep existing as-is
+                                // We don't change static/non-static to avoid breaking existing code
+                                // Just ensure it has the right modifiers
+                            }
+                            
+                            // Ensure type parameters are added if needed
+                            String nestedQn = parent.getQualifiedName() + "$" + simple;
+                            boolean needsGenerics = false;
+                            if (qn != null) {
+                                String expectedSuffix = "$" + simple + "<";
+                                needsGenerics = qn.contains(expectedSuffix) || qn.endsWith("$" + simple + "<>");
+                            }
+                            // Check if existing type already has type parameters
+                            boolean hasTypeParams = existing instanceof CtFormalTypeDeclarer &&
+                                    ((CtFormalTypeDeclarer) existing).getFormalCtTypeParameters() != null &&
+                                    !((CtFormalTypeDeclarer) existing).getFormalCtTypeParameters().isEmpty();
+                            // If generics are needed but type doesn't have them yet, add them
+                            if (needsGenerics && !hasTypeParams) {
+                                int arity = inferGenericArityFromUsages(nestedQn);
+                                if (arity == 0) {
+                                    arity = 2; // Default to 2 for common cases like Series<T,R>
+                                }
+                                if (arity > 0) {
+                                    List<String> paramNames = inferTypeParameterNamesFromMethodPlans(nestedQn, arity, methodPlans);
+                                    addTypeParameters(existing, arity, paramNames);
+                                }
+                            }
+                            // CRITICAL: Reuse existing type - don't create a duplicate
+                            parent = existing;
+                            continue nestedLevelLoop; // Skip creation, continue to next nested level
+                        }
                     }
-                }
-
+                    
+                    // Final safety check before creating - in case a type was just added
+                    if (existing == null) {
+                        // One more check: search all nested types one more time
+                        for (CtType<?> nestedType : parent.getNestedTypes()) {
+                            if (simple.equals(nestedType.getSimpleName())) {
+                                existing = nestedType;
+                                // Found it - reuse it instead of creating
+                                parent = existing;
+                                continue nestedLevelLoop;
+                            }
+                        }
+                    }
+                    
                     // Create the nested type if it doesn't exist or was deleted
                     if (existing == null) {
                         CtType<?> nested;
@@ -252,8 +500,51 @@ public final class SpoonStubber {
                                 nested.addModifier(ModifierKind.STATIC);
                             }
                         }
+                        
+                        // Add type parameters to nested types if needed
+                        // Build the qualified name for this nested type to check for generics
+                        String nestedQn = parent.getQualifiedName() + "$" + simple;
+                        // Check if original qn indicates generics for this specific nested type
+                        // The qn might be like "javafx.scene.chart.XYChart$Series<>" or "javafx.scene.chart.XYChart$Series<T,R>"
+                        boolean needsGenerics = false;
+                        if (qn != null) {
+                            // Check if the qualified name ends with this nested type followed by <> or <
+                            String expectedSuffix = "$" + simple + "<";
+                            needsGenerics = qn.contains(expectedSuffix) || qn.endsWith("$" + simple + "<>");
+                        }
+                        // Infer arity from usages if not already determined
+                        int arity = inferGenericArityFromUsages(nestedQn);
+                        if (needsGenerics && arity == 0) {
+                            // If qn indicates generics but we couldn't infer arity, default to 2 for common cases like Series<T,R>
+                            arity = 2;
+                        }
+                        if (arity > 0) {
+                            List<String> paramNames = inferTypeParameterNamesFromMethodPlans(nestedQn, arity, methodPlans);
+                            addTypeParameters(nested, arity, paramNames);
+                        }
+                        
                         parent = nested;
-                        createdTypes.add(parent.getQualifiedName());
+                        String createdQn = parent.getQualifiedName();
+                        createdTypes.add(createdQn);
+                        
+                        // Final check: if we just created a nested type, verify no duplicate was created
+                        // This catches cases where multiple type plans create the same nested type
+                        if (createdQn != null && createdQn.contains("$")) {
+                            // Check if there are multiple nested types with the same simple name
+                            int count = 0;
+                            Object parentObj = parent.getParent();
+                            if (parentObj != null && parentObj instanceof CtType) {
+                                @SuppressWarnings("unchecked")
+                                CtType<?> parentType = (CtType<?>) parentObj;
+                                for (CtType<?> checkType : parentType.getNestedTypes()) {
+                                    if (simple.equals(checkType.getSimpleName())) {
+                                        count++;
+                                    }
+                                }
+                            }
+                            // If we have more than one, we created a duplicate - this shouldn't happen with our checks
+                            // but if it does, we should log it (though we can't easily fix it here)
+                        }
                     }
                 }
 
@@ -628,6 +919,31 @@ public final class SpoonStubber {
             // IMPORTANT: Check for type parameters BEFORE normalization
             CtTypeReference<?> rt0 = (p.returnType != null ? p.returnType : f.Type().VOID_PRIMITIVE);
             
+            // Special handling for iterator() method in Vavr collections
+            // Vavr collections should return io.vavr.collection.Iterator<T> not java.util.Iterator<T>
+            if ("iterator".equals(p.name) && p.paramTypes.isEmpty()) {
+                String ownerQnForIterator = safeQN(owner.getReference());
+                if (ownerQnForIterator != null && ownerQnForIterator.startsWith("io.vavr.collection.")) {
+                    // Check if return type is java.util.Iterator
+                    String returnQn = safeQN(rt0);
+                    if (returnQn != null && returnQn.startsWith("java.util.Iterator")) {
+                        // Replace with io.vavr.collection.Iterator
+                        CtTypeReference<?> vavrIterator = f.Type().createReference("io.vavr.collection.Iterator");
+                        // Add type argument if original had one
+                        if (rt0.getActualTypeArguments() != null && !rt0.getActualTypeArguments().isEmpty()) {
+                            vavrIterator.addActualTypeArgument(rt0.getActualTypeArguments().get(0));
+                        } else if (owner instanceof CtFormalTypeDeclarer) {
+                            // Use owner's type parameter
+                            List<CtTypeParameter> ownerParams = ((CtFormalTypeDeclarer) owner).getFormalCtTypeParameters();
+                            if (ownerParams != null && !ownerParams.isEmpty()) {
+                                vavrIterator.addActualTypeArgument(ownerParams.get(0).getReference());
+                            }
+                        }
+                        rt0 = vavrIterator;
+                    }
+                }
+            }
+            
             // Check if return type matches owner's type parameters BEFORE normalization
             if (owner instanceof CtFormalTypeDeclarer && rt0 != null) {
                 String returnTypeSimple = rt0.getSimpleName();
@@ -696,6 +1012,18 @@ public final class SpoonStubber {
             List<CtTypeReference<?>> normParams = new ArrayList<>(p.paramTypes.size());
             for (int i = 0; i < p.paramTypes.size(); i++) {
                 CtTypeReference<?> t = p.paramTypes.get(i);
+                
+                // CRITICAL: Filter out void as parameter type - void can only be a return type
+                if (t != null) {
+                    try {
+                        if (t.equals(f.Type().VOID_PRIMITIVE) || 
+                            "void".equals(t.getSimpleName()) || 
+                            "void".equals(safeQN(t))) {
+                            // Replace void parameter with Object (void cannot be a parameter type)
+                            t = f.Type().createReference("java.lang.Object");
+                        }
+                    } catch (Throwable ignored) {}
+                }
                 
                 // Check if this is a type parameter BEFORE normalization
                 // This handles cases like Uncheck.apply(T) where T is a type parameter
@@ -774,6 +1102,15 @@ public final class SpoonStubber {
                     t = f.Type().createReference("java.lang.Object");
                 }
                 
+                // Final safety check: ensure parameter type is not void
+                try {
+                    if (t.equals(f.Type().VOID_PRIMITIVE) || 
+                        "void".equals(t.getSimpleName()) || 
+                        "void".equals(safeQN(t))) {
+                        t = f.Type().createReference("java.lang.Object");
+                    }
+                } catch (Throwable ignored) {}
+                
                 if (willBeVarargs && i == p.paramTypes.size() - 1) {
                     // varargs at AST-level is an array on the last parameter
                     // Only create array if not already an array
@@ -849,7 +1186,66 @@ public final class SpoonStubber {
                 m.removeModifier(ModifierKind.ABSTRACT);
             }
 
-            // 7) interface default/abstract body handling
+            // 7) Fix generic type variables in static methods
+            // Static methods cannot use instance type parameters - they need method-level type parameters
+            if (p.isStatic && owner instanceof CtFormalTypeDeclarer) {
+                // Check if method uses type parameters from the owner class
+                // If so, we need to add method-level type parameters instead
+                List<String> usedTypeParams = new ArrayList<>();
+                
+                // Check return type
+                if (rt0 instanceof CtTypeParameterReference) {
+                    String tpName = rt0.getSimpleName();
+                    if (tpName != null && !tpName.isEmpty()) {
+                        usedTypeParams.add(tpName);
+                    }
+                } else if (rt0 != null && rt0.getActualTypeArguments() != null) {
+                    for (CtTypeReference<?> arg : rt0.getActualTypeArguments()) {
+                        if (arg instanceof CtTypeParameterReference) {
+                            String tpName = arg.getSimpleName();
+                            if (tpName != null && !tpName.isEmpty()) {
+                                usedTypeParams.add(tpName);
+                            }
+                        }
+                    }
+                }
+                
+                // Check parameter types
+                for (CtTypeReference<?> paramType : normParams) {
+                    if (paramType instanceof CtTypeParameterReference) {
+                        String tpName = paramType.getSimpleName();
+                        if (tpName != null && !tpName.isEmpty()) {
+                            usedTypeParams.add(tpName);
+                        }
+                    } else if (paramType != null && paramType.getActualTypeArguments() != null) {
+                        for (CtTypeReference<?> arg : paramType.getActualTypeArguments()) {
+                            if (arg instanceof CtTypeParameterReference) {
+                                String tpName = arg.getSimpleName();
+                                if (tpName != null && !tpName.isEmpty()) {
+                                    usedTypeParams.add(tpName);
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // If method uses type parameters, add them as method-level type parameters
+                if (!usedTypeParams.isEmpty()) {
+                    for (String tpName : usedTypeParams) {
+                        // Check if method already has this type parameter
+                        boolean hasTypeParam = m.getFormalCtTypeParameters().stream()
+                                .anyMatch(tp -> tpName.equals(tp.getSimpleName()));
+                        
+                        if (!hasTypeParam) {
+                            CtTypeParameter methodTp = f.Core().createTypeParameter();
+                            methodTp.setSimpleName(tpName);
+                            m.addFormalCtTypeParameter(methodTp);
+                        }
+                    }
+                }
+            }
+            
+            // 8) interface default/abstract body handling
             boolean ownerIsInterface = owner instanceof CtInterface;
             if (ownerIsInterface) {
                 if (p.isStatic) {
@@ -869,9 +1265,14 @@ public final class SpoonStubber {
                 } else {
                     // Only make abstract if not static
                     if (!p.isStatic) {
-                    m.setBody(null);
-                    m.addModifier(ModifierKind.PUBLIC);
-                    m.addModifier(ModifierKind.ABSTRACT);
+                        // Abstract interface method - MUST have no body
+                        m.setBody(null);
+                        m.addModifier(ModifierKind.PUBLIC);
+                        m.addModifier(ModifierKind.ABSTRACT);
+                        // Ensure no body was accidentally added
+                        if (m.getBody() != null) {
+                            m.setBody(null);
+                        }
                     } else {
                         // Static method in interface - must have body
                         CtBlock<?> body = f.Core().createBlock();
@@ -882,6 +1283,7 @@ public final class SpoonStubber {
                     }
                 }
             } else {
+                // Class method - always has body
                 CtBlock<?> body = f.Core().createBlock();
                 CtReturn<?> ret = defaultReturn(rt0);
                 if (ret != null) body.addStatement(ret);
@@ -1176,6 +1578,13 @@ public final class SpoonStubber {
                     : normalizeUnknownRef(raw); // ensure normalization survives
                 // Additional safety check
                 if (safe == null || isNullish(safe)) {
+                    safe = f.Type().createReference("java.lang.Object");
+                }
+                
+                // CRITICAL: Ensure parameter type is never void - void can only be a return type
+                if (safe.equals(f.Type().VOID_PRIMITIVE) || 
+                    "void".equals(safe.getSimpleName()) || 
+                    "void".equals(safeQN(safe))) {
                     safe = f.Type().createReference("java.lang.Object");
                 }
             } catch (Throwable e) {
@@ -4126,6 +4535,120 @@ public final class SpoonStubber {
         
         // Fix collector method return types
         fixCollectorMethodReturnTypes();
+        
+        // Fix iterator() return types for Vavr collections
+        fixVavrIteratorReturnTypes();
+        
+        // Fix Option stub signatures (none() should have no params, some(T) should have one param)
+        fixOptionStubSignatures();
+    }
+    
+    /**
+     * Fix Option stub signatures.
+     * Option.none() should have no parameters (not Object).
+     * Option.some(T) should have one parameter of type T (not double or Object).
+     */
+    private void fixOptionStubSignatures() {
+        for (CtType<?> type : model.getAllTypes()) {
+            String typeQn = safeQN(type.getReference());
+            if (typeQn == null || !"io.vavr.control.Option".equals(typeQn)) continue;
+            
+            if (!(type instanceof CtInterface)) continue;
+            CtInterface<?> iface = (CtInterface<?>) type;
+            
+            // Fix none() method - should have no parameters
+            for (CtMethod<?> method : iface.getMethods()) {
+                if (!"none".equals(method.getSimpleName())) continue;
+                if (!method.hasModifier(ModifierKind.STATIC)) continue;
+                
+                // If it has parameters, remove them
+                if (!method.getParameters().isEmpty()) {
+                    // Remove all parameters
+                    List<CtParameter<?>> params = new ArrayList<>(method.getParameters());
+                    for (CtParameter<?> param : params) {
+                        method.removeParameter(param);
+                    }
+                }
+            }
+            
+            // Fix some() method - should have one parameter of type T
+            for (CtMethod<?> method : iface.getMethods()) {
+                if (!"some".equals(method.getSimpleName())) continue;
+                if (!method.hasModifier(ModifierKind.STATIC)) continue;
+                
+                List<CtParameter<?>> params = method.getParameters();
+                if (params.size() != 1) {
+                    // Remove all parameters and add one of type T
+                    for (CtParameter<?> param : new ArrayList<>(params)) {
+                        method.removeParameter(param);
+                    }
+                    
+                    // Add parameter of type T (use interface's type parameter)
+                    if (iface instanceof CtFormalTypeDeclarer) {
+                        List<CtTypeParameter> typeParams = ((CtFormalTypeDeclarer) iface).getFormalCtTypeParameters();
+                        if (typeParams != null && !typeParams.isEmpty()) {
+                            CtParameter<?> newParam = f.Core().createParameter();
+                            newParam.setType(typeParams.get(0).getReference());
+                            newParam.setSimpleName("value");
+                            method.addParameter(newParam);
+                        }
+                    }
+                } else {
+                    // Check if parameter type is wrong (e.g., double, unknown.T, or Object instead of T)
+                    CtParameter<?> param = params.get(0);
+                    CtTypeReference<?> paramType = param.getType();
+                    String paramQn = safeQN(paramType);
+                    if (paramQn != null && (paramQn.equals("double") || paramQn.equals("java.lang.Double") || 
+                        paramQn.equals("java.lang.Object") || paramQn.equals("unknown.T") || 
+                        paramQn.equals("unknown.Unknown") || paramQn.startsWith("unknown."))) {
+                        // Replace with T
+                        if (iface instanceof CtFormalTypeDeclarer) {
+                            List<CtTypeParameter> typeParams = ((CtFormalTypeDeclarer) iface).getFormalCtTypeParameters();
+                            if (typeParams != null && !typeParams.isEmpty()) {
+                                param.setType(typeParams.get(0).getReference());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    /**
+     * Fix iterator() return types for Vavr collections.
+     * Vavr collections should return io.vavr.collection.Iterator<T> not java.util.Iterator<T>.
+     */
+    private void fixVavrIteratorReturnTypes() {
+        for (CtType<?> type : model.getAllTypes()) {
+            String typeQn = safeQN(type.getReference());
+            if (typeQn == null || !typeQn.startsWith("io.vavr.collection.")) continue;
+            
+            // Check all methods named iterator()
+            for (CtMethod<?> method : type.getMethods()) {
+                if (!"iterator".equals(method.getSimpleName())) continue;
+                if (!method.getParameters().isEmpty()) continue; // Only no-arg iterator()
+                
+                CtTypeReference<?> returnType = method.getType();
+                if (returnType == null) continue;
+                
+                String returnQn = safeQN(returnType);
+                if (returnQn != null && returnQn.startsWith("java.util.Iterator")) {
+                    // Replace with io.vavr.collection.Iterator
+                    CtTypeReference<?> vavrIterator = f.Type().createReference("io.vavr.collection.Iterator");
+                    // Add type argument if original had one
+                    if (returnType.getActualTypeArguments() != null && !returnType.getActualTypeArguments().isEmpty()) {
+                        vavrIterator.addActualTypeArgument(returnType.getActualTypeArguments().get(0));
+                    } else if (type instanceof CtFormalTypeDeclarer) {
+                        // Use owner's type parameter
+                        List<CtTypeParameter> ownerParams = ((CtFormalTypeDeclarer) type).getFormalCtTypeParameters();
+                        if (ownerParams != null && !ownerParams.isEmpty()) {
+                            vavrIterator.addActualTypeArgument(ownerParams.get(0).getReference());
+                        }
+                    }
+                    method.setType(vavrIterator);
+                }
+            }
+        }
     }
     
     /**

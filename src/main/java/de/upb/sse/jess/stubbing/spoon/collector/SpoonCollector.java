@@ -91,6 +91,62 @@ public final class SpoonCollector {
         return JDK_SIMPLE.containsKey(simple);
     }
 
+    // --- Method name → return type mappings (like JavaParser's InferenceEngine) ---
+    // This provides fallback type inference when context-based inference fails
+    private static final Map<String, String> METHOD_RETURN_TYPES = new HashMap<>();
+    static {
+        // Collection/Iterator methods - CRITICAL for Vavr and functional libraries
+        METHOD_RETURN_TYPES.put("iterator", "java.util.Iterator");
+        METHOD_RETURN_TYPES.put("hasNext", "boolean");
+        METHOD_RETURN_TYPES.put("next", "GENERIC_T");  // Generic placeholder
+        METHOD_RETURN_TYPES.put("isEmpty", "boolean");
+        METHOD_RETURN_TYPES.put("isPresent", "boolean");
+        METHOD_RETURN_TYPES.put("size", "int");
+        METHOD_RETURN_TYPES.put("length", "int");
+        METHOD_RETURN_TYPES.put("count", "long");
+        
+        // Common Object methods
+        METHOD_RETURN_TYPES.put("toString", "java.lang.String");
+        METHOD_RETURN_TYPES.put("hashCode", "int");
+        METHOD_RETURN_TYPES.put("equals", "boolean");
+        METHOD_RETURN_TYPES.put("clone", "java.lang.Object");
+        METHOD_RETURN_TYPES.put("compareTo", "int");
+        
+        // Common getter/query patterns
+        METHOD_RETURN_TYPES.put("get", "GENERIC_T");  // Generic
+        METHOD_RETURN_TYPES.put("contains", "boolean");
+        METHOD_RETURN_TYPES.put("containsKey", "boolean");
+        METHOD_RETURN_TYPES.put("containsValue", "boolean");
+        METHOD_RETURN_TYPES.put("startsWith", "boolean");
+        METHOD_RETURN_TYPES.put("endsWith", "boolean");
+        
+        // Stream/Functional interface methods - CRITICAL for functional code
+        METHOD_RETURN_TYPES.put("apply", "GENERIC_T");  // Generic
+        METHOD_RETURN_TYPES.put("test", "boolean");
+        METHOD_RETURN_TYPES.put("accept", "void");
+        METHOD_RETURN_TYPES.put("run", "void");
+        METHOD_RETURN_TYPES.put("call", "GENERIC_T");
+        
+        // Stream API terminal operations
+        METHOD_RETURN_TYPES.put("forEach", "void");
+        METHOD_RETURN_TYPES.put("anyMatch", "boolean");
+        METHOD_RETURN_TYPES.put("allMatch", "boolean");
+        METHOD_RETURN_TYPES.put("noneMatch", "boolean");
+        METHOD_RETURN_TYPES.put("findFirst", "java.util.Optional");
+        METHOD_RETURN_TYPES.put("findAny", "java.util.Optional");
+        
+        // Comparator methods
+        METHOD_RETURN_TYPES.put("compare", "int");
+        
+        // Boolean query methods
+        METHOD_RETURN_TYPES.put("isValid", "boolean");
+        METHOD_RETURN_TYPES.put("isNull", "boolean");
+        METHOD_RETURN_TYPES.put("hasValue", "boolean");
+        METHOD_RETURN_TYPES.put("canRead", "boolean");
+        METHOD_RETURN_TYPES.put("canWrite", "boolean");
+        METHOD_RETURN_TYPES.put("exists", "boolean");
+    }
+
     /* ======================================================================
      *                               FIELDS
      * ====================================================================== */
@@ -151,6 +207,11 @@ public final class SpoonCollector {
         // This ensures that functional interfaces have only ONE abstract method
         // Even if different collection phases added methods with different parameter types (int vs Integer)
         removeDuplicateSamMethods(result);
+
+        // CRITICAL FIX: Post-process ALL method plans to fix return types using method name mappings
+        // This catches methods added from ANY of the 17+ collection points
+        // (collectUnresolvedMethodCalls, collectOverloadGaps, collectForEachLoops, etc.)
+        fixMethodReturnTypesFromMethodNames(result);
 
         // Ensure owners exist for any planned members / references discovered above.
         result.typePlans.addAll(ownersNeedingTypes(result));
@@ -1305,6 +1366,15 @@ public final class SpoonCollector {
                 if (returnType == null) returnType = f.Type().createReference("java.lang.String");
             }
 
+            // CRITICAL FIX (EARLY PATH): Try method name mapping before defaulting to void
+            if (returnType == null || isUnknownOrVoidPrimitive(returnType)) {
+                CtTypeReference<?> mappedType = inferReturnTypeFromMethodName(name, owner);
+                if (mappedType != null) {
+                    System.err.println("[FIX-EARLY] Method name mapping applied: " + name + "() -> " + safeQN(mappedType));
+                    returnType = mappedType;
+                }
+            }
+
             if (returnType == null) returnType = f.Type().VOID_PRIMITIVE;
 
             // --- Enum utilities: values() & valueOf(String) ---
@@ -1606,6 +1676,95 @@ public final class SpoonCollector {
         }
         // Default to Unknown for test compatibility (tests expect Unknown, not null/Object)
         return f.Type().createReference(UnknownType.CLASS);
+    }
+
+    /**
+     * Infer return type from method name using hardcoded mappings (like JavaParser's InferenceEngine).
+     * This provides a fallback when context-based inference fails.
+     * 
+     * @param methodName The name of the method being called
+     * @param ownerType The type reference of the method's owner (for generic type parameter resolution)
+     * @return The inferred return type, or null if no mapping exists
+     */
+    private CtTypeReference<?> inferReturnTypeFromMethodName(String methodName, CtTypeReference<?> ownerType) {
+        if (methodName == null) return null;
+        
+        String returnTypeName = METHOD_RETURN_TYPES.get(methodName);
+        if (returnTypeName == null) return null;
+        
+        // Handle generic placeholders (GENERIC_T)
+        if ("GENERIC_T".equals(returnTypeName)) {
+            // Try to get the generic type parameter from the owner type
+            if (ownerType != null) {
+                try {
+                    // If owner is a generic type like List<String>, extract the type argument
+                    var typeArgs = ownerType.getActualTypeArguments();
+                    if (typeArgs != null && !typeArgs.isEmpty()) {
+                        return typeArgs.get(0).clone();
+                    }
+                    
+                    // Try to get type parameters from the owner's declaration
+                    CtType<?> ownerDecl = ownerType.getTypeDeclaration();
+                    if (ownerDecl != null) {
+                        var typeParams = ownerDecl.getFormalCtTypeParameters();
+                        if (typeParams != null && !typeParams.isEmpty()) {
+                            // Create a reference to the first type parameter
+                            return typeParams.get(0).getReference();
+                        }
+                    }
+                } catch (Throwable ignored) {
+                    // If we can't resolve the generic, create a type parameter reference
+                }
+            }
+            
+            // Fallback: create a generic type parameter reference T
+            return f.Type().createTypeParameterReference("T");
+        }
+        
+        // Handle void specially
+        if ("void".equals(returnTypeName)) {
+            return f.Type().VOID_PRIMITIVE;
+        }
+        
+        // Handle boolean specially  
+        if ("boolean".equals(returnTypeName)) {
+            return f.Type().BOOLEAN_PRIMITIVE;
+        }
+        
+        // Handle int specially
+        if ("int".equals(returnTypeName)) {
+            return f.Type().INTEGER_PRIMITIVE;
+        }
+        
+        // Handle long specially
+        if ("long".equals(returnTypeName)) {
+            return f.Type().LONG_PRIMITIVE;
+        }
+        
+        // Create reference for the mapped type
+        return f.Type().createReference(returnTypeName);
+    }
+
+    /**
+     * Returns true if the type reference is unknown or void primitive.
+     * Used to determine if we should try method name mapping.
+     */
+    private boolean isUnknownOrVoidPrimitive(CtTypeReference<?> typeRef) {
+        if (typeRef == null) return true;
+        
+        try {
+            // Check if it's void primitive
+            if (typeRef.equals(f.Type().VOID_PRIMITIVE)) return true;
+            
+            // Check if qualified name contains "unknown" or "Unknown"
+            String qn = safeQN(typeRef);
+            if (qn != null && (qn.startsWith("unknown.") || qn.equals(UnknownType.CLASS))) {
+                return true;
+            }
+        } catch (Throwable ignored) {
+        }
+        
+        return false;
     }
 
     /**
@@ -2317,6 +2476,21 @@ public final class SpoonCollector {
             boolean isSuperCall = inv.getTarget() instanceof CtSuperAccess<?>;
 
             CtTypeReference<?> returnType = inferReturnTypeFromContext(inv);
+            
+            // CRITICAL FIX: Try method name mapping before defaulting to void
+            // This fixes the majority of failures where context-based inference fails
+            // (e.g., iterator(), isEmpty(), hasNext(), next(), apply(), etc.)
+            if (returnType == null || isUnknownOrVoidPrimitive(returnType)) {
+                CtTypeReference<?> mappedType = inferReturnTypeFromMethodName(name, owner);
+                if (mappedType != null) {
+                    System.err.println("[FIX] Method name mapping applied: " + name + "() -> " + safeQN(mappedType));
+                    returnType = mappedType;
+                } else if (returnType == null) {
+                    System.err.println("[FIX] No mapping for method: " + name + "(), will default to void");
+                }
+            }
+            
+            // Default to void only if all inference methods failed
             if (returnType == null) returnType = f.Type().VOID_PRIMITIVE;
             
             // For method calls on functional interfaces, check if this is the SAM method
@@ -3446,10 +3620,28 @@ public final class SpoonCollector {
         // Validate FQN: must have a simple name (not just a package)
         // Reject FQNs like "unknown." or "package." (ending with dot but no simple name)
         if (fqn.endsWith(".")) return; // Invalid: ends with dot but no simple name
+        
+        // Filter out array types - arrays should never be generated as classes
+        if (isArrayType(fqn)) return;
+        
         int lastDot = fqn.lastIndexOf('.');
         String simpleName = (lastDot >= 0 ? fqn.substring(lastDot + 1) : fqn);
         if (simpleName == null || simpleName.isEmpty()) return; // Invalid: no simple name
+        
+        // Also check if simple name is an array type
+        if (isArrayType(simpleName)) return;
+        
         out.typePlans.add(new TypeStubPlan(fqn, kind));
+    }
+    
+    /**
+     * Check if a type name represents an array type (should not be generated as a class).
+     */
+    private static boolean isArrayType(String typeName) {
+        if (typeName == null || typeName.isEmpty()) return false;
+        // Check for array brackets in the name
+        return typeName.contains("[]") || typeName.endsWith("]") || 
+               typeName.matches(".*\\[\\d*\\].*"); // Also matches multi-dimensional arrays
     }
     
     /**
@@ -4369,6 +4561,145 @@ public final class SpoonCollector {
                     toKeep.paramTypes.stream().map(t -> safeQN(t)).collect(Collectors.joining(", ")) + ")");
             }
         }
+    }
+
+    /**
+     * POST-PROCESS: Fix method return types AND parameters for functional interfaces.
+     * This is called AFTER all collection phases to fix methods that were incorrectly
+     * inferred (void return types, missing parameters, wrong generics).
+     * 
+     * CRITICAL FIX: Handles functional interface SAM methods (apply, test, accept, etc.)
+     * which need correct parameters and return types based on the interface's type parameters.
+     * 
+     * Since MethodStubPlan is immutable, we remove old plans and add new ones with correct signatures.
+     */
+    private void fixMethodReturnTypesFromMethodNames(CollectResult result) {
+        System.err.println("[fixMethodReturnTypes] Post-processing " + result.methodPlans.size() + " method plans");
+        
+        // DEBUG: Log all apply/test/accept methods to understand why they're not being fixed
+        for (MethodStubPlan plan : result.methodPlans) {
+            if ("apply".equals(plan.name) || "test".equals(plan.name) || "accept".equals(plan.name) || 
+                "isEmpty".equals(plan.name) || "iterator".equals(plan.name)) {
+                System.err.println("[DEBUG] Found SAM/common method: " + safeQN(plan.ownerType) + "#" + plan.name + 
+                    "(" + plan.paramTypes.size() + " params) : " + safeQN(plan.returnType));
+                if (plan.ownerType != null) {
+                    System.err.println("  ownerType typeArgs: " + (plan.ownerType.getActualTypeArguments() != null ? 
+                        plan.ownerType.getActualTypeArguments().size() : "null"));
+                }
+            }
+        }
+        
+        List<MethodStubPlan> plansToRemove = new ArrayList<>();
+        List<MethodStubPlan> plansToAdd = new ArrayList<>();
+        
+        for (MethodStubPlan plan : result.methodPlans) {
+            boolean needsFix = false;
+            CtTypeReference<?> fixedReturnType = plan.returnType;
+            List<CtTypeReference<?>> fixedParams = plan.paramTypes;
+            
+            // Check if this is a functional interface SAM method with wrong signature
+            if ("apply".equals(plan.name) || "test".equals(plan.name) || "accept".equals(plan.name)) {
+                // Check if owner is a functional interface (has type parameters)
+                if (plan.ownerType != null) {
+                    try {
+                        var typeArgs = plan.ownerType.getActualTypeArguments();
+                        String ownerQn = safeQN(plan.ownerType);
+                        
+                        System.err.println("[DEBUG] Checking functional interface: " + ownerQn + 
+                            ", typeArgs=" + (typeArgs != null ? typeArgs.size() : "null"));
+                        
+                        // Function1<T, R> → R apply(T t)
+                        if (ownerQn != null && ownerQn.startsWith("io.vavr.Function") && "apply".equals(plan.name)) {
+                            if (typeArgs != null && typeArgs.size() >= 2) {
+                                // Last type arg is return type, rest are parameters
+                                int numParams = typeArgs.size() - 1;
+                                fixedReturnType = typeArgs.get(typeArgs.size() - 1).clone();
+                                fixedParams = new ArrayList<>();
+                                for (int i = 0; i < numParams; i++) {
+                                    fixedParams.add(typeArgs.get(i).clone());
+                                }
+                                needsFix = true;
+                                System.err.println("[fixMethodReturnTypes] Fixed functional interface: " + ownerQn + "#apply");
+                            }
+                        }
+                        // Predicate<T> → boolean test(T t)
+                        else if (ownerQn != null && ownerQn.contains("Predicate") && "test".equals(plan.name)) {
+                            if (typeArgs != null && typeArgs.size() >= 1) {
+                                fixedReturnType = f.Type().BOOLEAN_PRIMITIVE;
+                                fixedParams = new ArrayList<>();
+                                fixedParams.add(typeArgs.get(0).clone());
+                                needsFix = true;
+                                System.err.println("[fixMethodReturnTypes] Fixed Predicate: " + ownerQn + "#test");
+                            }
+                        }
+                        // Consumer<T> → void accept(T t)
+                        else if (ownerQn != null && ownerQn.contains("Consumer") && "accept".equals(plan.name)) {
+                            if (typeArgs != null && typeArgs.size() >= 1) {
+                                fixedReturnType = f.Type().VOID_PRIMITIVE;
+                                fixedParams = new ArrayList<>();
+                                fixedParams.add(typeArgs.get(0).clone());
+                                needsFix = true;
+                                System.err.println("[fixMethodReturnTypes] Fixed Consumer: " + ownerQn + "#accept");
+                            }
+                        }
+                    } catch (Throwable ignored) {}
+                }
+            }
+            
+            // Check if return type needs fixing (void/unknown/Object)
+            if (!needsFix) {
+                if (plan.returnType == null || isUnknownOrVoidPrimitive(plan.returnType)) {
+                    needsFix = true;
+                } else {
+                    String qn = safeQN(plan.returnType);
+                    if ("java.lang.Object".equals(qn)) {
+                        needsFix = true;
+                    }
+                }
+                
+                if (needsFix) {
+                    // Try to get better return type from method name mapping
+                    CtTypeReference<?> mappedType = inferReturnTypeFromMethodName(plan.name, plan.ownerType);
+                    if (mappedType != null) {
+                        fixedReturnType = mappedType;
+                    } else {
+                        needsFix = false; // No mapping found, keep original
+                    }
+                }
+            }
+            
+            if (!needsFix) continue;
+            
+            String oldType = safeQN(plan.returnType);
+            String newType = safeQN(fixedReturnType);
+            
+            // Create new plan with correct signature
+            MethodStubPlan fixedPlan = new MethodStubPlan(
+                plan.ownerType,
+                plan.name,
+                fixedReturnType,
+                fixedParams,
+                plan.isStatic,
+                plan.visibility,
+                plan.thrownTypes,
+                plan.defaultOnInterface,
+                plan.varargs,
+                plan.mirror,
+                plan.mirrorOwnerRef
+            );
+            
+            plansToRemove.add(plan);
+            plansToAdd.add(fixedPlan);
+            
+            System.err.println("[fixMethodReturnTypes] Fixed: " + safeQN(plan.ownerType) + "#" + plan.name + 
+                "(" + plan.paramTypes.size() + " params) : " + oldType + " -> " + newType);
+        }
+        
+        // Apply changes
+        result.methodPlans.removeAll(plansToRemove);
+        result.methodPlans.addAll(plansToAdd);
+        
+        System.err.println("[fixMethodReturnTypes] Fixed " + plansToAdd.size() + " method signatures");
     }
 
     // In SpoonCollector
