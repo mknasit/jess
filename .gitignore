@@ -11,3 +11,5 @@ experiment
 experiment_result
 .experiment
 .experiment_result
+.projects
+/src/test/resources/projects/
