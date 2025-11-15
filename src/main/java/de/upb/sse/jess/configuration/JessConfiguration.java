@@ -12,7 +12,7 @@ public class JessConfiguration {
     private boolean exitOnParsingFail = false;
     private boolean looseSignatureMatching = true;
     private boolean keepAsteriskImports = true;
-    private boolean failOnAmbiguity = true;
+    private boolean failOnAmbiguity = false;
     private boolean disableStubbing = false;
     private boolean minimalStubbing = false; // Default to minimal stubbing mode
     private boolean includeJdkStubs = false; // Default to false - JDK types are available from JRE, stubs cause conflicts
