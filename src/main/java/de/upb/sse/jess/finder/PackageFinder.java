@@ -210,6 +210,15 @@ public class PackageFinder {
         System.err.println("[PackageFinder] Multi-module project, limited to " + sorted.size() + " shortest paths:");
         sorted.forEach(root -> System.err.println("  - " + root));
         
-        return new HashSet<>(sorted);
+        Set<String> result = new HashSet<>(sorted);
+        
+        // SAFETY CHECK: If filtering resulted in empty set, return original roots
+        // This prevents breaking the tool when filtering is too aggressive
+        if (result.isEmpty()) {
+            System.err.println("[PackageFinder] WARNING: Filtering resulted in empty set, using all " + nonTest.size() + " original roots");
+            return nonTest;
+        }
+        
+        return result;
     }
 }
