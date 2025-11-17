@@ -13,3 +13,5 @@ experiment_result
 .experiment_result
 .projects
 /src/test/resources/projects/
+/src/test/resources/project/
+/src/main/java/de/upb/sse/jess/experiment setup/
