@@ -17,3 +17,5 @@ experiment_result
 /src/main/java/de/upb/sse/jess/experiment setup/
 /src/main/resources/experiment setup/
 /src/main/resources/experiment_result/
+.zip
+*.zip
