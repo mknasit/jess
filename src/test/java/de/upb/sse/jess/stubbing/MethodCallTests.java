@@ -1,10 +1,13 @@
 package de.upb.sse.jess.stubbing;
 
 import de.upb.sse.jess.Jess;
+import de.upb.sse.jess.configuration.JessConfiguration;
 import de.upb.sse.jess.exceptions.AmbiguityException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+
+import java.util.Collections;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -63,6 +66,9 @@ public class MethodCallTests {
     @Test
     @DisplayName("Method call with null as argument (ambiguous)")
     void methodCall7ambiguous() {
+        JessConfiguration config = new JessConfiguration();
+        config.setFailOnAmbiguity(true);  // Allow Object for null arguments with multiple overloads
+        Jess jess = new Jess(config, Collections.emptyList(), Collections.emptyList());
         assertThrows(AmbiguityException.class, () -> jess.parse("src/test/resources/stubbing/methodcall/MethodCall7.java"));
     }
 
