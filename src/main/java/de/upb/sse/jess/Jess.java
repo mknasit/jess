@@ -225,7 +225,10 @@ public class Jess {
           throw e;
         } catch (Throwable e) {
             if (e instanceof StackOverflowError) {
-                System.err.println("Stackoverflow");
+                System.err.println("StackOverflowError: JavaParser symbol resolution overflow (likely circular type dependencies)");
+                System.err.println("  This is a known limitation of JavaParser when resolving complex inheritance hierarchies.");
+                System.err.println("  Suggestion: Increase JVM stack size with -Xss4m or -Xss8m");
+                System.err.println("  Example: java -Xss8m -jar jess.jar ...");
             } else if (e instanceof OutOfMemoryError) {
                 System.err.println("OutOfMemoryError: " + e.getMessage());
                 System.err.println("Heap memory exhausted. Consider increasing JVM heap size with -Xmx option.");

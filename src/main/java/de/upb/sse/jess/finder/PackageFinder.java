@@ -157,10 +157,12 @@ public class PackageFinder {
         // Prefer roots with standard patterns
         Set<String> preferred = new HashSet<>();
         
-        // Pattern 1: Standard Maven structure (src/main/java)
+        // Pattern 1: Standard Maven structure (src/main/java, src/generated/java)
         Set<String> standardMaven = nonTest.stream()
             .filter(root -> root.endsWith("src" + File.separator + "main" + File.separator + "java") ||
-                           root.endsWith("src" + File.separator + "main" + File.separator + "java" + File.separator))
+                           root.endsWith("src" + File.separator + "main" + File.separator + "java" + File.separator) ||
+                           root.endsWith("src" + File.separator + "generated" + File.separator + "java") ||
+                           root.endsWith("src" + File.separator + "generated" + File.separator + "java" + File.separator))
             .collect(Collectors.toSet());
         
         // Pattern 2: Android library structure (library/src, app/src)
@@ -201,10 +203,12 @@ public class PackageFinder {
         }
         
         // Step 5: Last resort - pick shortest paths (usually root/main modules)
-        // Limit to 5 to avoid overwhelming the type solver
+        // For very large projects (50+ roots), use higher limit to avoid missing important modules
+        // Limit to 5-15 depending on project size to avoid overwhelming the type solver
+        int limit = nonTest.size() > 50 ? 15 : (nonTest.size() > 20 ? 10 : 5);
         List<String> sorted = nonTest.stream()
             .sorted(Comparator.comparingInt(String::length))
-            .limit(5)
+            .limit(limit)
             .collect(Collectors.toList());
         
         System.err.println("[PackageFinder] Multi-module project, limited to " + sorted.size() + " shortest paths:");

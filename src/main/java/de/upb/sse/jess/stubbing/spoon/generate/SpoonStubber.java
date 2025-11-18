@@ -479,6 +479,20 @@ public final class SpoonStubber {
                             if (!(parent instanceof CtClass)) {
                                 ((CtType<?>) parent).addNestedType(nested);
                             }
+                        } else if (p.kind == TypeStubPlan.Kind.ENUM) {
+                            // Create enum type
+                            // Spoon API: f.Enum().create() only works for top-level enums with package
+                            // For nested enums, use Core API and addNestedType
+                            nested = f.Core().createEnum();
+                            nested.setSimpleName(simple);
+                            ((CtType<?>) parent).addNestedType(nested);
+                        } else if (p.kind == TypeStubPlan.Kind.RECORD) {
+                            // Create record type
+                            // Spoon API: f.Record().create() only works for top-level records with package
+                            // For nested records, use Core API and addNestedType
+                            nested = f.Core().createRecord();
+                            nested.setSimpleName(simple);
+                            ((CtType<?>) parent).addNestedType(nested);
                         } else {
                             // Default to class
                             if (parent instanceof CtClass) {
@@ -593,6 +607,15 @@ public final class SpoonStubber {
                 created = at;
                 break;
             }
+            case ENUM:
+                created = f.Enum().create(packageObj, name);
+                break;
+            case RECORD:
+                // Spoon API: Use Core API to create records (similar to enums)
+                created = f.Core().createRecord();
+                created.setSimpleName(name);
+                packageObj.addType(created);
+                break;
             default:
                 created = f.Class().create(packageObj, name);
         }
@@ -620,6 +643,15 @@ public final class SpoonStubber {
                 cls.setSuperclass(f.Type().createReference("java.lang.RuntimeException"));
             }
         }
+        
+        // Handle records: Records auto-generate equals(), hashCode(), toString()
+        // Component accessors are also auto-generated, but we can add them if needed
+        // For now, records are created correctly - component generation can be enhanced later
+        if (p.kind == TypeStubPlan.Kind.RECORD && created instanceof spoon.reflect.declaration.CtRecord) {
+            // TODO: Add record component generation based on usage patterns
+            // Records auto-generate component accessors, equals(), hashCode(), toString()
+            // so we don't need to add them manually unless we want to stub specific components
+        }
 
         //createdTypes.add(qn);
         createdTypes.add(created.getQualifiedName());
@@ -646,23 +678,28 @@ public final class SpoonStubber {
             CtType<?> ownerType = ownerRef.getTypeDeclaration();
             if (ownerType == null) continue;
             
-            // Skip if owner is an enum and field name matches an enum constant
-            // (enum constants should be added as enum values, not fields)
+            // If owner is an enum and field name looks like an enum constant, add it as enum constant
             if (ownerType instanceof CtEnum) {
                 CtEnum<?> enumDecl = (CtEnum<?>) ownerType;
-                // Check if this field name matches an enum constant
+                // Check if this field name matches an existing enum constant
+                boolean alreadyExists = false;
                 for (CtEnumValue<?> enumValue : enumDecl.getEnumValues()) {
                     if (p.fieldName.equals(enumValue.getSimpleName())) {
-                        // This is an enum constant, skip adding as field
-                        continue;
+                        // This enum constant already exists, skip
+                        alreadyExists = true;
+                        break;
                     }
                 }
-                // Also check if field name looks like an enum constant (all uppercase)
-                if (p.fieldName != null && p.fieldName.equals(p.fieldName.toUpperCase()) && 
-                    p.fieldName.matches("[A-Z][A-Z0-9_]*")) {
-                    // Looks like an enum constant, skip
+                if (!alreadyExists && p.fieldName != null && p.fieldName.equals(p.fieldName.toUpperCase()) && 
+                    p.fieldName.matches("[A-Z][A-Z0-9_]*") && p.isStatic) {
+                    // Looks like an enum constant, add it as enum value
+                    CtEnumValue<?> enumValue = f.Core().createEnumValue();
+                    enumValue.setSimpleName(p.fieldName);
+                    enumDecl.addEnumValue(enumValue);
+                    created++;
                     continue;
                 }
+                // If it's not an enum constant, continue to add as regular field
             }
             
             CtClass<?> owner = ensurePublicClass(p.ownerType);
@@ -678,6 +715,22 @@ public final class SpoonStubber {
             if (p.isStatic) mods.add(ModifierKind.STATIC);
 
             CtField<?> fd = f.Field().create(owner, mods, fieldType, p.fieldName);
+            
+            // CRITICAL FIX: Initialize primitive fields with proper default values (not null)
+            if (fieldType != null && fieldType.isPrimitive()) {
+                CtExpression<?> defaultValue = createDefaultValue(fieldType);
+                if (defaultValue != null) {
+                    try {
+                        // Use setAssignment with raw type cast (same pattern as autoInitializeFields)
+                        @SuppressWarnings({"unchecked", "rawtypes"})
+                        CtExpression expr = (CtExpression) defaultValue;
+                        fd.setAssignment(expr);
+                    } catch (Throwable ignored) {
+                        // Fail silently - field will be initialized later by autoInitializeFields
+                    }
+                }
+            }
+            
             ensureImport(owner, fieldType);
 
             created++;
@@ -833,6 +886,100 @@ public final class SpoonStubber {
             if (owner == null) {
                 continue;
             }
+            
+            // CRITICAL FIX: Check if method with same signature already exists (prevents duplicates)
+            // This fixes issues where methods are added from both interface inheritance and direct plans
+            boolean methodAlreadyExists = false;
+            if (owner instanceof CtClass) {
+                CtClass<?> cls = (CtClass<?>) owner;
+                // Check for existing method with same name and parameter count (including inherited from interfaces)
+                Collection<CtMethod<?>> existingMethods = new ArrayList<>();
+                existingMethods.addAll(cls.getMethods());
+                
+                // Also check methods from implemented interfaces
+                for (CtTypeReference<?> ifaceRef : cls.getSuperInterfaces()) {
+                    try {
+                        CtType<?> ifaceType = ifaceRef.getTypeDeclaration();
+                        if (ifaceType instanceof CtInterface) {
+                            existingMethods.addAll(((CtInterface<?>) ifaceType).getMethods());
+                        }
+                    } catch (Throwable ignored) {}
+                }
+                
+                // Filter by name
+                existingMethods = existingMethods.stream()
+                    .filter(m -> m.getSimpleName().equals(p.name))
+                    .collect(Collectors.toList());
+                
+                // Check if exact signature matches
+                for (CtMethod<?> existing : existingMethods) {
+                    if (existing.getParameters().size() == p.paramTypes.size()) {
+                        boolean signatureMatches = true;
+                        for (int i = 0; i < p.paramTypes.size(); i++) {
+                            try {
+                                String newParamQn = safeQN(p.paramTypes.get(i));
+                                String existingParamQn = safeQN(existing.getParameters().get(i).getType());
+                                if (newParamQn != null && existingParamQn != null && !newParamQn.equals(existingParamQn)) {
+                                    signatureMatches = false;
+                                    break;
+                                }
+                            } catch (Throwable ignored) {
+                                signatureMatches = false;
+                                break;
+                            }
+                        }
+                        if (signatureMatches) {
+                            // Method with exact signature already exists - skip
+                            methodAlreadyExists = true;
+                            break;
+                        }
+                    }
+                }
+            } else if (owner instanceof CtInterface) {
+                CtInterface<?> iface = (CtInterface<?>) owner;
+                // Check for existing method with same name and parameter count
+                Collection<CtMethod<?>> existingMethods = iface.getMethods().stream()
+                    .filter(m -> m.getSimpleName().equals(p.name))
+                    .collect(Collectors.toList());
+                
+                // Check if exact signature matches
+                for (CtMethod<?> existing : existingMethods) {
+                    if (existing.getParameters().size() == p.paramTypes.size()) {
+                        boolean signatureMatches = true;
+                        for (int i = 0; i < p.paramTypes.size(); i++) {
+                            try {
+                                String newParamQn = safeQN(p.paramTypes.get(i));
+                                String existingParamQn = safeQN(existing.getParameters().get(i).getType());
+                                if (newParamQn != null && existingParamQn != null && !newParamQn.equals(existingParamQn)) {
+                                    signatureMatches = false;
+                                    break;
+                                }
+                            } catch (Throwable ignored) {
+                                signatureMatches = false;
+                                break;
+                            }
+                        }
+                        if (signatureMatches) {
+                            // Method with exact signature already exists - skip
+                            methodAlreadyExists = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            if (methodAlreadyExists) {
+                continue; // Skip to next plan
+            }
+            
+            // Skip final methods from java.lang.Enum (ordinal, name) - they cannot be overridden
+            // Also skip values() and valueOf() - they are automatically provided by Java for all enums
+            if (owner instanceof CtEnum) {
+                if ("ordinal".equals(p.name) || "name".equals(p.name) || 
+                    "values".equals(p.name) || "valueOf".equals(p.name)) {
+                    continue; // Skip - these are final/automatic in java.lang.Enum
+                }
+            }
 
             // Check if this is a functional interface - if so, only allow the SAM method
             // Note: We mark functional interfaces when we add the "apply" or "make" method below
@@ -918,6 +1065,40 @@ public final class SpoonStubber {
             // 2) normalize return type
             // IMPORTANT: Check for type parameters BEFORE normalization
             CtTypeReference<?> rt0 = (p.returnType != null ? p.returnType : f.Type().VOID_PRIMITIVE);
+            
+            // Ensure that if return type references a package (e.g., android.net.Uri),
+            // the package and type exist before we try to use it
+            if (rt0 != null) {
+                String returnTypeQn = safeQN(rt0);
+                if (returnTypeQn != null && returnTypeQn.contains(".") && 
+                    !returnTypeQn.startsWith("java.") && !returnTypeQn.startsWith("javax.")) {
+                    int lastDot = returnTypeQn.lastIndexOf('.');
+                    if (lastDot > 0) {
+                        String packageName = returnTypeQn.substring(0, lastDot);
+                        String typeName = returnTypeQn.substring(lastDot + 1);
+                        // Ensure package exists and create a placeholder type if needed
+                        // This ensures the package declaration exists in the generated code
+                        try {
+                            CtPackage pkg = f.Package().getOrCreate(packageName);
+                            // Check if type exists in the package
+                            CtType<?> existingType = pkg.getType(typeName);
+                            if (existingType == null) {
+                                // Type doesn't exist - create a placeholder class to ensure package exists
+                                // This will be replaced by the actual shim later, but ensures compilation doesn't fail
+                                // Only create placeholder for known shim types (android.*, androidx.*, etc.)
+                                if (packageName.startsWith("android.") || packageName.startsWith("androidx.") ||
+                                    packageName.startsWith("io.grpc.") || packageName.startsWith("com.google.protobuf.")) {
+                                    // Create a minimal placeholder class - shim generator will replace it
+                                    CtClass<?> placeholder = f.Class().create(pkg, typeName);
+                                    placeholder.addModifier(ModifierKind.PUBLIC);
+                                }
+                            }
+                        } catch (Throwable ignored) {
+                            // Package/type creation failed, but that's okay - Spoon will handle it
+                        }
+                    }
+                }
+            }
             
             // Special handling for iterator() method in Vavr collections
             // Vavr collections should return io.vavr.collection.Iterator<T> not java.util.Iterator<T>
@@ -1290,7 +1471,48 @@ public final class SpoonStubber {
                 m.setBody(body);
                 m.removeModifier(ModifierKind.ABSTRACT);
             }
-
+            
+            // GENERAL FIX: If method implements an interface method that has a throws clause, copy it
+            // This fixes "overridden method does not throw" errors for any method, not just close()
+            if (owner instanceof CtClass) {
+                CtClass<?> cls = (CtClass<?>) owner;
+                // Check all implemented interfaces for methods with the same signature that have throws clauses
+                for (CtTypeReference<?> ifaceRef : cls.getSuperInterfaces()) {
+                    try {
+                        CtType<?> ifaceType = ifaceRef.getTypeDeclaration();
+                        if (ifaceType instanceof CtInterface) {
+                            CtInterface<?> iface = (CtInterface<?>) ifaceType;
+                            for (CtMethod<?> ifaceMethod : iface.getMethods()) {
+                                if (p.name.equals(ifaceMethod.getSimpleName()) && 
+                                    ifaceMethod.getParameters().size() == p.paramTypes.size() &&
+                                    ifaceMethod.getThrownTypes() != null && !ifaceMethod.getThrownTypes().isEmpty()) {
+                                    // Found matching method with throws clause - copy all thrown types
+                                    for (CtTypeReference<?> thrownType : ifaceMethod.getThrownTypes()) {
+                                        try {
+                                            @SuppressWarnings("unchecked")
+                                            CtTypeReference<? extends Throwable> throwableRef = 
+                                                (CtTypeReference<? extends Throwable>) thrownType.clone();
+                                            m.addThrownType(throwableRef);
+                                        } catch (Throwable ignored) {
+                                            // If clone fails, try creating new reference
+                                            try {
+                                                String thrownQn = safeQN(thrownType);
+                                                if (thrownQn != null) {
+                                                    @SuppressWarnings("unchecked")
+                                                    CtTypeReference<? extends Throwable> throwableRef = 
+                                                        f.Type().createReference(thrownQn);
+                                                    m.addThrownType(throwableRef);
+                                                }
+                                            } catch (Throwable ignored2) {}
+                                        }
+                                    }
+                                    break; // Found matching method, no need to check other interfaces
+                                }
+                            }
+                        }
+                    } catch (Throwable ignored) {}
+                }
+            }
 
             // 9) imports for owner
             boolean usesUnknown =
@@ -1800,9 +2022,8 @@ public final class SpoonStubber {
     }
 
     /**
-     * Force FQN printing for non-JDK, non-primitive types and skip imports.
-     * Keeps primitives/void/arrays and JDK types untouched.
-     * Special handling for unknown.Unknown: allows simple name with import.
+     * Ensure type is imported in the owner's compilation unit and set up the reference correctly.
+     * CRITICAL FIX: Actually adds imports to the compilation unit, not just sets up the reference.
      */
     private void ensureImport(CtType<?> owner, CtTypeReference<?> ref) {
         if (ref == null) return;
@@ -1811,7 +2032,14 @@ public final class SpoonStubber {
         try {
             if (ref.isPrimitive()) return;
             if (ref.equals(f.Type().VOID_PRIMITIVE)) return;
-            if (ref.isArray()) return;
+            if (ref.isArray()) {
+                // For arrays, ensure import for the component type
+                try {
+                    CtTypeReference<?> componentType = ((CtArrayTypeReference<?>) ref).getComponentType();
+                    ensureImport(owner, componentType);
+                } catch (Throwable ignored) {}
+                return;
+            }
         } catch (Throwable ignored) {
         }
 
@@ -1825,12 +2053,62 @@ public final class SpoonStubber {
                 || qn.startsWith("jdk.")) {
             return;
         }
+        
+        // Ensure package exists for non-JDK types (especially for shim types like android.*)
+        if (qn.contains(".")) {
+            int lastDot = qn.lastIndexOf('.');
+            if (lastDot > 0) {
+                String packageName = qn.substring(0, lastDot);
+                try {
+                    f.Package().getOrCreate(packageName);
+                } catch (Throwable ignored) {
+                    // Package creation failed, but that's okay
+                }
+            }
+        }
 
         // Special handling for unknown.Unknown: don't force FQN, allow simple name with import
         if ("unknown.Unknown".equals(qn) || ("Unknown".equals(ref.getSimpleName()) && qn.startsWith("unknown."))) {
             // Don't override the setSimplyQualified(false) set by normalizeUnknownRef
             // The import will be added by ensureExplicitUnknownImport
             return;
+        }
+
+        // CRITICAL FIX: Actually add import to compilation unit for non-JDK types
+        if (qn.contains(".") && !qn.startsWith("unknown.")) {
+            try {
+                CtCompilationUnit cu = f.CompilationUnit().getOrCreate(owner);
+                if (cu != null) {
+                    // Check if import already exists
+                    boolean hasImport = cu.getImports().stream().anyMatch(imp -> {
+                        try {
+                            CtReference r = imp.getReference();
+                            if (r instanceof CtTypeReference) {
+                                String impQn = ((CtTypeReference<?>) r).getQualifiedName();
+                                return qn.equals(impQn);
+                            }
+                            return false;
+                        } catch (Throwable ignored) {
+                            return false;
+                        }
+                    });
+                    
+                    if (!hasImport) {
+                        // Add import
+                        CtTypeReference<?> importRef = f.Type().createReference(qn);
+                        CtImport imp = f.createImport(importRef);
+                        cu.getImports().add(imp);
+                        // Use simple name in the reference (import will handle qualification)
+                        ref.setSimplyQualified(false);
+                        System.out.println("[ensureImport] Added import " + qn + " to " + owner.getQualifiedName());
+                    } else {
+                        // Import exists, use simple name
+                        ref.setSimplyQualified(false);
+                    }
+                }
+            } catch (Throwable e) {
+                System.err.println("[ensureImport] Failed to add import for " + qn + " to " + owner.getQualifiedName() + ": " + e.getMessage());
+            }
         }
 
         // If it already has a package (qn contains '.'), keep it qualified.
@@ -1841,13 +2119,37 @@ public final class SpoonStubber {
             return;
         }
 
-        // For non-JDK, non-primitive, with a package: force FQN printing (no import).
+        // For non-JDK, non-primitive, with a package: use simple name with import (already added above)
         if (ref.getPackage() == null) {
             int i = qn.lastIndexOf('.');
             if (i > 0) ref.setPackage(f.Package().createReference(qn.substring(0, i)));
         }
         ref.setImplicit(false);
-        ref.setSimplyQualified(true); // always print FQN
+        // Use simple name since we added the import above
+        if (!qn.contains(".") || qn.startsWith("unknown.")) {
+            ref.setSimplyQualified(true); // force FQN for unknown or unqualified
+        } else {
+            ref.setSimplyQualified(false); // use simple name with import
+        }
+    }
+    
+    /**
+     * Validate that a type reference is not void (void can only be a return type, not a parameter or generic type).
+     * Returns a safe replacement (Object) if void is detected.
+     */
+    private CtTypeReference<?> validateNotVoid(CtTypeReference<?> type) {
+        if (type == null) return f.Type().createReference("java.lang.Object");
+        
+        try {
+            if (type.equals(f.Type().VOID_PRIMITIVE) || 
+                "void".equals(type.getSimpleName()) || 
+                "void".equals(safeQN(type))) {
+                System.err.println("[validateNotVoid] WARNING: void type detected in invalid context, replacing with Object");
+                return f.Type().createReference("java.lang.Object");
+            }
+        } catch (Throwable ignored) {}
+        
+        return type;
     }
 
     /**
@@ -2585,6 +2887,7 @@ public final class SpoonStubber {
             concreteBySimple.putIfAbsent(simple, fq);
         }
 
+        // GENERAL FIX: Process all classes and fix their superclasses
         for (CtType<?> t : model.getAllTypes()) {
             if (!(t instanceof CtClass)) continue;
 
@@ -2598,20 +2901,43 @@ public final class SpoonStubber {
             if (qn == null || !qn.startsWith("unknown.")) continue;
 
             String simple = sup.getSimpleName();
+            if (simple == null || simple.isEmpty()) continue;
 
-            // 1) Prefer current package (like fixtures.sup.P)
+            // GENERAL FIX: Always prefer current package for superclasses (most common pattern)
             String pkg = Optional.ofNullable(cls.getPackage()).map(CtPackage::getQualifiedName).orElse("");
-            if (!pkg.isEmpty()) {
-                CtTypeReference<?> candidate = f.Type().createReference(pkg + "." + simple);
-                // We can just rebind to this ref; Stubber already creates types by plan.
-                cls.setSuperclass(candidate);
-                continue;
+            if (!pkg.isEmpty() && !pkg.startsWith("java.") && !pkg.startsWith("javax.") && !pkg.startsWith("jakarta.")) {
+                String candidateFqn = pkg + "." + simple;
+                
+                // Check if type exists in model
+                CtType<?> existingType = model.getAllTypes().stream()
+                    .filter(td -> candidateFqn.equals(td.getQualifiedName()))
+                    .findFirst()
+                    .orElse(null);
+                
+                if (existingType == null) {
+                    // Type doesn't exist - create it in the correct package (not unknown)
+                    try {
+                        CtPackage candidatePkg = f.Package().getOrCreate(pkg);
+                        CtClass<?> newSuper = f.Class().create(candidatePkg, simple);
+                        newSuper.addModifier(ModifierKind.PUBLIC);
+                        createdTypes.add(candidateFqn);
+                    } catch (Throwable ignored) {}
+                }
+                
+                // Always rebind to the correct package, even if type already exists
+                try {
+                    CtTypeReference<?> candidate = f.Type().createReference(candidateFqn);
+                    cls.setSuperclass(candidate);
+                    continue;
+                } catch (Throwable ignored) {}
             }
 
-            // 2) Otherwise, if we created a concrete owner with same simple name, bind to that
+            // Fallback: if we created a concrete owner with same simple name, bind to that
             String concreteFqn = concreteBySimple.get(simple);
             if (concreteFqn != null) {
-                cls.setSuperclass(f.Type().createReference(concreteFqn));
+                try {
+                    cls.setSuperclass(f.Type().createReference(concreteFqn));
+                } catch (Throwable ignored) {}
             }
         }
     }
@@ -3088,19 +3414,55 @@ public final class SpoonStubber {
                 String sig = entry.getKey();
                 MethodInfo methodInfo = entry.getValue();
                 
-                            if (!implementedMethods.contains(sig)) {
-                    try {
-                                // Clone the method and add it to the class
-                        CtMethod<?> impl = cloneMethodForImplementation(
-                            methodInfo.method, cls, methodInfo.interfaceRef);
-                                cls.addMethod(impl);
-                                implementedMethods.add(sig);
-                                createdMethods.add(cls.getQualifiedName() + "#" + sig);
-                    } catch (Throwable e) {
-                        // Ignore individual method failures, continue with others
-                        System.err.println("Warning: Failed to implement method " + sig + 
-                            " from interface: " + e.getMessage());
+                // CRITICAL FIX: Check if method already exists (prevents duplicates from interface inheritance)
+                if (implementedMethods.contains(sig)) {
+                    continue; // Already implemented, skip
+                }
+                
+                // Also check if a method with the same signature already exists in the class
+                boolean methodExists = false;
+                for (CtMethod<?> existingMethod : cls.getMethods()) {
+                    if (methodSignature(existingMethod).equals(sig)) {
+                        methodExists = true;
+                        break;
                     }
+                }
+                if (methodExists) {
+                    continue; // Method already exists, skip
+                }
+                
+                try {
+                    // Clone the method and add it to the class
+                    CtMethod<?> impl = cloneMethodForImplementation(
+                        methodInfo.method, cls, methodInfo.interfaceRef);
+                    
+                    // CRITICAL FIX: Copy throws clause from interface method (e.g., close() throws Exception)
+                    if (methodInfo.method.getThrownTypes() != null && !methodInfo.method.getThrownTypes().isEmpty()) {
+                        for (CtTypeReference<?> thrownType : methodInfo.method.getThrownTypes()) {
+                            try {
+                                @SuppressWarnings("unchecked")
+                                CtTypeReference<? extends Throwable> throwableRef = (CtTypeReference<? extends Throwable>) thrownType.clone();
+                                impl.addThrownType(throwableRef);
+                            } catch (Throwable ignored) {
+                                // If casting fails, try creating a new reference
+                                try {
+                                    String thrownQn = safeQN(thrownType);
+                                    if (thrownQn != null) {
+                                        CtTypeReference<? extends Throwable> throwableRef = f.Type().createReference(thrownQn);
+                                        impl.addThrownType(throwableRef);
+                                    }
+                                } catch (Throwable ignored2) {}
+                            }
+                        }
+                    }
+                    
+                    cls.addMethod(impl);
+                    implementedMethods.add(sig);
+                    createdMethods.add(cls.getQualifiedName() + "#" + sig);
+                } catch (Throwable e) {
+                    // Ignore individual method failures, continue with others
+                    System.err.println("Warning: Failed to implement method " + sig + 
+                        " from interface: " + e.getMessage());
                 }
             }
         }
@@ -3136,7 +3498,8 @@ public final class SpoonStubber {
             
             CtInterface<?> iface = (CtInterface<?>) ifaceType;
             
-            // Collect abstract methods from this interface
+            // GENERAL FIX: Collect methods from this interface, prioritizing super-interface methods with throws clauses
+            // This handles cases where a default method overrides a super-interface method (e.g., NativeResource.close() vs AutoCloseable.close())
             for (CtMethod<?> ifaceMethod : iface.getMethods()) {
                 // Only add abstract methods that aren't already implemented
                 boolean hasBody = ifaceMethod.getBody() != null;
@@ -3146,6 +3509,35 @@ public final class SpoonStubber {
                     // AND not already implemented in the class
                     if (!allAbstractMethods.containsKey(sig) && !implementedMethods.contains(sig)) {
                         allAbstractMethods.put(sig, new MethodInfo(ifaceMethod, originalIfaceRef));
+                    }
+                }
+                
+                // GENERAL FIX: For default methods, check if super-interfaces have the same method with throws clause
+                // This ensures we implement the correct signature (e.g., close() throws Exception from AutoCloseable)
+                if (!ifaceMethod.isAbstract() && hasBody && !ifaceMethod.isStatic()) {
+                    String methodName = ifaceMethod.getSimpleName();
+                    int paramCount = ifaceMethod.getParameters().size();
+                    
+                    // Check super-interfaces for the same method with throws clause
+                    for (CtTypeReference<?> superIfaceRef : iface.getSuperInterfaces()) {
+                        try {
+                            CtType<?> superIfaceType = superIfaceRef.getTypeDeclaration();
+                            if (superIfaceType instanceof CtInterface) {
+                                CtInterface<?> superIface = (CtInterface<?>) superIfaceType;
+                                for (CtMethod<?> superMethod : superIface.getMethods()) {
+                                    if (methodName.equals(superMethod.getSimpleName()) && 
+                                        superMethod.getParameters().size() == paramCount &&
+                                        superMethod.getThrownTypes() != null && !superMethod.getThrownTypes().isEmpty()) {
+                                        // Found method with throws in super-interface - prefer that signature
+                                        String sig = methodSignature(superMethod);
+                                        if (!allAbstractMethods.containsKey(sig) && !implementedMethods.contains(sig)) {
+                                            allAbstractMethods.put(sig, new MethodInfo(superMethod, superIfaceRef));
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        } catch (Throwable ignored) {}
                     }
                 }
             }
@@ -3299,9 +3691,11 @@ public final class SpoonStubber {
                 String typeName = type.getSimpleName();
                 if ("boolean".equals(typeName)) {
                     return f.Code().createLiteral(false);
-                } else if ("int".equals(typeName) || "long".equals(typeName) || 
-                          "short".equals(typeName) || "byte".equals(typeName) ||
-                          "char".equals(typeName)) {
+                } else if ("long".equals(typeName)) {
+                    // CRITICAL FIX: Use 0L for long, not 0 (to avoid type issues)
+                    return f.Code().createCodeSnippetExpression("0L");
+                } else if ("int".equals(typeName) || "short".equals(typeName) || 
+                          "byte".equals(typeName) || "char".equals(typeName)) {
                     return f.Code().createLiteral(0);
                 } else if ("float".equals(typeName)) {
                     return f.Code().createLiteral(0.0f);

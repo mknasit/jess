@@ -499,7 +499,19 @@ public class RepositoryProcessor {
             }
 
             // Step 2: parse (same as experiment)
-            int jessResult = jess.parse(targetClass);
+            // CRITICAL: Catch StackOverflowError from JavaParser symbol resolution
+            // This happens when there are circular type dependencies in complex projects
+            int jessResult;
+            try {
+                jessResult = jess.parse(targetClass);
+            } catch (StackOverflowError e) {
+                // JavaParser's symbol resolution can overflow on circular dependencies
+                // This is a known limitation of JavaParser, not a bug in our code
+                System.err.println("[RepositoryProcessor] StackOverflowError during symbol resolution for " + 
+                    methodSignature + " - likely due to circular type dependencies in JavaParser");
+                System.err.println("[RepositoryProcessor] Suggestion: Increase JVM stack size with -Xss4m or -Xss8m");
+                jessResult = 2; // INTERNAL_ERROR
+            }
             long endTime = System.nanoTime();
             long compilationTime = TimeUnit.NANOSECONDS.toMillis(endTime - startTime);
             boolean jessSuccess = jessResult == 0;

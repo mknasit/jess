@@ -6,7 +6,6 @@ import de.upb.sse.jess.generation.unknown.UnknownType;
 import de.upb.sse.jess.stubbing.spoon.plan.*;
 import spoon.reflect.CtModel;
 import spoon.reflect.code.*;
-import spoon.reflect.cu.CompilationUnit;
 import spoon.reflect.cu.SourcePosition;
 import spoon.reflect.declaration.*;
 import spoon.reflect.factory.Factory;
@@ -51,7 +50,8 @@ public final class SpoonCollector {
         public final Map<String, Set<CtTypeReference<?>>> implementsPlans = new LinkedHashMap<>();
         // de.upb.sse.jess.stubbing.spoon.collector.CollectResult
         public Map<String, String> unknownToConcrete = new HashMap<>();
-
+        // Track static imports that need to be added: Map<TypeFQN, Set<FieldName>>
+        public final Map<String, Set<String>> staticImports = new LinkedHashMap<>();
 
 
     }
@@ -304,12 +304,38 @@ public final class SpoonCollector {
             // Enum constants in switch cases should be handled specially
             CtElement parent = fa.getParent();
             boolean isInSwitchCase = false;
+            CtTypeReference<?> switchExpressionType = null;
             while (parent != null) {
                 if (parent instanceof spoon.reflect.code.CtCase) {
                     isInSwitchCase = true;
+                    // Try to find the switch expression type
+                    CtElement switchParent = parent.getParent();
+                    while (switchParent != null) {
+                        if (switchParent instanceof spoon.reflect.code.CtSwitch) {
+                            spoon.reflect.code.CtSwitch<?> switchStmt = (spoon.reflect.code.CtSwitch<?>) switchParent;
+                            try {
+                                switchExpressionType = switchStmt.getSelector().getType();
+                            } catch (Throwable ignored) {}
+                            break;
+                        }
+                        switchParent = switchParent.getParent();
+                    }
                     break;
                 }
                 parent = parent.getParent();
+            }
+            
+            // If we found a switch expression type, mark it as ENUM
+            if (switchExpressionType != null) {
+                String switchTypeQn = safeQN(switchExpressionType);
+                if (switchTypeQn != null && !isJdkFqn(switchTypeQn)) {
+                    boolean hasEnumPlan = out.typePlans.stream()
+                        .anyMatch(p -> p.qualifiedName.equals(switchTypeQn) && p.kind == TypeStubPlan.Kind.ENUM);
+                    if (!hasEnumPlan) {
+                        out.typePlans.removeIf(p -> p.qualifiedName.equals(switchTypeQn) && p.kind == TypeStubPlan.Kind.CLASS);
+                        out.typePlans.add(new TypeStubPlan(switchTypeQn, TypeStubPlan.Kind.ENUM));
+                    }
+                }
             }
             
             // If it's an enum constant in a switch, don't throw ambiguity exception
@@ -339,17 +365,84 @@ public final class SpoonCollector {
             String fieldName = (fa.getVariable() != null ? fa.getVariable().getSimpleName() : "f");
             CtTypeReference<?> fieldType = inferFieldTypeFromUsage(fa);
 
+            // CRITICAL FIX: Detect known static field patterns (e.g., CHECKS from Checks class)
+            // When a bare identifier like CHECKS is used, check if it matches a known static field pattern
+            if (!isStatic && fieldName != null && Character.isUpperCase(fieldName.charAt(0))) {
+                // Check if this is used in a boolean context (if statement, while, etc.)
+                boolean isBooleanContext = fa.getParent() instanceof CtIf || 
+                                          fa.getParent() instanceof CtWhile ||
+                                          fa.getParent() instanceof CtDo ||
+                                          fa.getParent() instanceof CtFor ||
+                                          fa.getParent() instanceof CtConditional;
+                
+                if (isBooleanContext) {
+                    // Try to find a class with matching name that has this static field
+                    // Pattern: fieldName "CHECKS" -> look for class "Checks" with static field "CHECKS"
+                    String potentialClassName = fieldName; // CHECKS -> Checks
+                    if (fieldName.length() > 1) {
+                        potentialClassName = fieldName.substring(0, 1) + fieldName.substring(1).toLowerCase();
+                    }
+                    
+                    // Search model for a class with this name
+                    final String finalPotentialClassName = potentialClassName;
+                    CtType<?> matchingClass = model.getAllTypes().stream()
+                        .filter(t -> finalPotentialClassName.equals(t.getSimpleName()))
+                        .filter(t -> t instanceof CtClass)
+                        .findFirst()
+                        .orElse(null);
+                    
+                    if (matchingClass != null) {
+                        String classFqn = matchingClass.getQualifiedName();
+                        // Check if this class already has or will have this static field
+                        boolean hasField = matchingClass.getFields().stream()
+                            .anyMatch(f -> fieldName.equals(f.getSimpleName()) && f.hasModifier(ModifierKind.STATIC));
+                        
+                        // Also check field plans
+                        boolean plannedAsField = out.fieldPlans.stream()
+                            .anyMatch(p -> {
+                                String pOwnerQn = safeQN(p.ownerType);
+                                return classFqn.equals(pOwnerQn) && fieldName.equals(p.fieldName) && p.isStatic;
+                            });
+                        
+                        if (hasField || plannedAsField) {
+                            // This is a known static field - add static import instead of creating unknown.*
+                            out.staticImports.computeIfAbsent(classFqn, k -> new LinkedHashSet<>()).add(fieldName);
+                            System.out.println("[collectUnresolvedFields] Detected static field pattern: " + fieldName + 
+                                " from " + classFqn + " - will add static import");
+                            // Don't add to fieldPlans - it will be handled via static import
+                            continue;
+                        }
+                    }
+                }
+            }
+
             if (fieldType == null) {
-                // Check if this is an enum constant in a switch statement
-                // If so, use the enum type as the field type
-                if (isInSwitchCase && simple != null && Character.isUpperCase(simple.charAt(0))) {
+                // Check if this is an enum constant (in switch statement OR as static field access)
+                // Enum constants are typically uppercase and accessed as Type.CONSTANT
+                boolean looksLikeEnumConstant = simple != null && Character.isUpperCase(simple.charAt(0)) && isStatic;
+                
+                if (isInSwitchCase || looksLikeEnumConstant) {
                     // This is an enum constant - infer type from the enum
                     if (ownerRef != null) {
                         CtType<?> ownerType = ownerRef.getTypeDeclaration();
                         if (ownerType instanceof spoon.reflect.declaration.CtEnum) {
                             fieldType = ownerRef; // Use the enum type itself
                         } else {
-                            fieldType = f.Type().createReference(UNKNOWN_TYPE_FQN);
+                            // Owner is not yet an enum, but we're accessing an enum constant
+                            // Create an ENUM TypeStubPlan for the owner
+                            String ownerQn = safeQN(ownerRef);
+                            if (ownerQn != null && !isJdkFqn(ownerQn)) {
+                                // Ensure owner is planned as ENUM, not CLASS
+                                boolean hasEnumPlan = out.typePlans.stream()
+                                    .anyMatch(p -> p.qualifiedName.equals(ownerQn) && p.kind == TypeStubPlan.Kind.ENUM);
+                                if (!hasEnumPlan) {
+                                    // Remove any existing CLASS plan for this type
+                                    out.typePlans.removeIf(p -> p.qualifiedName.equals(ownerQn) && p.kind == TypeStubPlan.Kind.CLASS);
+                                    // Add ENUM plan
+                                    out.typePlans.add(new TypeStubPlan(ownerQn, TypeStubPlan.Kind.ENUM));
+                                }
+                            }
+                            fieldType = ownerRef; // Use the owner type as enum type
                         }
                     } else {
                         fieldType = f.Type().createReference(UNKNOWN_TYPE_FQN);
@@ -1382,25 +1475,101 @@ public final class SpoonCollector {
             boolean looksEnumValueOf = "valueOf".equals(name)
                     && paramTypes.size() == 1
                     && "java.lang.String".equals(safeQN(paramTypes.get(0)));
+            
+            // Detect enum methods: ordinal(), compareTo(), name()
+            // These methods don't have return types inferred yet, so check method name and signature
+            boolean looksEnumOrdinal = "ordinal".equals(name) && args.isEmpty();
+            boolean looksEnumCompareTo = "compareTo".equals(name) && paramTypes.size() == 1;
+            boolean looksEnumName = "name".equals(name) && args.isEmpty();
+            
+            // Also detect EnumSet usage: EnumSet.of(...), EnumSet.allOf(...)
+            boolean looksEnumSet = owner != null && "java.util.EnumSet".equals(safeQN(owner)) &&
+                    ("of".equals(name) || "allOf".equals(name) || "noneOf".equals(name) || 
+                     "complementOf".equals(name) || "range".equals(name));
+            
+            // If any enum method is detected, mark the owner type as ENUM
+            if (owner != null && (looksEnumValues || looksEnumValueOf || looksEnumOrdinal || 
+                    looksEnumCompareTo || looksEnumName)) {
+                String ownerQn = safeQN(owner);
+                if (ownerQn != null && !isJdkFqn(ownerQn)) {
+                    // Ensure owner is planned as ENUM, not CLASS
+                    boolean hasEnumPlan = out.typePlans.stream()
+                        .anyMatch(p -> p.qualifiedName.equals(ownerQn) && p.kind == TypeStubPlan.Kind.ENUM);
+                    if (!hasEnumPlan) {
+                        // Remove any existing CLASS plan for this type
+                        out.typePlans.removeIf(p -> p.qualifiedName.equals(ownerQn) && p.kind == TypeStubPlan.Kind.CLASS);
+                        // Add ENUM plan
+                        out.typePlans.add(new TypeStubPlan(ownerQn, TypeStubPlan.Kind.ENUM));
+                    }
+                }
+            }
+            
+            // If EnumSet is used, mark the type parameter as ENUM
+            if (looksEnumSet && paramTypes.size() > 0) {
+                // For EnumSet.allOf(State.class), the first parameter is the enum type
+                CtTypeReference<?> enumTypeParam = paramTypes.get(0);
+                String enumTypeQn = safeQN(enumTypeParam);
+                if (enumTypeQn != null && !isJdkFqn(enumTypeQn)) {
+                    boolean hasEnumPlan = out.typePlans.stream()
+                        .anyMatch(p -> p.qualifiedName.equals(enumTypeQn) && p.kind == TypeStubPlan.Kind.ENUM);
+                    if (!hasEnumPlan) {
+                        out.typePlans.removeIf(p -> p.qualifiedName.equals(enumTypeQn) && p.kind == TypeStubPlan.Kind.CLASS);
+                        out.typePlans.add(new TypeStubPlan(enumTypeQn, TypeStubPlan.Kind.ENUM));
+                    }
+                }
+            }
+            
+            // Also check if owner is EnumSet and has type arguments
+            if (owner != null && "java.util.EnumSet".equals(safeQN(owner))) {
+                try {
+                    var typeArgs = owner.getActualTypeArguments();
+                    if (typeArgs != null && !typeArgs.isEmpty()) {
+                        CtTypeReference<?> enumTypeArg = typeArgs.get(0);
+                        String enumTypeQn = safeQN(enumTypeArg);
+                        if (enumTypeQn != null && !isJdkFqn(enumTypeQn)) {
+                            boolean hasEnumPlan = out.typePlans.stream()
+                                .anyMatch(p -> p.qualifiedName.equals(enumTypeQn) && p.kind == TypeStubPlan.Kind.ENUM);
+                            if (!hasEnumPlan) {
+                                out.typePlans.removeIf(p -> p.qualifiedName.equals(enumTypeQn) && p.kind == TypeStubPlan.Kind.CLASS);
+                                out.typePlans.add(new TypeStubPlan(enumTypeQn, TypeStubPlan.Kind.ENUM));
+                            }
+                        }
+                    }
+                } catch (Throwable ignored) {}
+            }
 
             if (owner != null && (looksEnumValues || looksEnumValueOf)) {
-                CtTypeReference<?> arrOfOwner = f.Core().createArrayTypeReference();
-                ((CtArrayTypeReference<?>) arrOfOwner).setComponentType(owner.clone());
+                // Check if owner is already an enum OR planned as ENUM - if so, skip adding values() and valueOf()
+                // These methods are automatically provided by Java for all enums
+                CtType<?> ownerType = owner.getTypeDeclaration();
+                boolean isAlreadyEnum = ownerType instanceof spoon.reflect.declaration.CtEnum;
+                
+                // Also check if owner is planned as ENUM
+                String ownerQn = safeQN(owner);
+                boolean isPlannedAsEnum = ownerQn != null && out.typePlans.stream()
+                    .anyMatch(p -> p.qualifiedName.equals(ownerQn) && p.kind == TypeStubPlan.Kind.ENUM);
+                
+                // Only add values() and valueOf() if owner is NOT already an enum AND NOT planned as ENUM
+                // (they might be needed if owner is a class that happens to have values()/valueOf() methods)
+                if (!isAlreadyEnum && !isPlannedAsEnum) {
+                    CtTypeReference<?> arrOfOwner = f.Core().createArrayTypeReference();
+                    ((CtArrayTypeReference<?>) arrOfOwner).setComponentType(owner.clone());
 
-                if (looksEnumValues) {
-                    out.methodPlans.add(new MethodStubPlan(
-                            owner, "values", arrOfOwner,
-                            Collections.emptyList(),
-                            /*isStatic*/ true, MethodStubPlan.Visibility.PUBLIC,
-                            Collections.emptyList(),
-                            /*defaultOnIface*/ false, /*isAbstract*/ false, /*isFinal*/ true, null));
-                } else {
-                    out.methodPlans.add(new MethodStubPlan(
-                            owner, "valueOf", owner.clone(),
-                            List.of(f.Type().createReference("java.lang.String")),
-                            /*isStatic*/ true, MethodStubPlan.Visibility.PUBLIC,
-                            Collections.emptyList(),
-                            /*defaultOnIface*/ false, /*isAbstract*/ false, /*isFinal*/ true, null));
+                    if (looksEnumValues) {
+                        out.methodPlans.add(new MethodStubPlan(
+                                owner, "values", arrOfOwner,
+                                Collections.emptyList(),
+                                /*isStatic*/ true, MethodStubPlan.Visibility.PUBLIC,
+                                Collections.emptyList(),
+                                /*defaultOnIface*/ false, /*isAbstract*/ false, /*isFinal*/ true, null));
+                    } else {
+                        out.methodPlans.add(new MethodStubPlan(
+                                owner, "valueOf", owner.clone(),
+                                List.of(f.Type().createReference("java.lang.String")),
+                                /*isStatic*/ true, MethodStubPlan.Visibility.PUBLIC,
+                                Collections.emptyList(),
+                                /*defaultOnIface*/ false, /*isAbstract*/ false, /*isFinal*/ true, null));
+                    }
                 }
                 // NOTE: don't "continue" — let normal flow still plan 'name()' if seen elsewhere.
             }
@@ -1542,6 +1711,44 @@ public final class SpoonCollector {
     private CtTypeReference<?> inferReturnTypeFromContext(CtInvocation<?> inv) {
         CtElement p = inv.getParent();
 
+        // CRITICAL FIX: Detect chaining patterns (obj.method().field or obj.method().method2())
+        // If the method result is used in a field access or another method call, it cannot be void
+        if (p instanceof CtFieldAccess) {
+            // This is obj.method().field - method must return an object, not void
+            CtFieldAccess<?> fa = (CtFieldAccess<?>) p;
+            try {
+                CtTypeReference<?> fieldOwnerType = fa.getTarget() != null ? fa.getTarget().getType() : null;
+                if (fieldOwnerType != null && !isUnknownOrVoidPrimitive(fieldOwnerType)) {
+                    return fieldOwnerType;
+                }
+            } catch (Throwable ignored) {}
+            // CRITICAL FIX: If getCapabilities() is used with field access, return unknown.Missing
+            // since that's where capability fields are stored (e.g., xrCreateFacialExpressionClientML)
+            String methodName = inv.getExecutable() != null ? inv.getExecutable().getSimpleName() : null;
+            if ("getCapabilities".equals(methodName)) {
+                return f.Type().createReference("unknown.Missing");
+            }
+            // If we can't infer the type, return Object instead of void
+            return f.Type().OBJECT;
+        }
+        
+        // Also check if this invocation is the target of another invocation (chaining)
+        if (p instanceof CtInvocation) {
+            CtInvocation<?> outerInv = (CtInvocation<?>) p;
+            if (outerInv.getTarget() == inv) {
+                // This is obj.method().method2() - method must return an object, not void
+                // Try to infer from the outer invocation's target type
+                try {
+                    CtTypeReference<?> outerTargetType = outerInv.getTarget() != null ? outerInv.getTarget().getType() : null;
+                    if (outerTargetType != null && !isUnknownOrVoidPrimitive(outerTargetType)) {
+                        return outerTargetType;
+                    }
+                } catch (Throwable ignored) {}
+                // If we can't infer, return Object instead of void
+                return f.Type().OBJECT;
+            }
+        }
+
         if (p instanceof CtVariable && Objects.equals(((CtVariable<?>) p).getDefaultExpression(), inv)) {
             return ((CtVariable<?>) p).getType();
         }
@@ -1558,6 +1765,11 @@ public final class SpoonCollector {
 
         if (p instanceof CtBinaryOperator) {
             CtBinaryOperator<?> bo = (CtBinaryOperator<?>) p;
+            // CRITICAL FIX: If method is used in boolean operators (||, &&), it must return boolean
+            if (bo.getKind() == BinaryOperatorKind.OR || bo.getKind() == BinaryOperatorKind.AND) {
+                // Method is used in a boolean expression, so it must return boolean
+                return f.Type().BOOLEAN_PRIMITIVE;
+            }
             if (bo.getKind() == BinaryOperatorKind.PLUS) {
                 CtExpression<?> other =
                         Objects.equals(bo.getLeftHandOperand(), inv)
@@ -2114,7 +2326,101 @@ public final class SpoonCollector {
 
         // ---- FQN branch ---------------------------------------------------------
         // Non-JDK and unresolved → plan its qualified name as-is.
-        addTypePlanIfNonJdk(out, qn, TypeStubPlan.Kind.CLASS);
+        
+        // QUICK FIX: Detect module classes (e.g., CheckedConsumerModule -> CheckedConsumer$Module)
+        // This handles Vavr and similar libraries that use module classes
+        String moduleClassFqn = detectModuleClass(qn, out);
+        if (moduleClassFqn != null) {
+            // Plan as inner class: parent$Module
+            addTypePlanIfNonJdk(out, moduleClassFqn, TypeStubPlan.Kind.CLASS);
+            return;
+        }
+        
+        // Try to detect if this might be a record based on usage patterns
+        TypeStubPlan.Kind kind = detectRecordFromUsage(ctx, qn, out);
+        addTypePlanIfNonJdk(out, qn, kind);
+    }
+    
+    /**
+     * Detect module class pattern (e.g., CheckedConsumerModule -> CheckedConsumer$Module).
+     * Returns the inner class FQN if detected, null otherwise.
+     * Also ensures the parent class is planned if it doesn't exist yet.
+     */
+    private String detectModuleClass(String fqn, CollectResult out) {
+        if (fqn == null || !fqn.contains(".")) return null;
+        
+        int lastDot = fqn.lastIndexOf('.');
+        String simpleName = fqn.substring(lastDot + 1);
+        String packageName = fqn.substring(0, lastDot);
+        
+        // Pattern 1: XModule -> X$Module (e.g., CheckedConsumerModule -> CheckedConsumer$Module)
+        if (simpleName.endsWith("Module") && simpleName.length() > 6) {
+            String parentName = simpleName.substring(0, simpleName.length() - 6);
+            String parentFqn = packageName + "." + parentName;
+            
+            // Check if parent class exists in model
+            boolean parentExistsInModel = false;
+            try {
+                CtType<?> parentType = f.Type().get(parentFqn);
+                parentExistsInModel = (parentType != null);
+            } catch (Throwable ignored) {}
+            
+            // Check if parent class is already planned
+            boolean parentPlanned = out.typePlans.stream()
+                .anyMatch(p -> p.qualifiedName.equals(parentFqn));
+            
+            // If parent doesn't exist, plan it first (it will be created as a class)
+            if (!parentExistsInModel && !parentPlanned) {
+                addTypePlanIfNonJdk(out, parentFqn, TypeStubPlan.Kind.CLASS);
+            }
+            
+            // If parent exists or is planned, create module as inner class
+            if (parentExistsInModel || parentPlanned) {
+                // Return inner class FQN: parent$Module
+                return parentFqn + "$" + simpleName;
+            }
+        }
+        
+        // Pattern 2: X.API -> X$API (e.g., Value.API -> Value$API)
+        if (simpleName.equals("API") && lastDot > 0) {
+            // Extract parent from package.class.API -> package.class
+            String parentFqn = packageName;
+            
+            // Check if parent exists
+            boolean parentExistsInModel = false;
+            try {
+                CtType<?> parentType = f.Type().get(parentFqn);
+                parentExistsInModel = (parentType != null);
+            } catch (Throwable ignored) {}
+            
+            boolean parentPlanned = out.typePlans.stream()
+                .anyMatch(p -> p.qualifiedName.equals(parentFqn));
+            
+            if (!parentExistsInModel && !parentPlanned) {
+                addTypePlanIfNonJdk(out, parentFqn, TypeStubPlan.Kind.CLASS);
+            }
+            
+            if (parentExistsInModel || parentPlanned) {
+                return parentFqn + "$API";
+            }
+        }
+        
+        return null;
+    }
+    
+    /**
+     * Try to detect if a type should be a record based on usage patterns.
+     * This is a heuristic - records are detected by:
+     * 1. Method calls with no parameters that look like component accessors
+     * 2. Constructor calls that match record constructor patterns
+     * 
+     * For now, defaults to CLASS. Can be enhanced with more sophisticated detection.
+     */
+    private TypeStubPlan.Kind detectRecordFromUsage(CtElement ctx, String fqn, CollectResult out) {
+        // TODO: Add record detection heuristics
+        // For now, default to CLASS - records will be detected if they're already in the model
+        // or can be manually specified via TypeStubPlan.Kind.RECORD
+        return TypeStubPlan.Kind.CLASS;
     }
 
 
@@ -2225,6 +2531,25 @@ public final class SpoonCollector {
         if (ownerRef.isPrimitive() || ownerRef.isArray()) return ownerRef;
 
         String qn = safeQN(ownerRef);
+
+        // CRITICAL FIX: For superclasses, if the type is in unknown package, prefer the child's package
+        // This ensures parent classes are created in the correct package (e.g., org.lwjgl.vulkan)
+        if (qn != null && qn.startsWith("unknown.") && ctx instanceof CtClass) {
+            CtClass<?> childClass = (CtClass<?>) ctx;
+            try {
+                CtPackage childPkg = childClass.getPackage();
+                if (childPkg != null) {
+                    String childPkgName = childPkg.getQualifiedName();
+                    if (childPkgName != null && !childPkgName.isEmpty() && !childPkgName.startsWith("java.")) {
+                        // Use child's package for superclass
+                        String superSimple = ownerRef.getSimpleName();
+                        String candidateFqn = childPkgName + "." + superSimple;
+                        // Return the reference with the correct package
+                        return f.Type().createReference(candidateFqn);
+                    }
+                }
+            } catch (Throwable ignored) {}
+        }
 
         // NEW: treat 'unknown.*' as a *simple* name so we can rebind it sensibly
         if (qn != null && qn.startsWith("unknown.")) {
@@ -2351,7 +2676,21 @@ public final class SpoonCollector {
 
         model.getAllTypes().forEach(t -> {
             SourcePosition pos = t.getPosition();
-            CompilationUnit cu = (pos != null ? pos.getCompilationUnit() : null);
+            // Use the factory method to get compilation unit instead of deprecated SourcePosition method
+            spoon.reflect.declaration.CtCompilationUnit cu = null;
+            try {
+                cu = f.CompilationUnit().getOrCreate(t);
+            } catch (Throwable ignored) {
+                // Fallback to position method if factory fails
+                if (pos != null) {
+                    try {
+                        Object cuObj = pos.getCompilationUnit();
+                        if (cuObj instanceof spoon.reflect.declaration.CtCompilationUnit) {
+                            cu = (spoon.reflect.declaration.CtCompilationUnit) cuObj;
+                        }
+                    } catch (Throwable ignored2) {}
+                }
+            }
             if (cu == null) return;
 
             Set<String> fqns = new LinkedHashSet<>();
@@ -2717,7 +3056,24 @@ public final class SpoonCollector {
             if (sup != null) {
                 String sqn = safeQN(sup);
                 if (sqn != null && sqn.startsWith("unknown.")) {
-                    sup = f.Type().createReference(sup.getSimpleName());
+                    // CRITICAL FIX: For superclasses, prefer the child's package instead of unknown
+                    // This ensures parent classes are created in the correct package (e.g., org.lwjgl.vulkan)
+                    String childPkg = null;
+                    try {
+                        CtPackage pkg = c.getPackage();
+                        if (pkg != null) {
+                            childPkg = pkg.getQualifiedName();
+                        }
+                    } catch (Throwable ignored) {}
+                    
+                    if (childPkg != null && !childPkg.isEmpty() && !childPkg.startsWith("java.")) {
+                        // Use child's package for superclass
+                        String superSimple = sup.getSimpleName();
+                        String candidateFqn = childPkg + "." + superSimple;
+                        sup = f.Type().createReference(candidateFqn);
+                    } else {
+                        sup = f.Type().createReference(sup.getSimpleName());
+                    }
                 }
                 CtTypeReference<?> owner = chooseOwnerPackage(sup, c);
                 if (owner != null && !isJdkType(owner)) {
@@ -3402,7 +3758,7 @@ public final class SpoonCollector {
         }
 
         for (CtType<?> t : model.getAllTypes()) {
-            CtCompilationUnit cu = t.getPosition() != null ? t.getPosition().getCompilationUnit() : null;
+            CtCompilationUnit cu = f.CompilationUnit().getOrCreate(t);
             String cuPkg = (cu != null && cu.getDeclaredPackage() != null ? cu.getDeclaredPackage().getQualifiedName() : "");
             if (cuPkg == null) cuPkg = "";
 

@@ -6,7 +6,7 @@ import spoon.reflect.reference.CtTypeReference;
 public final class FieldStubPlan {
     public final CtTypeReference<?> ownerType;
     public final String fieldName;
-    public final CtTypeReference<?> fieldType;
+    public CtTypeReference<?> fieldType;
     public final boolean isStatic;
     public FieldStubPlan(CtTypeReference<?> ownerType, String fieldName,
                          CtTypeReference<?> fieldType, boolean isStatic) {

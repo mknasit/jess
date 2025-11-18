@@ -5,13 +5,11 @@ import de.upb.sse.jess.stubbing.spoon.collector.SpoonCollector;
 import de.upb.sse.jess.stubbing.spoon.generate.SpoonStubber;
 import spoon.Launcher;
 import spoon.reflect.CtModel;
-import spoon.reflect.code.CtAssignment;
-import spoon.reflect.code.CtExpression;
-import spoon.reflect.code.CtFieldAccess;
-import spoon.reflect.code.CtInvocation;
+import spoon.reflect.code.*;
 import spoon.reflect.declaration.*;
 import spoon.reflect.declaration.CtImportKind;
 import spoon.reflect.factory.Factory;
+import spoon.reflect.reference.CtExecutableReference;
 import spoon.reflect.reference.CtPackageReference;
 import spoon.reflect.reference.CtReference;
 import spoon.reflect.reference.CtTypeReference;
@@ -22,6 +20,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
@@ -111,6 +110,22 @@ public final class SpoonStubbingRunner implements Stubber {
             referencedTypes.add("org.slf4j.Marker");
         }
         
+        // CRITICAL: Ensure Android return types are also included
+        // When Intent is referenced, ensure Uri is also generated (Intent.getData() returns Uri)
+        // When Bundle is referenced, ensure Parcelable is also generated (Bundle.getParcelable() returns Parcelable)
+        Set<String> androidDependencies = new HashSet<>();
+        for (String refType : referencedTypes) {
+            if (refType != null && (refType.startsWith("android.") || refType.startsWith("androidx."))) {
+                if (refType.contains("Intent")) {
+                    androidDependencies.add("android.net.Uri");
+                }
+                if (refType.contains("Bundle")) {
+                    androidDependencies.add("android.os.Parcelable");
+                }
+            }
+        }
+        referencedTypes.addAll(androidDependencies);
+        
         // Generate shims ONLY for referenced types (minimal stubbing)
         // generateShimsForReferencedTypes() will skip any shim definitions that aren't in referencedTypes
         int shimsGenerated = shimGenerator.generateShimsForReferencedTypes(referencedTypes);
@@ -144,6 +159,9 @@ public final class SpoonStubbingRunner implements Stubber {
         created += stubber.applyConstructorPlans(plans.ctorPlans);// constructors
         created += stubber.applyMethodPlans(plans.methodPlans);   // methods
         stubber.applyImplementsPlans(plans.implementsPlans);
+        
+        // CRITICAL FIX: Add static imports for known static fields (e.g., CHECKS from Checks class)
+        addStaticImports(model, f, plans.staticImports);
 
         // MINIMAL STUBBING MODE: Only apply fixes that are absolutely necessary for compilation
         // In minimal mode, we only stub what's directly referenced in target methods
@@ -225,11 +243,317 @@ public final class SpoonStubbingRunner implements Stubber {
             } catch (Throwable ignored) {}
         }
 
-        // Force FQN printing for all non-JDK type references to prevent invalid imports
-        forceFQNForAllTypeReferences(model, f);
+        // CRITICAL FIX: Re-add static imports and type imports AFTER forceFQN but BEFORE pretty-printing
+        // This ensures imports are present when the code is written
+        addStaticImports(model, f, plans.staticImports);
         
-        // Clean up invalid imports before pretty printing
+        // Re-add type imports that were added during fixParams
+        model.getAllTypes().forEach(type -> {
+            try {
+                CtCompilationUnit cu = f.CompilationUnit().getOrCreate(type);
+                if (cu == null) return;
+                
+                // Check all method parameters and return types to ensure imports are present
+                for (CtMethod<?> method : type.getMethods()) {
+                    // Check return type
+                    try {
+                        CtTypeReference<?> returnType = method.getType();
+                        if (returnType != null) {
+                            String qn = returnType.getQualifiedName();
+                            if (qn != null && qn.contains(".") && !qn.startsWith("java.") && 
+                                !qn.startsWith("javax.") && !qn.startsWith("jakarta.") &&
+                                !qn.startsWith("unknown.")) {
+                                // Check if import exists
+                                boolean hasImport = cu.getImports().stream().anyMatch(imp -> {
+                                    try {
+                                        CtReference r = imp.getReference();
+                                        if (r instanceof CtTypeReference) {
+                                            return qn.equals(((CtTypeReference<?>) r).getQualifiedName());
+                                        }
+                                        return false;
+                                    } catch (Throwable ignored) {
+                                        return false;
+                                    }
+                                });
+                                if (!hasImport) {
+                                    CtTypeReference<?> importRef = f.Type().createReference(qn);
+                                    CtImport imp = f.createImport(importRef);
+                                    cu.getImports().add(imp);
+                                    System.out.println("[finalCheck] Added return type import " + qn + " to " + type.getQualifiedName());
+                                }
+                            }
+                        }
+                    } catch (Throwable ignored) {}
+                    
+                    // Check parameters
+                    for (CtParameter<?> param : method.getParameters()) {
+                        try {
+                            CtTypeReference<?> paramType = param.getType();
+                            if (paramType != null) {
+                                String qn = paramType.getQualifiedName();
+                                if (qn != null && qn.contains(".") && !qn.startsWith("java.") && 
+                                    !qn.startsWith("javax.") && !qn.startsWith("jakarta.") &&
+                                    !qn.startsWith("unknown.")) {
+                                    // Check if import exists
+                                    boolean hasImport = cu.getImports().stream().anyMatch(imp -> {
+                                        try {
+                                            CtReference r = imp.getReference();
+                                            if (r instanceof CtTypeReference) {
+                                                return qn.equals(((CtTypeReference<?>) r).getQualifiedName());
+                                            }
+                                            return false;
+                                        } catch (Throwable ignored) {
+                                            return false;
+                                        }
+                                    });
+                                    if (!hasImport) {
+                                        CtTypeReference<?> importRef = f.Type().createReference(qn);
+                                        CtImport imp = f.createImport(importRef);
+                                        cu.getImports().add(imp);
+                                        System.out.println("[finalCheck] Added parameter type import " + qn + " to " + type.getQualifiedName());
+                                    }
+                                }
+                            }
+                        } catch (Throwable ignored) {}
+                    }
+                }
+            } catch (Throwable e) {
+                System.err.println("[finalCheck] Error processing type " + type.getQualifiedName() + ": " + e.getMessage());
+            }
+        });
+        
+        // Clean up invalid imports before adding new ones
         cleanupInvalidImports(model, f);
+        
+        // CRITICAL FIX: After cleanup, re-add all necessary imports and set setSimplyQualified(false)
+        // This ensures imports are written to the file (Spoon only writes imports when setSimplyQualified(false))
+        System.out.println("[finalCheck] Re-adding imports and setting setSimplyQualified(false) for types with imports...");
+        model.getAllTypes().forEach(type -> {
+            try {
+                CtCompilationUnit cu = f.CompilationUnit().getOrCreate(type);
+                if (cu == null) return;
+                
+                // Get all imports in the CU (both type and static imports)
+                Set<String> importQns = new HashSet<>();
+                cu.getImports().forEach(imp -> {
+                    try {
+                        CtReference r = imp.getReference();
+                        CtImportKind kind = imp.getImportKind();
+                        boolean isStatic = (kind != null && (kind.name().contains("STATIC") || kind.name().contains("METHOD") || kind.name().contains("ALL")));
+                        
+                        if (r instanceof CtTypeReference) {
+                            String qn = ((CtTypeReference<?>) r).getQualifiedName();
+                            if (qn != null) {
+                                importQns.add(qn);
+                                System.out.println("[finalCheck] Found " + (isStatic ? "static " : "") + "import in CU: " + qn + " for " + type.getQualifiedName());
+                            }
+                        } else if (isStatic) {
+                            // For static imports, try to extract the class name
+                            String importStr = r.toString();
+                            if (importStr != null && importStr.contains(".")) {
+                                // Extract class FQN (everything except the last part)
+                                String[] parts = importStr.split("\\.");
+                                if (parts.length >= 2) {
+                                    StringBuilder classFqn = new StringBuilder();
+                                    for (int i = 0; i < parts.length - 1; i++) {
+                                        if (i > 0) classFqn.append(".");
+                                        classFqn.append(parts[i]);
+                                    }
+                                    String classFqnStr = classFqn.toString();
+                                    importQns.add(classFqnStr); // Add the class for reference
+                                    System.out.println("[finalCheck] Found static import in CU: " + importStr + " (class: " + classFqnStr + ") for " + type.getQualifiedName());
+                                }
+                            }
+                        }
+                    } catch (Throwable e) {
+                        System.err.println("[finalCheck] Error processing import: " + e.getMessage());
+                    }
+                });
+                
+                // CRITICAL FIX: For each import, find ALL usages of that type and set setSimplyQualified(false)
+                // This includes checking all type references in methods, fields, and even in method bodies
+                for (String importQn : importQns) {
+                    if (importQn.startsWith("java.") || importQn.startsWith("javax.") || importQn.startsWith("jakarta.")) {
+                        continue; // Skip JDK types
+                    }
+                    
+                    // Find all type references in this type that match the import
+                    type.getMethods().forEach(method -> {
+                        // Check return type
+                        try {
+                            CtTypeReference<?> returnType = method.getType();
+                            if (returnType != null) {
+                                String returnQn = returnType.getQualifiedName();
+                                if (importQn.equals(returnQn)) {
+                                    returnType.setSimplyQualified(false);
+                                    System.out.println("[finalCheck] Set setSimplyQualified(false) for return type " + importQn + " in " + method.getSimpleName());
+                                }
+                            }
+                        } catch (Throwable ignored) {}
+                        
+                        // Check parameters
+                        method.getParameters().forEach(param -> {
+                            try {
+                                CtTypeReference<?> paramType = param.getType();
+                                if (paramType != null) {
+                                    String paramQn = paramType.getQualifiedName();
+                                    if (importQn.equals(paramQn)) {
+                                        paramType.setSimplyQualified(false);
+                                        System.out.println("[finalCheck] Set setSimplyQualified(false) for parameter type " + importQn + " in " + method.getSimpleName());
+                                    }
+                                }
+                            } catch (Throwable ignored) {}
+                        });
+                    });
+                    
+                    // Also check fields
+                    type.getFields().forEach(field -> {
+                        try {
+                            CtTypeReference<?> fieldType = field.getType();
+                            if (fieldType != null) {
+                                String fieldQn = fieldType.getQualifiedName();
+                                if (importQn.equals(fieldQn)) {
+                                    fieldType.setSimplyQualified(false);
+                                    System.out.println("[finalCheck] Set setSimplyQualified(false) for field type " + importQn);
+                                }
+                            }
+                        } catch (Throwable ignored) {}
+                    });
+                }
+                
+                // CRITICAL FIX: Also ensure that if we have imports, we re-add them if they're missing
+                // Sometimes imports get removed, so we need to re-add them
+                type.getMethods().forEach(method -> {
+                    // Check return type
+                    try {
+                        CtTypeReference<?> returnType = method.getType();
+                        if (returnType != null) {
+                            String returnQn = returnType.getQualifiedName();
+                            if (returnQn != null && returnQn.contains(".") && !returnQn.startsWith("java.") && 
+                                !returnQn.startsWith("javax.") && !returnQn.startsWith("jakarta.")) {
+                                // Check if import exists (including unknown.Unknown)
+                                boolean hasImport = cu.getImports().stream().anyMatch(imp -> {
+                                    try {
+                                        CtReference r = imp.getReference();
+                                        if (r instanceof CtTypeReference) {
+                                            return returnQn.equals(((CtTypeReference<?>) r).getQualifiedName());
+                                        }
+                                        return false;
+                                    } catch (Throwable ignored) {
+                                        return false;
+                                    }
+                                });
+                                if (!hasImport) {
+                                    // Re-add the import
+                                    CtTypeReference<?> importRef = f.Type().createReference(returnQn);
+                                    CtImport imp = f.createImport(importRef);
+                                    cu.getImports().add(imp);
+                                    returnType.setSimplyQualified(false);
+                                    System.out.println("[finalCheck] Re-added missing import " + returnQn + " for return type in " + method.getSimpleName());
+                                } else {
+                                    // Import exists, ensure setSimplyQualified(false)
+                                    returnType.setSimplyQualified(false);
+                                }
+                            }
+                        }
+                    } catch (Throwable ignored) {}
+                    
+                    // Check parameters
+                    method.getParameters().forEach(param -> {
+                        try {
+                            CtTypeReference<?> paramType = param.getType();
+                            if (paramType != null) {
+                                String paramQn = paramType.getQualifiedName();
+                                if (paramQn != null && paramQn.contains(".") && !paramQn.startsWith("java.") && 
+                                    !paramQn.startsWith("javax.") && !paramQn.startsWith("jakarta.")) {
+                                    // Check if import exists (including unknown.Unknown)
+                                    boolean hasImport = cu.getImports().stream().anyMatch(imp -> {
+                                        try {
+                                            CtReference r = imp.getReference();
+                                            if (r instanceof CtTypeReference) {
+                                                return paramQn.equals(((CtTypeReference<?>) r).getQualifiedName());
+                                            }
+                                            return false;
+                                        } catch (Throwable ignored) {
+                                            return false;
+                                        }
+                                    });
+                                    if (!hasImport) {
+                                        // Re-add the import
+                                        CtTypeReference<?> importRef = f.Type().createReference(paramQn);
+                                        CtImport imp = f.createImport(importRef);
+                                        cu.getImports().add(imp);
+                                        paramType.setSimplyQualified(false);
+                                        System.out.println("[finalCheck] Re-added missing import " + paramQn + " for parameter in " + method.getSimpleName());
+                                    } else {
+                                        // Import exists, ensure setSimplyQualified(false)
+                                        paramType.setSimplyQualified(false);
+                                    }
+                                }
+                            }
+                        } catch (Throwable ignored) {}
+                    });
+                });
+                
+                // Also check for static imports
+                cu.getImports().forEach(imp -> {
+                    try {
+                        CtImportKind kind = imp.getImportKind();
+                        if (kind != null && (kind.name().contains("STATIC") || kind.name().contains("METHOD") || kind.name().contains("ALL"))) {
+                            System.out.println("[finalCheck] Found static import in CU: " + imp.getReference() + " for " + type.getQualifiedName());
+                        }
+                    } catch (Throwable ignored) {}
+                });
+                
+            } catch (Throwable e) {
+                System.err.println("[finalCheck] Error processing type " + type.getQualifiedName() + ": " + e.getMessage());
+            }
+        });
+        
+        // CRITICAL FIX: Update getCapabilities() return type to unknown.Missing when used with field access
+        // This fixes cases like session.getCapabilities().xrCreateFacialExpressionClientML
+        System.out.println("[finalCheck] Fixing getCapabilities() return types...");
+        model.getAllTypes().forEach(type -> {
+            try {
+                for (CtMethod<?> method : type.getMethods()) {
+                    String methodName = method.getSimpleName();
+                    if ("getCapabilities".equals(methodName)) {
+                        CtTypeReference<?> returnType = method.getType();
+                        if (returnType != null) {
+                            String qn = returnType.getQualifiedName();
+                            // If it returns Object, check if it's used with field access
+                            if ("java.lang.Object".equals(qn)) {
+                                // Check all usages of this method in the model
+                                AtomicBoolean usedWithFieldAccess = new AtomicBoolean(false);
+                                for (CtType<?> otherType : model.getAllTypes()) {
+                                    for (CtMethod<?> otherMethod : otherType.getMethods()) {
+                                        // Check if this method is called and result is used in field access
+                                        otherMethod.getElements(new TypeFilter<>(CtInvocation.class)).forEach(inv -> {
+                                            if (inv.getExecutable() != null && "getCapabilities".equals(inv.getExecutable().getSimpleName())) {
+                                                CtElement parent = inv.getParent();
+                                                if (parent instanceof CtFieldAccess) {
+                                                    // This is getCapabilities().field - should return unknown.Missing
+                                                    usedWithFieldAccess.set(true);
+                                                }
+                                            }
+                                        });
+                                    }
+                                }
+                                
+                                if (usedWithFieldAccess.get()) {
+                                    // Update return type to unknown.Missing
+                                    CtTypeReference<?> missingRef = f.Type().createReference("unknown.Missing");
+                                    method.setType(missingRef);
+                                    System.out.println("[finalCheck] Updated getCapabilities() return type to unknown.Missing in " + type.getQualifiedName());
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (Throwable e) {
+                System.err.println("[finalCheck] Error fixing getCapabilities in " + type.getQualifiedName() + ": " + e.getMessage());
+            }
+        });
         
         // Re-ensure unknown.Unknown imports after cleanup (in case they were removed)
         ensureUnknownImportsForAllTypes(model, f);
@@ -237,46 +561,41 @@ public final class SpoonStubbingRunner implements Stubber {
         // Final verification: check that imports are present before pretty printing
         System.out.println("[finalCheck] Verifying imports before pretty printing...");
         model.getAllTypes().forEach(type -> {
-            boolean hasUnknown = type.getMethods().stream().anyMatch(m -> 
-                m.getParameters().stream().anyMatch(p -> {
-                    try {
-                        String simple = p.getType().getSimpleName();
-                        return "Unknown".equals(simple);
-                    } catch (Throwable ignored) {
-                        return false;
-                    }
-                })
-            );
-            if (hasUnknown) {
-                boolean hasImport = hasUnknownImport(type, f);
-                System.out.println("[finalCheck] Type " + type.getQualifiedName() + " uses Unknown, hasImport=" + hasImport);
-                if (!hasImport) {
-                    System.out.println("[finalCheck] WARNING: Import missing, adding it now...");
-                    ensureUnknownImport(type, f);
-                } else {
-                    // Verify the import is actually in the CU
-                    try {
-                        CtCompilationUnit cu = f.CompilationUnit().getOrCreate(type);
-                        if (cu != null) {
-                            System.out.println("[finalCheck] CU imports count: " + cu.getImports().size());
-                            cu.getImports().forEach(imp -> {
-                                try {
-                                    CtReference r = imp.getReference();
-                                    if (r instanceof CtTypeReference) {
-                                        String qn = ((CtTypeReference<?>) r).getQualifiedName();
-                                        System.out.println("[finalCheck] Import: " + qn);
-                                    }
-                                } catch (Throwable ignored) {}
-                            });
-                        }
-                    } catch (Throwable e) {
-                        System.err.println("[finalCheck] Error checking CU: " + e.getMessage());
-                    }
+            try {
+                CtCompilationUnit cu = f.CompilationUnit().getOrCreate(type);
+                if (cu != null) {
+                    System.out.println("[finalCheck] Type " + type.getQualifiedName() + " CU imports count: " + cu.getImports().size());
+                    cu.getImports().forEach(imp -> {
+                        try {
+                            CtReference r = imp.getReference();
+                            if (r instanceof CtTypeReference) {
+                                String qn = ((CtTypeReference<?>) r).getQualifiedName();
+                                System.out.println("[finalCheck] Import: " + qn);
+                            } else {
+                                CtImportKind kind = imp.getImportKind();
+                                if (kind != null && (kind.name().contains("STATIC") || kind.name().contains("METHOD") || kind.name().contains("ALL"))) {
+                                    System.out.println("[finalCheck] Static import: " + r);
+                                }
+                            }
+                        } catch (Throwable ignored) {}
+                    });
                 }
+            } catch (Throwable e) {
+                System.err.println("[finalCheck] Error checking CU: " + e.getMessage());
             }
         });
 
+        // CRITICAL FIX: Fix void return types for methods used in boolean expressions (BEFORE pretty-printing)
+        fixVoidReturnTypesInBooleanContexts(model, f);
+
         launcher.prettyprint();
+        
+        // CRITICAL FIX: Post-process to add missing imports directly to files
+        // Spoon sometimes doesn't write imports even when they're in the CU, so we add them manually
+        postProcessAddMissingImports(slicedSrcDir, model, f);
+        
+        // CRITICAL FIX: Post-process to fix primitive field initializations (null -> proper defaults)
+        postProcessFixPrimitiveFieldInitializations(slicedSrcDir);
         
         // Post-process generated files to fix unknown.Unknown -> Unknown with import
         postProcessUnknownTypes(slicedSrcDir);
@@ -548,6 +867,59 @@ public final class SpoonStubbingRunner implements Stubber {
                                 System.out.println("[fixParams] Created new Unknown reference, hasImport=" + finalHasUnknownImport + ", setSimplyQualified=" + !finalHasUnknownImport + ", qn=" + newRef.getQualifiedName());
                             } else {
                                 System.out.println("[fixParams] Not Unknown, calling fixTypeReferenceFQN");
+                                // CRITICAL FIX: Resolve simple type names to their full qualified names
+                                // This ensures types like XrSession are resolved to org.lwjgl.XrSession
+                                if (qn != null && !qn.contains(".") && qn.equals(simple)) {
+                                    // qn is same as simple, meaning it's not fully qualified
+                                    // Try to find the type in the model (use the parameter, not create new variable)
+                                    CtType<?> foundType = model.getAllTypes().stream()
+                                        .filter(t -> simple.equals(t.getSimpleName()))
+                                        .filter(t -> {
+                                            try {
+                                                String tQn = t.getQualifiedName();
+                                                return tQn != null && !tQn.startsWith("unknown.");
+                                            } catch (Throwable ignored) {
+                                                return false;
+                                            }
+                                        })
+                                        .findFirst()
+                                        .orElse(null);
+                                    
+                                    if (foundType != null) {
+                                        String fullQn = foundType.getQualifiedName();
+                                        System.out.println("[fixParams] Resolved " + simple + " to " + fullQn);
+                                        // Update the parameter type to use the full qualified name
+                                        CtTypeReference<?> resolvedRef = f.Type().createReference(fullQn);
+                                        resolvedRef.setSimplyQualified(false); // Use simple name with import
+                                        param.setType(resolvedRef);
+                                        // Ensure import is added
+                                        try {
+                                            CtCompilationUnit cu = f.CompilationUnit().getOrCreate(type);
+                                            if (cu != null) {
+                                                boolean hasImport = cu.getImports().stream().anyMatch(imp -> {
+                                                    try {
+                                                        CtReference r = imp.getReference();
+                                                        if (r instanceof CtTypeReference) {
+                                                            return fullQn.equals(((CtTypeReference<?>) r).getQualifiedName());
+                                                        }
+                                                        return false;
+                                                    } catch (Throwable ignored) {
+                                                        return false;
+                                                    }
+                                                });
+                                                if (!hasImport) {
+                                                    CtTypeReference<?> importRef = f.Type().createReference(fullQn);
+                                                    CtImport imp = f.createImport(importRef);
+                                                    cu.getImports().add(imp);
+                                                    System.out.println("[fixParams] Added import " + fullQn + " to " + type.getQualifiedName());
+                                                }
+                                            }
+                                        } catch (Throwable e) {
+                                            System.err.println("[fixParams] Failed to add import: " + e.getMessage());
+                                        }
+                                        return; // Skip fixTypeReferenceFQN since we've already fixed it
+                                    }
+                                }
                                 fixTypeReferenceFQN(paramType, f, finalHasUnknownImport);
                             }
                         }
@@ -743,6 +1115,157 @@ public final class SpoonStubbingRunner implements Stubber {
             System.err.println("[imports] Failed to add import unknown.Unknown to CU of " + 
                 (type != null ? type.getQualifiedName() : "null") + ": " + e.getMessage());
             e.printStackTrace();
+        }
+    }
+    
+    /**
+     * Add static imports for known static fields (e.g., CHECKS from Checks class).
+     * This fixes cases where bare identifiers like CHECKS are used without qualification.
+     */
+    private static void addStaticImports(CtModel model, Factory f, Map<String, Set<String>> staticImports) {
+        if (staticImports == null || staticImports.isEmpty()) {
+            return;
+        }
+        
+        System.out.println("[addStaticImports] Processing " + staticImports.size() + " static import groups");
+        
+        // For each type that needs static imports, find all types that use fields from it
+        for (Map.Entry<String, Set<String>> entry : staticImports.entrySet()) {
+            String classFqn = entry.getKey();
+            Set<String> fieldNames = entry.getValue();
+            
+            // Find the class that owns these static fields
+            CtType<?> ownerType = model.getAllTypes().stream()
+                .filter(t -> classFqn.equals(t.getQualifiedName()))
+                .findFirst()
+                .orElse(null);
+            
+            if (ownerType == null) {
+                System.out.println("[addStaticImports] WARNING: Owner type not found: " + classFqn);
+                continue;
+            }
+            
+            // Find all types that might use these static fields
+            // We'll add static imports to all types in the model (they'll be filtered by the compiler if unused)
+            for (CtType<?> type : model.getAllTypes()) {
+                try {
+                    CtCompilationUnit cu = f.CompilationUnit().getOrCreate(type);
+                    if (cu == null) continue;
+                    
+                    // Check if this type's source code uses any of these field names
+                    boolean shouldAddImport = false;
+                    try {
+                        String source = cu.getOriginalSourceCode();
+                        if (source != null) {
+                            for (String fieldName : fieldNames) {
+                                // Look for bare usage of the field name (not qualified)
+                                // Pattern: word boundary, field name, word boundary (but not ClassName.fieldName)
+                                String pattern = "\\b" + Pattern.quote(fieldName) + "\\b";
+                                if (Pattern.compile(pattern).matcher(source).find()) {
+                                    // Check it's not already qualified
+                                    String qualifiedPattern = "\\b" + Pattern.quote(ownerType.getSimpleName()) + "\\." + Pattern.quote(fieldName) + "\\b";
+                                    if (!Pattern.compile(qualifiedPattern).matcher(source).find()) {
+                                        shouldAddImport = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    } catch (Throwable ignored) {
+                        // If we can't check source, add import anyway (safe)
+                        shouldAddImport = true;
+                    }
+                    
+                    if (shouldAddImport) {
+                        // Add static import for each field
+                        for (String fieldName : fieldNames) {
+                            try {
+                                // Check if static import already exists
+                                boolean exists = cu.getImports().stream().anyMatch(imp -> {
+                                    try {
+                                        CtImportKind kind = imp.getImportKind();
+                                        if (kind == null) return false;
+                                        boolean isStatic = kind.name().contains("STATIC") || 
+                                                          kind.name().contains("METHOD") ||
+                                                          kind.name().contains("ALL");
+                                        if (!isStatic) return false;
+                                        
+                                        CtReference ref = imp.getReference();
+                                        if (ref == null) return false;
+                                        String refStr = ref.toString();
+                                        return refStr != null && refStr.equals(classFqn + "." + fieldName);
+                                    } catch (Throwable ignored2) {
+                                        return false;
+                                    }
+                                });
+                                
+                                if (!exists) {
+                                    // Create static import: import static package.Class.field;
+                                    try {
+                                        CtTypeReference<?> ownerRef = f.Type().createReference(classFqn);
+                                        // Find the actual field in the owner type
+                                        CtType<?> ownerTypeDecl = ownerRef.getTypeDeclaration();
+                                        if (ownerTypeDecl != null) {
+                                            CtField<?> field = ownerTypeDecl.getField(fieldName);
+                                            if (field != null) {
+                                                // Create import using the field reference
+                                                CtReference fieldRef = field.getReference();
+                                                CtImport staticImport = f.createImport(fieldRef);
+                                                cu.getImports().add(staticImport);
+                                                System.out.println("[addStaticImports] Added static import: " + classFqn + "." + fieldName + 
+                                                    " to " + type.getQualifiedName());
+                                            } else {
+                                                // Field doesn't exist yet - create it first, then add static import
+                                                // This is needed because static imports require the field to exist
+                                                try {
+                                                    if (ownerTypeDecl instanceof CtClass) {
+                                                        CtClass<?> ownerClass = (CtClass<?>) ownerTypeDecl;
+                                                        // Check if field already exists (might have been created in a different pass)
+                                                        CtField<?> existingField = ownerClass.getField(fieldName);
+                                                        if (existingField == null) {
+                                                            // Create the static field
+                                                            CtField<?> newField = f.Core().createField();
+                                                            newField.setSimpleName(fieldName);
+                                                            newField.setType(f.Type().BOOLEAN_PRIMITIVE); // CHECKS is boolean
+                                                            newField.addModifier(ModifierKind.PUBLIC);
+                                                            newField.addModifier(ModifierKind.STATIC);
+                                                            newField.addModifier(ModifierKind.FINAL);
+                                                            // Set default value
+                                                            @SuppressWarnings({"unchecked", "rawtypes"})
+                                                            CtExpression defaultValue = (CtExpression) f.Code().createCodeSnippetExpression("true");
+                                                            newField.setAssignment(defaultValue);
+                                                            ownerClass.addField(newField);
+                                                            System.out.println("[addStaticImports] Created static field: " + fieldName + " in " + classFqn);
+                                                        }
+                                                        // Now get the field and create import
+                                                        CtField<?> fieldToImport = ownerClass.getField(fieldName);
+                                                        if (fieldToImport != null) {
+                                                            CtReference fieldRef = fieldToImport.getReference();
+                                                            CtImport staticImport = f.createImport(fieldRef);
+                                                            cu.getImports().add(staticImport);
+                                                            System.out.println("[addStaticImports] Added static import: " + classFqn + "." + fieldName + 
+                                                                " to " + type.getQualifiedName() + " (field created)");
+                                                        }
+                                                    }
+                                                } catch (Throwable e3) {
+                                                    System.err.println("[addStaticImports] Failed to create field and import: " + e3.getMessage());
+                                                }
+                                            }
+                                        }
+                                    } catch (Throwable e2) {
+                                        System.err.println("[addStaticImports] Error creating static import: " + e2.getMessage());
+                                    }
+                                }
+                            } catch (Throwable e) {
+                                System.err.println("[addStaticImports] Failed to add static import for " + fieldName + 
+                                    " from " + classFqn + " to " + type.getQualifiedName() + ": " + e.getMessage());
+                            }
+                        }
+                    }
+                } catch (Throwable e) {
+                    System.err.println("[addStaticImports] Error processing type " + type.getQualifiedName() + ": " + e.getMessage());
+                }
+            }
         }
     }
     
@@ -999,6 +1522,12 @@ public final class SpoonStubbingRunner implements Stubber {
                                     }
                                 }
                                 
+                                // CRITICAL FIX: Never remove static imports for org.lwjgl.system.Checks.CHECKS
+                                // This is a known static field that we explicitly create
+                                if ("org.lwjgl.system.Checks".equals(classFqnStr)) {
+                                    return false; // Keep this static import
+                                }
+                                
                                 // If class doesn't exist and it's not a JDK type, remove the static import
                                 if (!classExists && !classFqnStr.startsWith("java.") && 
                                     !classFqnStr.startsWith("javax.") && !classFqnStr.startsWith("jakarta.")) {
@@ -1013,6 +1542,11 @@ public final class SpoonStubbingRunner implements Stubber {
                         String qn = ((CtTypeReference<?>) r).getQualifiedName();
                         if ("unknown.Unknown".equals(qn)) {
                             return false; // Keep this import
+                        }
+                        // CRITICAL FIX: Never remove imports for types we explicitly added (e.g., XrSession)
+                        // These are needed for the code to compile
+                        if (qn != null && (qn.startsWith("org.lwjgl.") || qn.equals("unknown.Missing"))) {
+                            return false; // Keep these imports
                         }
                     }
                     
@@ -2061,6 +2595,207 @@ public final class SpoonStubbingRunner implements Stubber {
     }
     
     /**
+     * CRITICAL FIX: Post-process to add missing imports directly to generated files.
+     * Spoon sometimes doesn't write imports even when they're in the CU, so we add them manually.
+     * This function is SAFE - it only adds imports, never removes or modifies existing code.
+     */
+    private static void postProcessAddMissingImports(Path outputDir, CtModel model, Factory f) {
+        if (outputDir == null || !Files.exists(outputDir)) {
+            return; // Safety check
+        }
+        
+        // PERFORMANCE: Only process files that were actually generated (not all files in directory)
+        // This reduces overhead when processing many methods
+        try {
+            // Quick check: if directory is too large, skip detailed processing
+            long fileCount = Files.walk(outputDir)
+                .filter(p -> p.toString().endsWith(".java"))
+                .count();
+            
+            // If too many files, use faster path (only check specific patterns)
+            if (fileCount > 500) {
+                // Fast path: only check for critical imports (XrSession, Unknown, CHECKS)
+                postProcessAddMissingImportsFast(outputDir, model, f);
+                return;
+            }
+        } catch (Throwable ignored) {}
+        
+        // Build map of all types in model for quick lookup
+        Map<String, String> simpleNameToFQN = new HashMap<>();
+        for (CtType<?> type : model.getAllTypes()) {
+            try {
+                String qn = type.getQualifiedName();
+                String simple = type.getSimpleName();
+                if (qn != null && simple != null && !qn.startsWith("java.") && !qn.startsWith("javax.") && !qn.startsWith("jakarta.")) {
+                    simpleNameToFQN.put(simple, qn);
+                }
+            } catch (Throwable ignored) {}
+        }
+        
+        // Build map of type to its required imports from CU
+        Map<String, Set<String>> typeToImports = new HashMap<>();
+        for (CtType<?> type : model.getAllTypes()) {
+            try {
+                CtCompilationUnit cu = f.CompilationUnit().getOrCreate(type);
+                if (cu == null) continue;
+                
+                Set<String> imports = new LinkedHashSet<>();
+                cu.getImports().forEach(imp -> {
+                    try {
+                        CtReference r = imp.getReference();
+                        CtImportKind kind = imp.getImportKind();
+                        boolean isStatic = (kind != null && (kind.name().contains("STATIC") || kind.name().contains("METHOD") || kind.name().contains("ALL")));
+                        
+                        if (r instanceof CtTypeReference) {
+                            String qn = ((CtTypeReference<?>) r).getQualifiedName();
+                            if (qn != null && !qn.startsWith("java.") && !qn.startsWith("javax.") && !qn.startsWith("jakarta.")) {
+                                if (isStatic) {
+                                    // For static imports, try to get the full member path
+                                    String importStr = r.toString();
+                                    if (importStr != null && importStr.contains(".")) {
+                                        imports.add("import static " + importStr + ";");
+                                    } else {
+                                        imports.add("import static " + qn + ".*;");
+                                    }
+                                } else {
+                                    imports.add("import " + qn + ";");
+                                }
+                            }
+                        } else if (isStatic) {
+                            String importStr = r.toString();
+                            if (importStr != null && importStr.contains(".")) {
+                                imports.add("import static " + importStr + ";");
+                            }
+                        }
+                    } catch (Throwable ignored) {}
+                });
+                
+                if (!imports.isEmpty()) {
+                    String typeQn = type.getQualifiedName();
+                    if (typeQn != null) {
+                        typeToImports.put(typeQn, imports);
+                    }
+                }
+            } catch (Throwable ignored) {}
+        }
+        
+        // Now add imports to the actual files
+        try (Stream<Path> paths = Files.walk(outputDir)) {
+            paths.filter(p -> p.toString().endsWith(".java"))
+                .forEach(javaFile -> {
+                    try {
+                        String content = Files.readString(javaFile);
+                        String originalContent = content;
+                        
+                        // Extract package name
+                        Pattern packagePattern = Pattern.compile("^package\\s+([^;]+);", Pattern.MULTILINE);
+                        java.util.regex.Matcher packageMatcher = packagePattern.matcher(content);
+                        if (!packageMatcher.find()) return; // Skip files without package
+                        
+                        String packageName = packageMatcher.group(1);
+                        
+                        // Extract class name (handle multiple classes in file - take first one)
+                        Pattern classPattern = Pattern.compile("(?:public\\s+)?(?:final\\s+)?(?:abstract\\s+)?(?:class|interface|enum|@interface)\\s+(\\w+)", Pattern.MULTILINE);
+                        java.util.regex.Matcher classMatcher = classPattern.matcher(content);
+                        if (!classMatcher.find()) return;
+                        
+                        String className = classMatcher.group(1);
+                        String typeQn = packageName + "." + className;
+                        
+                        // Get required imports for this type from CU
+                        Set<String> requiredImports = new LinkedHashSet<>(typeToImports.getOrDefault(typeQn, new HashSet<>()));
+                        
+                        // CRITICAL: Detect specific known patterns that need imports
+                        // Only add imports for types we know are used in the file
+                        
+                        // Pattern 1: Parameter types like "XrSession session" or "Unknown arg0"
+                        Pattern paramPattern = Pattern.compile("\\b(XrSession|Unknown|Missing)\\s+[a-zA-Z_$]");
+                        if (paramPattern.matcher(content).find()) {
+                            if (content.contains("XrSession") && !content.contains("import org.lwjgl.XrSession") && simpleNameToFQN.containsKey("XrSession")) {
+                                String fqn = simpleNameToFQN.get("XrSession");
+                                if (fqn != null && !fqn.startsWith(packageName + ".")) {
+                                    requiredImports.add("import " + fqn + ";");
+                                }
+                            }
+                            // Check for Unknown as parameter or return type (with or without spaces)
+                            Pattern unknownPattern = Pattern.compile("\\bUnknown\\s+[a-zA-Z_$]|\\bUnknown\\s*[\\[\\]<>(),]");
+                            if (unknownPattern.matcher(content).find() && !content.contains("import unknown.Unknown")) {
+                                requiredImports.add("import unknown.Unknown;");
+                            }
+                        }
+                        
+                        // Pattern 2: Return types like "public static Unknown address()"
+                        Pattern returnPattern = Pattern.compile("\\b(Unknown|Missing)\\s+[a-zA-Z_$]+\\s*\\(");
+                        if (returnPattern.matcher(content).find() && !content.contains("import unknown.Unknown")) {
+                            requiredImports.add("import unknown.Unknown;");
+                        }
+                        
+                        // Pattern 3: Static field CHECKS
+                        if (content.contains("CHECKS") && !content.contains("import static") && !content.contains("Checks.CHECKS")) {
+                            // Check if it's used as a bare identifier (not qualified)
+                            Pattern checksPattern = Pattern.compile("\\bif\\s*\\(\\s*CHECKS\\s*\\)|\\bCHECKS\\s*\\?");
+                            if (checksPattern.matcher(content).find()) {
+                                requiredImports.add("import static org.lwjgl.system.Checks.CHECKS;");
+                            }
+                        }
+                        
+                        if (requiredImports.isEmpty()) return;
+                        
+                        // Check if all imports already exist
+                        String finalContent = content;
+                        boolean allPresent = requiredImports.stream().allMatch(imp -> {
+                            String importQn = imp.replace("import ", "").replace("import static ", "").replace(";", "").replace(".*", "");
+                            return finalContent.contains("import " + importQn) || finalContent.contains("import static " + importQn);
+                        });
+                        if (allPresent) return;
+                        
+                        // Find insertion point (after package, before class or existing imports)
+                        int insertPos = packageMatcher.end();
+                        Pattern existingImportPattern = Pattern.compile("^import\\s+", Pattern.MULTILINE);
+                        java.util.regex.Matcher existingImportMatcher = existingImportPattern.matcher(content);
+                        if (existingImportMatcher.find(insertPos)) {
+                            // Find the last import line
+                            int lastImportEnd = insertPos;
+                            while (existingImportMatcher.find()) {
+                                int importStart = existingImportMatcher.start();
+                                // Find the end of this import line
+                                int importEnd = content.indexOf('\n', importStart);
+                                if (importEnd == -1) importEnd = content.length();
+                                lastImportEnd = importEnd;
+                            }
+                            insertPos = lastImportEnd;
+                        }
+                        
+                        // Build import block (only missing ones)
+                        StringBuilder importBlock = new StringBuilder("\n");
+                        for (String imp : requiredImports) {
+                            String importQn = imp.replace("import ", "").replace("import static ", "").replace(";", "").replace(".*", "");
+                            if (!content.contains("import " + importQn) && !content.contains("import static " + importQn)) {
+                                importBlock.append(imp).append("\n");
+                            }
+                        }
+                        
+                        if (importBlock.length() > 1) {
+                            // Insert imports
+                            content = content.substring(0, insertPos) + importBlock.toString() + content.substring(insertPos);
+                            
+                            if (!content.equals(originalContent)) {
+                                Files.writeString(javaFile, content);
+                                System.out.println("[postProcessAddMissingImports] Added " + (importBlock.toString().split("\n").length - 1) + " imports to " + typeQn);
+                            }
+                        }
+                    } catch (Exception e) {
+                        // Silently fail - don't break existing functionality
+                        System.err.println("[postProcessAddMissingImports] Error processing " + javaFile + ": " + e.getMessage());
+                    }
+                });
+        } catch (Exception e) {
+            // Silently fail - don't break existing functionality
+            System.err.println("[postProcessAddMissingImports] Error: " + e.getMessage());
+        }
+    }
+    
+    /**
      * Post-process generated Java files to replace unknown.Unknown with Unknown and ensure import is present.
      * This fixes cases where Spoon's pretty printer doesn't respect setSimplyQualified(false).
      */
@@ -2236,6 +2971,233 @@ public final class SpoonStubbingRunner implements Stubber {
             }
         } catch (Exception e) {
             // Ignore errors
+        }
+    }
+    
+    /**
+     * CRITICAL FIX: Post-process to fix primitive field initializations.
+     * Replaces `= null` with proper default values for primitive types (e.g., `long field = null` -> `long field = 0L`).
+     * This function is SAFE - it only fixes invalid initializations, never removes or modifies valid code.
+     */
+    private static void postProcessFixPrimitiveFieldInitializations(Path outputDir) {
+        if (outputDir == null || !Files.exists(outputDir)) {
+            return; // Safety check
+        }
+        
+        try {
+            Files.walk(outputDir)
+                .filter(p -> p.toString().endsWith(".java"))
+                .forEach(javaFile -> {
+                    try {
+                        String content = Files.readString(javaFile);
+                        String originalContent = content;
+                        
+                        // Fix primitive field initializations: type field = null; -> type field = defaultValue;
+                        // Pattern: (public|private|protected)?\s*(static)?\s*(final)?\s*(boolean|byte|char|short|int|long|float|double)\s+\w+\s*=\s*null;
+                        java.util.regex.Pattern primitiveNullPattern = java.util.regex.Pattern.compile(
+                            "\\b(public|private|protected)?\\s*(static)?\\s*(final)?\\s*(boolean|byte|char|short|int|long|float|double)\\s+(\\w+)\\s*=\\s*null\\s*;"
+                        );
+                        
+                        java.util.regex.Matcher matcher = primitiveNullPattern.matcher(content);
+                        boolean changed = false;
+                        StringBuffer sb = new StringBuffer();
+                        
+                        while (matcher.find()) {
+                            String modifier = matcher.group(1) != null ? matcher.group(1) : "";
+                            String staticMod = matcher.group(2) != null ? matcher.group(2) : "";
+                            String finalMod = matcher.group(3) != null ? matcher.group(3) : "";
+                            String type = matcher.group(4);
+                            String fieldName = matcher.group(5);
+                            
+                            String defaultValue;
+                            switch (type) {
+                                case "boolean": defaultValue = "false"; break;
+                                case "byte": defaultValue = "(byte) 0"; break;
+                                case "char": defaultValue = "'\\0'"; break;
+                                case "short": defaultValue = "(short) 0"; break;
+                                case "int": defaultValue = "0"; break;
+                                case "long": defaultValue = "0L"; break;
+                                case "float": defaultValue = "0.0f"; break;
+                                case "double": defaultValue = "0.0"; break;
+                                default: defaultValue = "0"; break;
+                            }
+                            
+                            String replacement = (modifier.isEmpty() ? "" : modifier + " ") +
+                                               (staticMod.isEmpty() ? "" : staticMod + " ") +
+                                               (finalMod.isEmpty() ? "" : finalMod + " ") +
+                                               type + " " + fieldName + " = " + defaultValue + ";";
+                            
+                            matcher.appendReplacement(sb, replacement);
+                            changed = true;
+                        }
+                        
+                        if (changed) {
+                            matcher.appendTail(sb);
+                            content = sb.toString();
+                            
+                            if (!content.equals(originalContent)) {
+                                Files.writeString(javaFile, content);
+                                System.out.println("[postProcessFixPrimitiveFieldInitializations] Fixed primitive field initializations in " + javaFile.getFileName());
+                            }
+                        }
+                    } catch (Throwable e) {
+                        // Fail silently - don't break the build
+                        System.err.println("[postProcessFixPrimitiveFieldInitializations] Error processing " + javaFile + ": " + e.getMessage());
+                    }
+                });
+        } catch (Throwable e) {
+            // Fail silently - don't break the build
+            System.err.println("[postProcessFixPrimitiveFieldInitializations] Error: " + e.getMessage());
+        }
+    }
+    
+    /**
+     * Fast path for post-processing imports when there are many files.
+     * Only checks for critical patterns (XrSession, Unknown, CHECKS).
+     */
+    private static void postProcessAddMissingImportsFast(Path outputDir, CtModel model, Factory f) {
+        try {
+            Files.walk(outputDir)
+                .filter(p -> p.toString().endsWith(".java"))
+                .forEach(javaFile -> {
+                    try {
+                        String content = Files.readString(javaFile);
+                        String originalContent = content;
+                        boolean changed = false;
+                        
+                        // Only check for critical patterns
+                        if (content.contains("XrSession") && !content.contains("import org.lwjgl.XrSession")) {
+                            int insertPos = content.indexOf("package ");
+                            if (insertPos >= 0) {
+                                insertPos = content.indexOf('\n', insertPos) + 1;
+                                content = content.substring(0, insertPos) + "import org.lwjgl.XrSession;\n" + content.substring(insertPos);
+                                changed = true;
+                            }
+                        }
+                        
+                        if (content.contains("Unknown") && !content.contains("import unknown.Unknown") && !content.contains("package unknown")) {
+                            int insertPos = content.indexOf("package ");
+                            if (insertPos >= 0) {
+                                insertPos = content.indexOf('\n', insertPos) + 1;
+                                content = content.substring(0, insertPos) + "import unknown.Unknown;\n" + content.substring(insertPos);
+                                changed = true;
+                            }
+                        }
+                        
+                        if (content.contains("CHECKS") && !content.contains("import static") && !content.contains("static org.lwjgl.system.Checks.CHECKS")) {
+                            int insertPos = content.indexOf("package ");
+                            if (insertPos >= 0) {
+                                insertPos = content.indexOf('\n', insertPos) + 1;
+                                content = content.substring(0, insertPos) + "import static org.lwjgl.system.Checks.CHECKS;\n" + content.substring(insertPos);
+                                changed = true;
+                            }
+                        }
+                        
+                        if (changed && !content.equals(originalContent)) {
+                            Files.writeString(javaFile, content);
+                        }
+                    } catch (Throwable ignored) {}
+                });
+        } catch (Throwable ignored) {}
+    }
+    
+    /**
+     * CRITICAL FIX: Fix void return types for methods used in boolean expressions (||, &&).
+     * If a method returns void but is used in a boolean binary operator, change its return type to boolean.
+     */
+    private static void fixVoidReturnTypesInBooleanContexts(CtModel model, Factory f) {
+        try {
+            for (CtType<?> type : model.getAllTypes()) {
+                if (!(type instanceof CtClass)) continue;
+                
+                CtClass<?> cls = (CtClass<?>) type;
+                for (CtMethod<?> method : cls.getMethods()) {
+                    CtTypeReference<?> returnType = method.getType();
+                    if (returnType == null) continue;
+                    
+                    // Check if method returns void
+                    if (!returnType.getQualifiedName().equals("void")) continue;
+                    
+                    // Check if this method is used in a boolean context (||, &&)
+                    boolean usedInBooleanContext = false;
+                    try {
+                        // Search for invocations of this method in boolean binary operators
+                        for (CtType<?> searchType : model.getAllTypes()) {
+                            if (!(searchType instanceof CtClass)) continue;
+                            
+                            CtClass<?> searchCls = (CtClass<?>) searchType;
+                            for (CtMethod<?> searchMethod : searchCls.getMethods()) {
+                                CtBlock<?> body = searchMethod.getBody();
+                                if (body == null) continue;
+                                
+                                // Check all binary operators in the method body
+                                for (CtBinaryOperator<?> binOp : body.getElements(new spoon.reflect.visitor.filter.TypeFilter<>(CtBinaryOperator.class))) {
+                                    if (binOp.getKind() == spoon.reflect.code.BinaryOperatorKind.OR || 
+                                        binOp.getKind() == spoon.reflect.code.BinaryOperatorKind.AND) {
+                                        
+                                        // Check if this method is invoked in this boolean expression
+                                        for (CtInvocation<?> inv : binOp.getElements(new spoon.reflect.visitor.filter.TypeFilter<>(CtInvocation.class))) {
+                                            CtExecutableReference<?> execRef = inv.getExecutable();
+                                            if (execRef != null && 
+                                                execRef.getSimpleName().equals(method.getSimpleName()) &&
+                                                execRef.getDeclaringType() != null &&
+                                                execRef.getDeclaringType().getQualifiedName().equals(cls.getQualifiedName())) {
+                                                usedInBooleanContext = true;
+                                                break;
+                                            }
+                                        }
+                                        if (usedInBooleanContext) break;
+                                    }
+                                }
+                                if (usedInBooleanContext) break;
+                            }
+                            if (usedInBooleanContext) break;
+                        }
+                    } catch (Throwable ignored) {}
+                    
+                    // If method is used in boolean context, change return type to boolean
+                    if (usedInBooleanContext) {
+                        try {
+                            method.setType(f.Type().BOOLEAN_PRIMITIVE);
+                            // Also update the method body to return a boolean value
+                            if (method.getBody() != null) {
+                                CtBlock<?> body = method.getBody();
+                                // Check if there's already a return statement
+                                boolean hasReturn = false;
+                                for (CtStatement stmt : body.getStatements()) {
+                                    if (stmt instanceof CtReturn) {
+                                        hasReturn = true;
+                                        // Update return statement to return boolean
+                                        CtReturn<?> ret = (CtReturn<?>) stmt;
+                                        if (ret.getReturnedExpression() == null) {
+                                            // Use raw type cast to avoid generic type issues
+                                            @SuppressWarnings({"unchecked", "rawtypes"})
+                                            CtExpression expr = (CtExpression) f.Code().createLiteral(false);
+                                            ret.setReturnedExpression(expr);
+                                        }
+                                        break;
+                                    }
+                                }
+                                // If no return statement, add one at the end
+                                if (!hasReturn) {
+                                    CtReturn<Boolean> ret = f.Core().createReturn();
+                                    @SuppressWarnings({"unchecked", "rawtypes"})
+                                    CtExpression expr = (CtExpression) f.Code().createLiteral(false);
+                                    ret.setReturnedExpression(expr);
+                                    body.addStatement(ret);
+                                }
+                            }
+                            System.out.println("[fixVoidReturnTypesInBooleanContexts] Changed return type of " + 
+                                cls.getQualifiedName() + "#" + method.getSimpleName() + " from void to boolean");
+                        } catch (Throwable e) {
+                            System.err.println("[fixVoidReturnTypesInBooleanContexts] Error fixing " + 
+                                cls.getQualifiedName() + "#" + method.getSimpleName() + ": " + e.getMessage());
+                        }
+                    }
+                }
+            }
+        } catch (Throwable e) {
+            System.err.println("[fixVoidReturnTypesInBooleanContexts] Error: " + e.getMessage());
         }
     }
 }

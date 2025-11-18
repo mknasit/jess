@@ -1063,6 +1063,231 @@ public class ShimGenerator {
                 Arrays.asList("get", "hasKey", "put", "putAll", "delete")));
         addShim("reactor.util.context", "ContextView", createInterfaceShim("reactor.util.context.ContextView",
                 Arrays.asList("get", "hasKey")));
+        
+        // ======================================================================
+        // ANDROID ECOSYSTEM SHIMS (android.*, androidx.*)
+        // ======================================================================
+        // Core Android types (android.*)
+        addShim("android", "Context", createClassShim("android.Context",
+                Arrays.asList("getPackageName", "getResources", "getSystemService", "getApplicationContext",
+                        "startActivity", "sendBroadcast", "registerReceiver", "unregisterReceiver")));
+        addShim("android.app", "Activity", createClassShim("android.app.Activity",
+                Arrays.asList("onCreate", "onStart", "onResume", "onPause", "onStop", "onDestroy",
+                        "setContentView", "findViewById", "finish", "startActivity")));
+        addShim("android.app", "Fragment", createClassShim("android.app.Fragment",
+                Arrays.asList("onCreate", "onCreateView", "onViewCreated", "onDestroyView", "onDestroy",
+                        "getActivity", "getContext", "getView", "getArguments")));
+        addShim("android.app", "Service", createClassShim("android.app.Service",
+                Arrays.asList("onCreate", "onStartCommand", "onBind", "onDestroy", "stopSelf")));
+        addShim("android.content", "Intent", createClassShim("android.content.Intent",
+                Arrays.asList("getAction", "getData", "getExtras", "putExtra", "getStringExtra",
+                        "getIntExtra", "getBooleanExtra", "setAction", "setData", "setClass")));
+        addShim("android.content", "BroadcastReceiver", createClassShim("android.content.BroadcastReceiver",
+                Arrays.asList("onReceive")));
+        addShim("android.content.pm", "PackageManager", createInterfaceShim("android.content.pm.PackageManager",
+                Arrays.asList("getPackageInfo", "getApplicationInfo", "resolveActivity")));
+        addShim("android.net", "Uri", createClassShim("android.net.Uri",
+                Arrays.asList("parse", "fromParts", "withAppendedPath", "getScheme", "getHost", "getPath")));
+        addShim("android.os", "Bundle", createClassShim("android.os.Bundle",
+                Arrays.asList("putString", "getString", "putInt", "getInt", "putBoolean", "getBoolean",
+                        "putParcelable", "getParcelable", "containsKey")));
+        addShim("android.os", "Handler", createClassShim("android.os.Handler",
+                Arrays.asList("post", "postDelayed", "sendMessage", "obtainMessage", "removeCallbacks")));
+        addShim("android.os", "Message", createClassShim("android.os.Message",
+                Arrays.asList("getData", "setData", "getWhat", "setWhat", "getTarget")));
+        addShim("android.os", "Parcelable", createInterfaceShim("android.os.Parcelable",
+                Arrays.asList("describeContents", "writeToParcel")));
+        addShim("android.view", "View", createClassShim("android.view.View",
+                Arrays.asList("findViewById", "setOnClickListener", "setVisibility", "getContext",
+                        "invalidate", "requestLayout", "getWidth", "getHeight")));
+        addShim("android.view", "ViewGroup", createClassShim("android.view.ViewGroup",
+                Arrays.asList("addView", "removeView", "removeAllViews", "getChildCount", "getChildAt")));
+        addShim("android.widget", "TextView", createClassShim("android.widget.TextView",
+                Arrays.asList("setText", "getText", "setTextColor", "setTextSize")));
+        addShim("android.widget", "Button", createClassShim("android.widget.Button"));
+        addShim("android.widget", "ImageView", createClassShim("android.widget.ImageView",
+                Arrays.asList("setImageResource", "setImageBitmap", "setImageDrawable")));
+        addShim("android.widget", "EditText", createClassShim("android.widget.EditText",
+                Arrays.asList("getText", "setText", "setHint", "setInputType")));
+        addShim("android.widget", "ListView", createClassShim("android.widget.ListView",
+                Arrays.asList("setAdapter", "getAdapter", "setOnItemClickListener")));
+        addShim("android.widget", "RecyclerView", createClassShim("android.widget.RecyclerView",
+                Arrays.asList("setAdapter", "getAdapter", "setLayoutManager", "getLayoutManager")));
+        addShim("android.widget", "Adapter", createInterfaceShim("android.widget.Adapter",
+                Arrays.asList("getCount", "getItem", "getView", "getItemId")));
+        addShim("android.graphics", "Bitmap", createClassShim("android.graphics.Bitmap",
+                Arrays.asList("createBitmap", "getWidth", "getHeight", "compress", "recycle")));
+        addShim("android.graphics", "Canvas", createClassShim("android.graphics.Canvas",
+                Arrays.asList("drawColor", "drawBitmap", "drawText", "drawLine", "drawRect", "drawCircle")));
+        addShim("android.graphics", "Paint", createClassShim("android.graphics.Paint",
+                Arrays.asList("setColor", "setTextSize", "setStyle", "setAntiAlias")));
+        addShim("android.graphics.drawable", "Drawable", createClassShim("android.graphics.drawable.Drawable",
+                Arrays.asList("setBounds", "draw", "getIntrinsicWidth", "getIntrinsicHeight")));
+        addShim("android.util", "Log", createClassShim("android.util.Log",
+                Arrays.asList("d", "i", "w", "e", "v")));
+        addShim("android.util", "SparseArray", createClassShim("android.util.SparseArray",
+                Arrays.asList("get", "put", "remove", "size", "keyAt", "valueAt")));
+        addShim("android.content.res", "Resources", createClassShim("android.content.res.Resources",
+                Arrays.asList("getString", "getColor", "getDrawable", "getDimension", "getIdentifier")));
+        
+        // AndroidX types (androidx.*)
+        addShim("androidx.appcompat.app", "AppCompatActivity", createClassShim("androidx.appcompat.app.AppCompatActivity",
+                Arrays.asList("onCreate", "setContentView", "findViewById", "getSupportActionBar",
+                        "setSupportActionBar", "onOptionsItemSelected")));
+        addShim("androidx.fragment.app", "Fragment", createClassShim("androidx.fragment.app.Fragment",
+                Arrays.asList("onCreate", "onCreateView", "onViewCreated", "onDestroyView", "onDestroy",
+                        "getActivity", "getContext", "getView", "getArguments", "requireContext",
+                        "requireActivity", "getParentFragment")));
+        addShim("androidx.fragment.app", "FragmentManager", createInterfaceShim("androidx.fragment.app.FragmentManager",
+                Arrays.asList("beginTransaction", "findFragmentById", "findFragmentByTag", "popBackStack")));
+        addShim("androidx.fragment.app", "FragmentTransaction", createInterfaceShim("androidx.fragment.app.FragmentTransaction",
+                Arrays.asList("add", "remove", "replace", "commit", "commitAllowingStateLoss")));
+        addShim("androidx.recyclerview.widget", "RecyclerView", createClassShim("androidx.recyclerview.widget.RecyclerView",
+                Arrays.asList("setAdapter", "getAdapter", "setLayoutManager", "getLayoutManager",
+                        "addItemDecoration", "setItemAnimator")));
+        addShim("androidx.recyclerview.widget", "RecyclerView.LayoutManager", createClassShim("androidx.recyclerview.widget.RecyclerView.LayoutManager"));
+        addShim("androidx.recyclerview.widget", "RecyclerView.Adapter", createClassShim("androidx.recyclerview.widget.RecyclerView.Adapter",
+                Arrays.asList("onCreateViewHolder", "onBindViewHolder", "getItemCount", "notifyDataSetChanged",
+                        "notifyItemInserted", "notifyItemRemoved", "notifyItemChanged")));
+        addShim("androidx.recyclerview.widget", "RecyclerView.ViewHolder", createClassShim("androidx.recyclerview.widget.RecyclerView.ViewHolder",
+                Arrays.asList("getAdapterPosition", "getLayoutPosition", "itemView")));
+        addShim("androidx.recyclerview.widget", "LinearLayoutManager", createClassShim("androidx.recyclerview.widget.LinearLayoutManager",
+                Arrays.asList("setOrientation", "getOrientation", "scrollToPosition", "scrollToPositionWithOffset")));
+        addShim("androidx.recyclerview.widget", "GridLayoutManager", createClassShim("androidx.recyclerview.widget.GridLayoutManager",
+                Arrays.asList("setSpanCount", "getSpanCount")));
+        addShim("androidx.lifecycle", "LifecycleOwner", createInterfaceShim("androidx.lifecycle.LifecycleOwner",
+                Arrays.asList("getLifecycle")));
+        addShim("androidx.lifecycle", "LifecycleObserver", createInterfaceShim("androidx.lifecycle.LifecycleObserver"));
+        addShim("androidx.lifecycle", "Lifecycle", createClassShim("androidx.lifecycle.Lifecycle",
+                Arrays.asList("addObserver", "removeObserver", "getCurrentState")));
+        addShim("androidx.lifecycle", "Lifecycle.State", createEnumShim("androidx.lifecycle.Lifecycle.State"));
+        addShim("androidx.lifecycle", "ViewModel", createClassShim("androidx.lifecycle.ViewModel",
+                Arrays.asList("onCleared")));
+        addShim("androidx.lifecycle", "LiveData", createClassShim("androidx.lifecycle.LiveData",
+                Arrays.asList("observe", "observeForever", "removeObserver", "setValue", "getValue",
+                        "postValue", "hasObservers")));
+        addShim("androidx.lifecycle", "MutableLiveData", createClassShim("androidx.lifecycle.MutableLiveData"));
+        addShim("androidx.lifecycle", "Observer", createInterfaceShim("androidx.lifecycle.Observer",
+                Arrays.asList("onChanged")));
+        addShim("androidx.room", "Database", createAnnotationShim("androidx.room.Database"));
+        addShim("androidx.room", "Entity", createAnnotationShim("androidx.room.Entity"));
+        addShim("androidx.room", "Dao", createAnnotationShim("androidx.room.Dao"));
+        addShim("androidx.room", "RoomDatabase", createClassShim("androidx.room.RoomDatabase",
+                Arrays.asList("databaseBuilder", "getOpenHelper", "getInvalidationTracker")));
+        addShim("androidx.room", "Dao", createInterfaceShim("androidx.room.Dao"));
+        
+        // ======================================================================
+        // LWJGL ECOSYSTEM SHIMS (org.lwjgl.*)
+        // ======================================================================
+        // Core LWJGL types
+        addShim("org.lwjgl", "Buffer", createClassShim("org.lwjgl.Buffer",
+                Arrays.asList("remaining", "position", "limit", "capacity", "clear", "flip", "rewind")));
+        addShim("org.lwjgl", "MemoryUtil", createClassShim("org.lwjgl.MemoryUtil",
+                Arrays.asList("memAlloc", "memRealloc", "memFree", "memAddress")));
+        
+        // OpenGL (org.lwjgl.opengl.*)
+        addShim("org.lwjgl.opengl", "GL", createClassShim("org.lwjgl.opengl.GL",
+                Arrays.asList("glClear", "glClearColor", "glViewport", "glEnable", "glDisable",
+                        "glDrawArrays", "glDrawElements", "glBindBuffer", "glGenBuffers",
+                        "glDeleteBuffers", "glBufferData", "glUseProgram", "glUniformMatrix4fv",
+                        "glUniform1i", "glUniform3f", "glGetUniformLocation", "glGetAttribLocation")));
+        addShim("org.lwjgl.opengl", "GL11", createClassShim("org.lwjgl.opengl.GL11",
+                Arrays.asList("glClear", "glClearColor", "glViewport", "glEnable", "glDisable",
+                        "glDrawArrays", "glDrawElements", "glBindTexture", "glGenTextures",
+                        "glDeleteTextures", "glTexImage2D", "glTexParameteri")));
+        addShim("org.lwjgl.opengl", "GL20", createClassShim("org.lwjgl.opengl.GL20",
+                Arrays.asList("glUseProgram", "glUniformMatrix4fv", "glUniform1i", "glUniform3f",
+                        "glGetUniformLocation", "glGetAttribLocation", "glEnableVertexAttribArray",
+                        "glVertexAttribPointer", "glCreateShader", "glShaderSource", "glCompileShader",
+                        "glGetShaderi", "glCreateProgram", "glAttachShader", "glLinkProgram")));
+        addShim("org.lwjgl.opengl", "GL30", createClassShim("org.lwjgl.opengl.GL30",
+                Arrays.asList("glBindVertexArray", "glGenVertexArrays", "glDeleteVertexArrays",
+                        "glBindFramebuffer", "glGenFramebuffers", "glDeleteFramebuffers",
+                        "glFramebufferTexture2D", "glCheckFramebufferStatus")));
+        addShim("org.lwjgl.opengl", "GL33", createClassShim("org.lwjgl.opengl.GL33"));
+        addShim("org.lwjgl.opengl", "GLCapabilities", createClassShim("org.lwjgl.opengl.GLCapabilities",
+                Arrays.asList("OpenGL11", "OpenGL20", "OpenGL30", "OpenGL33")));
+        
+        // GLFW (org.lwjgl.glfw.*)
+        addShim("org.lwjgl.glfw", "GLFW", createClassShim("org.lwjgl.glfw.GLFW",
+                Arrays.asList("glfwInit", "glfwTerminate", "glfwCreateWindow", "glfwDestroyWindow",
+                        "glfwWindowShouldClose", "glfwPollEvents", "glfwSwapBuffers", "glfwSwapInterval",
+                        "glfwMakeContextCurrent", "glfwSetWindowShouldClose", "glfwSetKeyCallback",
+                        "glfwSetCursorPosCallback", "glfwSetMouseButtonCallback", "glfwSetScrollCallback",
+                        "glfwGetPrimaryMonitor", "glfwGetVideoMode", "glfwSetWindowPos", "glfwSetWindowSize")));
+        addShim("org.lwjgl.glfw", "GLFWErrorCallback", createClassShim("org.lwjgl.glfw.GLFWErrorCallback",
+                Arrays.asList("invoke", "create", "set")));
+        addShim("org.lwjgl.glfw", "GLFWKeyCallback", createClassShim("org.lwjgl.glfw.GLFWKeyCallback",
+                Arrays.asList("invoke", "create", "set")));
+        addShim("org.lwjgl.glfw", "GLFWCursorPosCallback", createClassShim("org.lwjgl.glfw.GLFWCursorPosCallback",
+                Arrays.asList("invoke", "create", "set")));
+        addShim("org.lwjgl.glfw", "GLFWMouseButtonCallback", createClassShim("org.lwjgl.glfw.GLFWMouseButtonCallback",
+                Arrays.asList("invoke", "create", "set")));
+        addShim("org.lwjgl.glfw", "GLFWScrollCallback", createClassShim("org.lwjgl.glfw.GLFWScrollCallback",
+                Arrays.asList("invoke", "create", "set")));
+        addShim("org.lwjgl.glfw", "GLFWVidMode", createClassShim("org.lwjgl.glfw.GLFWVidMode",
+                Arrays.asList("width", "height", "refreshRate")));
+        
+        // Vulkan (org.lwjgl.vulkan.*)
+        addShim("org.lwjgl.vulkan", "VK", createClassShim("org.lwjgl.vulkan.VK",
+                Arrays.asList("vkCreateInstance", "vkDestroyInstance", "vkEnumeratePhysicalDevices",
+                        "vkGetPhysicalDeviceProperties", "vkCreateDevice", "vkDestroyDevice",
+                        "vkCreateSwapchainKHR", "vkDestroySwapchainKHR", "vkGetSwapchainImagesKHR",
+                        "vkCreateImageView", "vkDestroyImageView", "vkCreateRenderPass",
+                        "vkDestroyRenderPass", "vkCreateFramebuffer", "vkDestroyFramebuffer",
+                        "vkCreateCommandPool", "vkDestroyCommandPool", "vkAllocateCommandBuffers",
+                        "vkFreeCommandBuffers", "vkBeginCommandBuffer", "vkEndCommandBuffer",
+                        "vkQueueSubmit", "vkQueuePresentKHR", "vkDeviceWaitIdle")));
+        addShim("org.lwjgl.vulkan", "VkInstance", createClassShim("org.lwjgl.vulkan.VkInstance"));
+        addShim("org.lwjgl.vulkan", "VkPhysicalDevice", createClassShim("org.lwjgl.vulkan.VkPhysicalDevice"));
+        addShim("org.lwjgl.vulkan", "VkDevice", createClassShim("org.lwjgl.vulkan.VkDevice"));
+        addShim("org.lwjgl.vulkan", "VkQueue", createClassShim("org.lwjgl.vulkan.VkQueue"));
+        addShim("org.lwjgl.vulkan", "VkCommandBuffer", createClassShim("org.lwjgl.vulkan.VkCommandBuffer"));
+        addShim("org.lwjgl.vulkan", "VkSwapchainKHR", createClassShim("org.lwjgl.vulkan.VkSwapchainKHR"));
+        addShim("org.lwjgl.vulkan", "VkImage", createClassShim("org.lwjgl.vulkan.VkImage"));
+        addShim("org.lwjgl.vulkan", "VkImageView", createClassShim("org.lwjgl.vulkan.VkImageView"));
+        addShim("org.lwjgl.vulkan", "VkRenderPass", createClassShim("org.lwjgl.vulkan.VkRenderPass"));
+        addShim("org.lwjgl.vulkan", "VkFramebuffer", createClassShim("org.lwjgl.vulkan.VkFramebuffer"));
+        addShim("org.lwjgl.vulkan", "VkCommandPool", createClassShim("org.lwjgl.vulkan.VkCommandPool"));
+        addShim("org.lwjgl.vulkan", "VkCommandBufferAllocateInfo", createClassShim("org.lwjgl.vulkan.VkCommandBufferAllocateInfo"));
+        addShim("org.lwjgl.vulkan", "VkCommandBufferBeginInfo", createClassShim("org.lwjgl.vulkan.VkCommandBufferBeginInfo"));
+        addShim("org.lwjgl.vulkan", "VkSubmitInfo", createClassShim("org.lwjgl.vulkan.VkSubmitInfo"));
+        addShim("org.lwjgl.vulkan", "VkPresentInfoKHR", createClassShim("org.lwjgl.vulkan.VkPresentInfoKHR"));
+        
+        // OpenAL (org.lwjgl.openal.*)
+        addShim("org.lwjgl.openal", "AL", createClassShim("org.lwjgl.openal.AL",
+                Arrays.asList("alGenSources", "alDeleteSources", "alSourcei", "alSourcef",
+                        "alSource3f", "alSourcePlay", "alSourcePause", "alSourceStop",
+                        "alGenBuffers", "alDeleteBuffers", "alBufferData", "alListener3f",
+                        "alListenerf", "alGetError")));
+        addShim("org.lwjgl.openal", "ALC", createClassShim("org.lwjgl.openal.ALC",
+                Arrays.asList("alcOpenDevice", "alcCloseDevice", "alcCreateContext",
+                        "alcDestroyContext", "alcMakeContextCurrent", "alcGetCurrentContext")));
+        addShim("org.lwjgl.openal", "AL10", createClassShim("org.lwjgl.openal.AL10",
+                Arrays.asList("AL_SOURCE_STATE", "AL_PLAYING", "AL_PAUSED", "AL_STOPPED",
+                        "AL_BUFFER", "AL_LOOPING", "AL_POSITION", "AL_VELOCITY")));
+        
+        // OpenCL (org.lwjgl.opencl.*)
+        addShim("org.lwjgl.opencl", "CL", createClassShim("org.lwjgl.opencl.CL",
+                Arrays.asList("clGetPlatformIDs", "clGetDeviceIDs", "clCreateContext",
+                        "clCreateCommandQueue", "clCreateProgramWithSource", "clBuildProgram",
+                        "clCreateKernel", "clCreateBuffer", "clEnqueueWriteBuffer",
+                        "clEnqueueNDRangeKernel", "clEnqueueReadBuffer", "clReleaseKernel",
+                        "clReleaseProgram", "clReleaseMemObject", "clReleaseCommandQueue",
+                        "clReleaseContext")));
+        
+        // System (org.lwjgl.system.*)
+        addShim("org.lwjgl.system", "MemoryStack", createClassShim("org.lwjgl.system.MemoryStack",
+                Arrays.asList("stackPush", "stackPop", "malloc", "calloc", "nmalloc", "ncalloc")));
+        addShim("org.lwjgl.system", "MemoryUtil", createClassShim("org.lwjgl.system.MemoryUtil",
+                Arrays.asList("memAlloc", "memRealloc", "memFree", "memAddress", "memByteBuffer",
+                        "memSet", "memCopy")));
+        addShim("org.lwjgl.system", "Configuration", createClassShim("org.lwjgl.system.Configuration",
+                Arrays.asList("DEBUG", "DEBUG_STACK", "DEBUG_MEMORY_ALLOCATOR", "DEBUG_MEMORY_ACCESS")));
+        addShim("org.lwjgl.system", "Library", createInterfaceShim("org.lwjgl.system.Library",
+                Arrays.asList("getName", "getFunctionProvider")));
+        addShim("org.lwjgl.system", "SharedLibrary", createInterfaceShim("org.lwjgl.system.SharedLibrary",
+                Arrays.asList("getPath", "getFunctionAddress")));
     }
 
     /**
@@ -1396,12 +1621,40 @@ public class ShimGenerator {
                 return false;
             }
             
+            // Handle nested types (e.g., RecyclerView.Adapter, Lifecycle.State)
+            // Pattern: package.OuterClass.InnerClass
+            // We need to detect if the last segment before the class name is actually a class, not a package
             int lastDot = fqn.lastIndexOf('.');
             String packageName = lastDot >= 0 ? fqn.substring(0, lastDot) : "";
             String className = lastDot >= 0 ? fqn.substring(lastDot + 1) : fqn;
             
+            // Check if this is a nested type by looking for patterns like:
+            // - androidx.recyclerview.widget.RecyclerView.Adapter
+            // - androidx.lifecycle.Lifecycle.State
+            // These have a dot in the "class name" part, indicating a nested type
+            boolean isNestedType = false;
+            String outerClassName = null;
+            String innerClassName = className;
+            
+            // Known nested type patterns for Android
+            if (fqn.contains("RecyclerView.Adapter") || fqn.contains("RecyclerView.LayoutManager") || 
+                fqn.contains("RecyclerView.ViewHolder") || fqn.contains("Lifecycle.State")) {
+                isNestedType = true;
+                // Extract outer and inner class names
+                // For "androidx.recyclerview.widget.RecyclerView.Adapter"
+                // packageName should be "androidx.recyclerview.widget"
+                // outerClassName should be "RecyclerView"
+                // innerClassName should be "Adapter"
+                int secondLastDot = fqn.lastIndexOf('.', lastDot - 1);
+                if (secondLastDot >= 0) {
+                    outerClassName = fqn.substring(secondLastDot + 1, lastDot);
+                    innerClassName = className;
+                    packageName = fqn.substring(0, secondLastDot);
+                }
+            }
+            
             // Validate package and class names
-            if (className == null || className.isEmpty()) {
+            if (innerClassName == null || innerClassName.isEmpty()) {
                 if (Boolean.getBoolean("jess.verboseShims")) {
                     System.err.println("    Warning: Skipping shim with invalid class name: " + fqn);
                 }
@@ -1409,7 +1662,7 @@ public class ShimGenerator {
             }
             
             // Skip if class name is a Java keyword or invalid identifier
-            if (isJavaKeyword(className) || !isValidJavaIdentifier(className)) {
+            if (isJavaKeyword(innerClassName) || !isValidJavaIdentifier(innerClassName)) {
                 if (Boolean.getBoolean("jess.verboseShims")) {
                     System.err.println("    Warning: Skipping shim with invalid identifier: " + fqn);
                 }
@@ -1417,6 +1670,57 @@ public class ShimGenerator {
             }
 
             CtPackage pkg = factory.Package().getOrCreate(packageName);
+            
+            // Handle nested types - create as inner class
+            if (isNestedType && outerClassName != null) {
+                // First, ensure the outer class exists
+                String outerFqn = packageName.isEmpty() ? outerClassName : packageName + "." + outerClassName;
+                CtType<?> outerType = factory.Type().get(outerFqn);
+                if (outerType == null) {
+                    // Create outer class if it doesn't exist
+                    outerType = factory.Class().create(pkg, outerClassName);
+                    outerType.addModifier(ModifierKind.PUBLIC);
+                }
+                
+                // Create nested type as inner class
+                if (outerType instanceof CtClass) {
+                    CtClass<?> outerClass = (CtClass<?>) outerType;
+                    CtType<?> nestedType;
+                    switch (shim.getKind()) {
+                        case CLASS:
+                            nestedType = factory.Class().create(outerClass, innerClassName);
+                            break;
+                        case INTERFACE:
+                            nestedType = factory.Interface().create(outerClass, innerClassName);
+                            break;
+                        case ENUM:
+                            // For nested enums, use Core API and addNestedType (same as SpoonStubber)
+                            nestedType = factory.Core().createEnum();
+                            nestedType.setSimpleName(innerClassName);
+                            outerClass.addNestedType(nestedType);
+                            break;
+                        default:
+                            return false;
+                    }
+                    if (shim.getKind() != ShimDefinition.Kind.ENUM) {
+                        nestedType.addModifier(ModifierKind.PUBLIC);
+                        nestedType.addModifier(ModifierKind.STATIC); // Nested types are typically static
+                    } else {
+                        nestedType.addModifier(ModifierKind.PUBLIC);
+                        nestedType.addModifier(ModifierKind.STATIC);
+                    }
+                    
+                    // Add methods if specified
+                    if (!shim.getMethodNames().isEmpty()) {
+                        for (String methodName : shim.getMethodNames()) {
+                            addShimMethod(nestedType, methodName);
+                        }
+                    }
+                    
+                    return true;
+                }
+                return false;
+            }
 
             CtType<?> type;
             switch (shim.getKind()) {
@@ -1572,6 +1876,25 @@ public class ShimGenerator {
                 typeParam.setSimpleName("T");
                 iface.addFormalCtTypeParameter(typeParam);
             }
+            
+            // Special handling for Android LiveData and MutableLiveData - make them generic
+            if (("androidx.lifecycle.LiveData".equals(fqn) || "androidx.lifecycle.MutableLiveData".equals(fqn)) 
+                    && type instanceof CtClass) {
+                CtClass<?> cls = (CtClass<?>) type;
+                // Add type parameter <T>
+                CtTypeParameter typeParam = factory.Core().createTypeParameter();
+                typeParam.setSimpleName("T");
+                cls.addFormalCtTypeParameter(typeParam);
+            }
+            
+            // Special handling for Android Observer - make it generic
+            if ("androidx.lifecycle.Observer".equals(fqn) && type instanceof CtInterface) {
+                CtInterface<?> iface = (CtInterface<?>) type;
+                // Add type parameter <T>
+                CtTypeParameter typeParam = factory.Core().createTypeParameter();
+                typeParam.setSimpleName("T");
+                iface.addFormalCtTypeParameter(typeParam);
+            }
             if ("com.baomidou.mybatisplus.extension.service.impl.ServiceImpl".equals(fqn) && type instanceof CtClass) {
                 CtClass<?> cls = (CtClass<?>) type;
                 // Add type parameters <M extends BaseMapper<T>, T>
@@ -1650,6 +1973,22 @@ public class ShimGenerator {
 
             // Determine return type based on method name
             CtTypeReference<?> returnType = inferReturnType(methodName, type);
+            
+            // Special handling for generic types - if return type is a type parameter reference,
+            // ensure it's properly scoped to the class's type parameters
+            if (returnType instanceof CtTypeParameterReference) {
+                CtTypeParameterReference typeParamRef = (CtTypeParameterReference) returnType;
+                // Check if the class has this type parameter
+                if (type instanceof CtClass) {
+                    CtClass<?> cls = (CtClass<?>) type;
+                    boolean hasTypeParam = cls.getFormalCtTypeParameters().stream()
+                        .anyMatch(tp -> tp.getSimpleName().equals(typeParamRef.getSimpleName()));
+                    if (!hasTypeParam) {
+                        // Type parameter doesn't exist on class, fallback to Object
+                        returnType = factory.Type().createReference("java.lang.Object");
+                    }
+                }
+            }
 
             // Special handling for ANTLR ParseTreeVisitor - visit() methods return T
             String typeQn = type.getQualifiedName();
@@ -1765,14 +2104,28 @@ public class ShimGenerator {
             }
 
             // Determine parameter types based on method name
-            List<CtTypeReference<?>> paramTypes = inferParameterTypes(methodName, typeQn);
+            List<CtTypeReference<?>> paramTypes = inferParameterTypes(methodName, typeQn, type);
 
             Set<ModifierKind> mods = new HashSet<>();
             mods.add(ModifierKind.PUBLIC);
 
             // Check if this is a utility class (like StringUtils, ObjectUtils) - methods should be static
+            // Also check for LWJGL classes (GLFW, GL, AL, ALC, MemoryStack, MemoryUtil, VK) - all methods are static
+            // Exception: MemoryStack.stackPush() is static, but other methods are instance methods
             boolean isUtilityClass = isUtilityClass(type);
-            if (isUtilityClass && type instanceof CtClass) {
+            boolean isLWJGLStaticClass = typeQn != null && (
+                typeQn.equals("org.lwjgl.glfw.GLFW") ||
+                typeQn.startsWith("org.lwjgl.opengl.GL") ||
+                typeQn.equals("org.lwjgl.openal.AL") ||
+                typeQn.equals("org.lwjgl.openal.ALC") ||
+                typeQn.equals("org.lwjgl.system.MemoryUtil") ||
+                typeQn.equals("org.lwjgl.vulkan.VK")
+            );
+            // MemoryStack.stackPush() is static, but other methods are instance
+            boolean isMemoryStackStaticMethod = typeQn != null && 
+                typeQn.equals("org.lwjgl.system.MemoryStack") && 
+                "stackPush".equals(methodName);
+            if ((isUtilityClass || isLWJGLStaticClass || isMemoryStackStaticMethod) && type instanceof CtClass) {
                 mods.add(ModifierKind.STATIC);
             }
 
@@ -1900,6 +2253,8 @@ public class ShimGenerator {
                 addTokenStreamMethods(type);
             } else if (fqn.startsWith("org.antlr.v4.runtime.CommonTokenStream")) {
                 addCommonTokenStreamMethods(type);
+            } else if (fqn.startsWith("androidx.lifecycle.LiveData")) {
+                addLiveDataOverloads(type);
             }
         } catch (Exception e) {
             // Ignore overload addition failures - log only in verbose mode
@@ -1907,6 +2262,16 @@ public class ShimGenerator {
                 System.err.println("    Warning: Failed to add overloads for " + fqn + ": " + e.getMessage());
             }
         }
+    }
+    
+    /**
+     * Add overloaded methods for LiveData.
+     * Note: observe() methods require LifecycleOwner and Observer<T> which may not always be available,
+     * so we skip adding them here to avoid compilation errors.
+     */
+    private void addLiveDataOverloads(CtType<?> type) {
+        // Skip - observe() methods require LifecycleOwner and Observer<T>
+        // which may not be in the referenced types set
     }
 
     /**
@@ -2396,6 +2761,8 @@ public class ShimGenerator {
      * Infer return type based on method name.
      */
     private CtTypeReference<?> inferReturnType(String methodName, CtType<?> ownerType) {
+        String typeQn = ownerType != null ? ownerType.getQualifiedName() : null;
+        
         // Special cases for common methods
         if ("toString".equals(methodName)) {
             return factory.Type().createReference("java.lang.String");
@@ -2425,6 +2792,130 @@ public class ShimGenerator {
             // trim() should return String
             return factory.Type().createReference("java.lang.String");
         }
+        
+        // Android-specific return types
+        if (typeQn != null && (typeQn.startsWith("android.") || typeQn.startsWith("androidx."))) {
+            // Intent methods
+            if ("getStringExtra".equals(methodName) || "getAction".equals(methodName)) {
+                return factory.Type().createReference("java.lang.String");
+            }
+            if ("getData".equals(methodName)) {
+                return factory.Type().createReference("android.net.Uri");
+            }
+            if ("getExtras".equals(methodName)) {
+                return factory.Type().createReference("android.os.Bundle");
+            }
+            // LifecycleOwner methods
+            if ("getLifecycle".equals(methodName) && typeQn != null && typeQn.contains("LifecycleOwner")) {
+                return factory.Type().createReference("androidx.lifecycle.Lifecycle");
+            }
+            // Bundle methods
+            if ("getString".equals(methodName) && typeQn != null && typeQn.contains("Bundle")) {
+                return factory.Type().createReference("java.lang.String");
+            }
+            if ("getInt".equals(methodName) && typeQn != null && typeQn.contains("Bundle")) {
+                return factory.Type().INTEGER_PRIMITIVE;
+            }
+            if ("getBoolean".equals(methodName) && typeQn != null && typeQn.contains("Bundle")) {
+                return factory.Type().BOOLEAN_PRIMITIVE;
+            }
+            // View methods
+            if ("getWidth".equals(methodName) || "getHeight".equals(methodName) || 
+                "getChildCount".equals(methodName) || "getItemCount".equals(methodName)) {
+                return factory.Type().INTEGER_PRIMITIVE;
+            }
+            // TextView methods
+            if ("getText".equals(methodName) && typeQn != null && typeQn.contains("TextView")) {
+                // getText() returns CharSequence, but we'll use String for simplicity
+                return factory.Type().createReference("java.lang.String");
+            }
+            // RecyclerView methods
+            if ("getAdapter".equals(methodName) && typeQn != null && typeQn.contains("RecyclerView")) {
+                // Return generic Adapter type - will be resolved by compiler
+                return factory.Type().createReference("java.lang.Object");
+            }
+            if ("getLayoutManager".equals(methodName) && typeQn != null && typeQn.contains("RecyclerView")) {
+                return factory.Type().createReference("java.lang.Object");
+            }
+            // Lifecycle methods
+            if ("getCurrentState".equals(methodName) && typeQn != null && typeQn.contains("Lifecycle")) {
+                return factory.Type().createReference("androidx.lifecycle.Lifecycle.State");
+            }
+            // LiveData methods
+            if ("getValue".equals(methodName) && typeQn != null && typeQn.contains("LiveData")) {
+                // Return the generic type parameter T from LiveData<T>
+                if (ownerType instanceof CtClass) {
+                    CtClass<?> cls = (CtClass<?>) ownerType;
+                    if (!cls.getFormalCtTypeParameters().isEmpty()) {
+                        // Use the first type parameter (T)
+                        CtTypeParameterReference typeParamRef = factory.Core().createTypeParameterReference();
+                        typeParamRef.setSimpleName("T");
+                        return typeParamRef;
+                    }
+                }
+                // Fallback to Object if no type parameter
+                return factory.Type().createReference("java.lang.Object");
+            }
+            if ("hasObservers".equals(methodName) && typeQn != null && typeQn.contains("LiveData")) {
+                return factory.Type().BOOLEAN_PRIMITIVE;
+            }
+            if ("setValue".equals(methodName) && typeQn != null && typeQn.contains("LiveData")) {
+                // setValue(T value) - parameter type will be inferred
+                return factory.Type().VOID_PRIMITIVE;
+            }
+            if ("postValue".equals(methodName) && typeQn != null && typeQn.contains("LiveData")) {
+                // postValue(T value) - parameter type will be inferred
+                return factory.Type().VOID_PRIMITIVE;
+            }
+        }
+        
+        // LWJGL return types
+        if (typeQn != null && (typeQn.startsWith("org.lwjgl."))) {
+            // GLFW methods
+            if ("glfwInit".equals(methodName) || "glfwWindowShouldClose".equals(methodName)) {
+                return factory.Type().BOOLEAN_PRIMITIVE;
+            }
+            if ("glfwCreateWindow".equals(methodName) || "glfwGetPrimaryMonitor".equals(methodName) ||
+                "alcGetCurrentContext".equals(methodName)) {
+                return factory.Type().LONG_PRIMITIVE;
+            }
+            // OpenAL methods
+            if ("alGetError".equals(methodName)) {
+                return factory.Type().INTEGER_PRIMITIVE;
+            }
+            // OpenGL methods
+            if ("glCreateProgram".equals(methodName) || "glCreateShader".equals(methodName) ||
+                "glGetShaderi".equals(methodName) || "glGetUniformLocation".equals(methodName) ||
+                "glGetAttribLocation".equals(methodName)) {
+                return factory.Type().INTEGER_PRIMITIVE;
+            }
+            // MemoryStack methods
+            if ("stackPush".equals(methodName) && typeQn != null && typeQn.contains("MemoryStack")) {
+                // stackPush() returns MemoryStack (the class itself)
+                return factory.Type().createReference("org.lwjgl.system.MemoryStack");
+            }
+            if ("malloc".equals(methodName) || "calloc".equals(methodName) || 
+                "nmalloc".equals(methodName) || "ncalloc".equals(methodName)) {
+                // MemoryStack allocation methods return long (pointer)
+                return factory.Type().LONG_PRIMITIVE;
+            }
+            // MemoryUtil methods
+            if ("memAlloc".equals(methodName) || "memRealloc".equals(methodName) ||
+                "memAddress".equals(methodName)) {
+                return factory.Type().LONG_PRIMITIVE;
+            }
+            // Vulkan methods
+            if ("vkCreateInstance".equals(methodName) || "vkEnumeratePhysicalDevices".equals(methodName) ||
+                "vkCreateDevice".equals(methodName) || "vkCreateSwapchainKHR".equals(methodName) ||
+                "vkGetSwapchainImagesKHR".equals(methodName) || "vkCreateImageView".equals(methodName) ||
+                "vkCreateRenderPass".equals(methodName) || "vkCreateFramebuffer".equals(methodName) ||
+                "vkCreateCommandPool".equals(methodName) || "vkAllocateCommandBuffers".equals(methodName) ||
+                "vkBeginCommandBuffer".equals(methodName) || "vkQueueSubmit".equals(methodName) ||
+                "vkQueuePresentKHR".equals(methodName) || "vkCheckFramebufferStatus".equals(methodName)) {
+                return factory.Type().INTEGER_PRIMITIVE;
+            }
+        }
+        
         if ("get".equals(methodName) && methodName.length() == 3) {
             // Generic get() method - return Object for shims
             return factory.Type().createReference("java.lang.Object");
@@ -2436,7 +2927,7 @@ public class ShimGenerator {
     /**
      * Infer parameter types based on method name.
      */
-    private List<CtTypeReference<?>> inferParameterTypes(String methodName, String typeQn) {
+    private List<CtTypeReference<?>> inferParameterTypes(String methodName, String typeQn, CtType<?> ownerType) {
         List<CtTypeReference<?>> params = new ArrayList<>();
 
         // Special handling for reactive types (Mono, Flux)
@@ -2520,6 +3011,38 @@ public class ShimGenerator {
             // StringUtils methods - might take String parameter
             if ("trim".equals(methodName)) {
                 params.add(factory.Type().createReference("java.lang.String"));
+            }
+        }
+        
+        // Android LiveData methods
+        if (typeQn != null && typeQn.contains("LiveData")) {
+            if ("observe".equals(methodName)) {
+                // observe(LifecycleOwner, Observer<T>)
+                // Use Object types to avoid dependency on LifecycleOwner/Observer if not available
+                params.add(factory.Type().createReference("java.lang.Object")); // LifecycleOwner
+                params.add(factory.Type().createReference("java.lang.Object")); // Observer<T>
+            } else if ("observeForever".equals(methodName)) {
+                // observeForever(Observer<T>)
+                params.add(factory.Type().createReference("java.lang.Object")); // Observer<T>
+            } else if ("removeObserver".equals(methodName)) {
+                // removeObserver(Observer<T>)
+                params.add(factory.Type().createReference("java.lang.Object")); // Observer<T>
+            } else if ("setValue".equals(methodName) || "postValue".equals(methodName)) {
+                // setValue(T value) or postValue(T value)
+                // Use the class's type parameter T if it exists
+                if (ownerType instanceof CtClass) {
+                    CtClass<?> cls = (CtClass<?>) ownerType;
+                    if (!cls.getFormalCtTypeParameters().isEmpty()) {
+                        CtTypeParameterReference typeParamT = factory.Core().createTypeParameterReference();
+                        typeParamT.setSimpleName("T");
+                        params.add(typeParamT);
+                    } else {
+                        // No type parameter, use Object
+                        params.add(factory.Type().createReference("java.lang.Object"));
+                    }
+                } else {
+                    params.add(factory.Type().createReference("java.lang.Object"));
+                }
             }
         } else if ("assertEquals".equals(methodName) || "assertNotNull".equals(methodName) ||
                 "assertTrue".equals(methodName) || "assertFalse".equals(methodName)) {
