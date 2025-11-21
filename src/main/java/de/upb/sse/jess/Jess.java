@@ -65,6 +65,14 @@ public class Jess {
     private final Stubber stubber;
     private String lastCompilationErrors; // Store last compilation error messages
 
+    /**
+     * Get the last compilation error messages (if any).
+     * @return Compilation error messages, or null if compilation succeeded or no errors were captured
+     */
+    public String getLastCompilationErrors() {
+        return lastCompilationErrors;
+    }
+
     private static final Logger logger = Logger.getLogger(Jess.class.getName());
 
     public Jess() {
@@ -166,7 +174,9 @@ public class Jess {
             Slicer slicer = new Slicer(config, getFullyQualifiedRootName(this.cleanRoot), symbolSolver, annotatedUnits);
             Map<String, CompilationUnit> types = slicer.slice();
 
-            System.out.println("\n== SLICED TYPES (before stubbing) ==");
+            System.out.println("\n==================================================================================");
+            System.out.println("2. SLICED CODE");
+            System.out.println("==================================================================================");
             types.forEach((fqn, cu) -> {
                 System.out.println("// " + fqn);
                 String code = cu.toString();
@@ -202,19 +212,7 @@ public class Jess {
                 boolean successfulPreCompilation = compile(targetClass, classOutput, true);
                 if (successfulPreCompilation) return 0;
 
-
-
                 int created = this.stubber.run(Paths.get(SRC_OUTPUT), this.jarPaths);
-                System.out.println("\n== SLICED TYPES (after stubbing) ==");
-                List<String> javaFiles = de.upb.sse.jess.util.FileUtil.getAllJavaFiles(SRC_OUTPUT);
-                for (String path : javaFiles) {
-                    // Skip the original target file if you want, or print all
-                    String code = java.nio.file.Files.readString(java.nio.file.Path.of(path));
-                    System.out.println("// " + path.replace(SRC_OUTPUT + "/", ""));
-                    System.out.println(code.length() > 2000 ? code.substring(0, 2000) + "\n...[truncated]..." : code);
-                    System.out.println();
-                }
-
             }
 
             // Compile sliced files and capture errors

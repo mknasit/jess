@@ -30,6 +30,14 @@ import java.util.stream.Collectors;
  */
 public class RepositoryProcessor {
 
+    /**
+     * Selection mode for choosing methods to process.
+     */
+    public enum SelectionMode {
+        RANDOM,      // Random selection with seed (reproducible)
+        SEQUENTIAL   // Sequential selection (first N methods in order)
+    }
+
     private final String projectDir;
     private final List<String> sourceRoots;
     private final List<String> classpathJars;
@@ -40,6 +48,7 @@ public class RepositoryProcessor {
     private final int maxMethodsToProcess;  // -1 means unlimited
     private final int minimumLoc;  // Minimum lines of code (default: 3, actual threshold: minimumLoc + 2 = 5)
     private final Random random;  // Random number generator with fixed seed (same as experiment: 1234)
+    private final SelectionMode selectionMode;  // How to select methods (RANDOM or SEQUENTIAL)
 
     // Statistics
     private final AtomicInteger totalMethods = new AtomicInteger(0);
@@ -63,7 +72,7 @@ public class RepositoryProcessor {
      * Uses random selection with fixed seed (1234) to match experiment setup.
      */
     public RepositoryProcessor(String projectDir, List<String> sourceRoots, List<String> classpathJars) {
-        this(projectDir, sourceRoots, classpathJars, -1, 3);  // -1 means unlimited, default MINIMUM_LOC = 3
+        this(projectDir, sourceRoots, classpathJars, -1, 3, SelectionMode.RANDOM);  // -1 means unlimited, default MINIMUM_LOC = 3
     }
 
     /**
@@ -72,7 +81,7 @@ public class RepositoryProcessor {
      * Uses random selection with fixed seed (1234) to match experiment setup.
      */
     public RepositoryProcessor(String projectDir, List<String> sourceRoots, List<String> classpathJars, int maxMethodsToProcess) {
-        this(projectDir, sourceRoots, classpathJars, maxMethodsToProcess, 3);  // Default MINIMUM_LOC = 3
+        this(projectDir, sourceRoots, classpathJars, maxMethodsToProcess, 3, SelectionMode.RANDOM);  // Default MINIMUM_LOC = 3
     }
 
     /**
@@ -86,13 +95,28 @@ public class RepositoryProcessor {
      * @param minimumLoc Minimum lines of code (actual threshold will be minimumLoc + 2)
      */
     public RepositoryProcessor(String projectDir, List<String> sourceRoots, List<String> classpathJars, int maxMethodsToProcess, int minimumLoc) {
+        this(projectDir, sourceRoots, classpathJars, maxMethodsToProcess, minimumLoc, SelectionMode.RANDOM);
+    }
+
+    /**
+     * Create a RepositoryProcessor with method limit, minimum LOC threshold, and selection mode.
+     *
+     * @param projectDir Project directory path
+     * @param sourceRoots List of source root directories
+     * @param classpathJars List of classpath JAR files
+     * @param maxMethodsToProcess Maximum number of methods to process (-1 for unlimited)
+     * @param minimumLoc Minimum lines of code (actual threshold will be minimumLoc + 2)
+     * @param selectionMode Selection mode: RANDOM (with seed 1234) or SEQUENTIAL (first N methods)
+     */
+    public RepositoryProcessor(String projectDir, List<String> sourceRoots, List<String> classpathJars, int maxMethodsToProcess, int minimumLoc, SelectionMode selectionMode) {
         this.projectDir = projectDir;
         this.sourceRoots = sourceRoots;
         this.classpathJars = classpathJars;
         this.projectPath = Paths.get(projectDir);
         this.maxMethodsToProcess = maxMethodsToProcess;
         this.minimumLoc = minimumLoc;
-        // Use same random seed as experiment setup for reproducibility
+        this.selectionMode = selectionMode;
+        // Use same random seed as experiment setup for reproducibility (only used if RANDOM mode)
         this.random = new Random(1234);
 
         // Use PackageFinder to get source roots (same as experiment setup: RandomJessHandler.compileAll)
@@ -101,13 +125,13 @@ public class RepositoryProcessor {
         if (sourceRoots != null && !sourceRoots.isEmpty()) {
             // Convert provided source roots to Set<String> (absolute paths)
             packagesSet = new HashSet<>();
-        for (String sourceRoot : sourceRoots) {
-            Path sourceRootPath = Paths.get(sourceRoot);
-            if (sourceRootPath.isAbsolute()) {
+            for (String sourceRoot : sourceRoots) {
+                Path sourceRootPath = Paths.get(sourceRoot);
+                if (sourceRootPath.isAbsolute()) {
                     packagesSet.add(sourceRoot);
-            } else {
-                // Resolve relative path against project directory
-                Path absolutePath = projectPath.resolve(sourceRoot).normalize();
+                } else {
+                    // Resolve relative path against project directory
+                    Path absolutePath = projectPath.resolve(sourceRoot).normalize();
                     packagesSet.add(absolutePath.toString());
                 }
             }
@@ -146,9 +170,14 @@ public class RepositoryProcessor {
         System.out.println("Source Roots: " + sourceRoots);
         System.out.println("Classpath Jars: " + classpathJars);
         System.out.println("Minimum LOC: " + minimumLoc + " (actual threshold: " + (minimumLoc + 2) + " lines)");
-        System.out.println("Random Selection: Enabled (seed=1234, same as experiment setup)");
+        if (selectionMode == SelectionMode.RANDOM) {
+            System.out.println("Selection Mode: RANDOM (seed=1234, same as experiment setup)");
+        } else {
+            System.out.println("Selection Mode: SEQUENTIAL (first N methods in order)");
+        }
         if (maxMethodsToProcess > 0) {
-            System.out.println("Method Limit: " + maxMethodsToProcess + " methods (randomly selected)");
+            System.out.println("Method Limit: " + maxMethodsToProcess + " methods (" + 
+                (selectionMode == SelectionMode.RANDOM ? "randomly selected" : "sequentially selected") + ")");
         } else {
             System.out.println("Method Limit: Unlimited (all methods will be processed)");
         }
@@ -180,10 +209,13 @@ public class RepositoryProcessor {
         System.out.println("Collected " + allMethods.size() + " methods (after filtering)");
         System.out.println();
 
-        // STEP 3: Randomly select methods (same as experiment: getRandomClassMethodPairs)
-        List<MethodToProcess> methodsToProcess = getRandomMethods(allMethods);
+        // STEP 3: Select methods based on selection mode
+        List<MethodToProcess> methodsToProcess = selectMethods(allMethods);
 
-        System.out.println("Selected " + methodsToProcess.size() + " methods to process (random selection with seed 1234)");
+        String selectionDesc = selectionMode == SelectionMode.RANDOM 
+            ? "random selection with seed 1234" 
+            : "sequential selection (first N methods)";
+        System.out.println("Selected " + methodsToProcess.size() + " methods to process (" + selectionDesc + ")");
         System.out.println();
 
         // STEP 4: Process selected methods (source roots are used here for compilation)
@@ -360,33 +392,38 @@ public class RepositoryProcessor {
     }
 
     /**
-     * Randomly select methods to process (same logic as experiment's getRandomClassMethodPairs).
-     * Uses fixed seed (1234) for reproducibility.
+     * Select methods to process based on selection mode.
+     * RANDOM: Randomly select methods (same logic as experiment's getRandomClassMethodPairs).
+     * SEQUENTIAL: Select first N methods in order.
      */
-    private List<MethodToProcess> getRandomMethods(List<MethodToProcess> allMethods) {
+    private List<MethodToProcess> selectMethods(List<MethodToProcess> allMethods) {
         if (maxMethodsToProcess <= 0 || allMethods.size() <= maxMethodsToProcess) {
             // Process all methods (no limit or not enough methods)
             return new ArrayList<>(allMethods);
         }
 
-        // Randomly select methods (same as experiment)
-        List<MethodToProcess> randomMethods = new ArrayList<>();
-        int collisions = 0;
-        for (int i = 0; i < maxMethodsToProcess; i++) {
-            int randomIdx = random.nextInt(allMethods.size());
-            MethodToProcess randomMethod = allMethods.get(randomIdx);
-            if (randomMethods.contains(randomMethod)) {
-                i--;  // Try again if duplicate
-                collisions++;
-                if (collisions > maxMethodsToProcess) {
-                    break;  // Avoid infinite loop
+        if (selectionMode == SelectionMode.SEQUENTIAL) {
+            // Sequential selection: return first N methods
+            return new ArrayList<>(allMethods.subList(0, Math.min(maxMethodsToProcess, allMethods.size())));
+        } else {
+            // Random selection (same as experiment)
+            List<MethodToProcess> randomMethods = new ArrayList<>();
+            int collisions = 0;
+            for (int i = 0; i < maxMethodsToProcess; i++) {
+                int randomIdx = random.nextInt(allMethods.size());
+                MethodToProcess randomMethod = allMethods.get(randomIdx);
+                if (randomMethods.contains(randomMethod)) {
+                    i--;  // Try again if duplicate
+                    collisions++;
+                    if (collisions > maxMethodsToProcess) {
+                        break;  // Avoid infinite loop
+                    }
+                    continue;
                 }
-                continue;
+                randomMethods.add(randomMethod);
             }
-            randomMethods.add(randomMethod);
+            return randomMethods;
         }
-
-        return randomMethods;
     }
 
     /**

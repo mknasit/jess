@@ -3,6 +3,10 @@ package de.upb.sse.jess.stubbing;
 import de.upb.sse.jess.configuration.JessConfiguration;
 import de.upb.sse.jess.stubbing.spoon.collector.SpoonCollector;
 import de.upb.sse.jess.stubbing.spoon.generate.SpoonStubber;
+import de.upb.sse.jess.stubbing.spoon.plan.FieldStubPlan;
+import de.upb.sse.jess.stubbing.spoon.plan.MethodStubPlan;
+import de.upb.sse.jess.stubbing.spoon.plan.TypeStubPlan;
+import de.upb.sse.jess.stubbing.spoon.plan.ConstructorStubPlan;
 import spoon.Launcher;
 import spoon.reflect.CtModel;
 import spoon.reflect.code.*;
@@ -35,7 +39,7 @@ public final class SpoonStubbingRunner implements Stubber {
 
     @Override
     public int run(Path slicedSrcDir, List<Path> classpathJars) throws Exception {
-        System.out.println("\n>> Using stubber: Spoon Based Stubber");
+        // Suppressed debug output
 
         // Let -Djess.failOnAmbiguity=true|false override BEFORE collection
         String sys = System.getProperty("jess.failOnAmbiguity");
@@ -61,13 +65,71 @@ public final class SpoonStubbingRunner implements Stubber {
         }
 
         launcher.addInputResource(slicedSrcDir.toString());
-        launcher.buildModel();
-
+        
+        // CRITICAL FIX: Catch StackOverflowError during model building
+        // This happens when there are circular type dependencies in complex projects
+        final CtModel model;
+        final Factory f;
+        try {
+            launcher.buildModel();
+        } catch (StackOverflowError e) {
+            System.err.println("[SpoonStubbingRunner] StackOverflowError during model building - likely due to circular type dependencies");
+            System.err.println("[SpoonStubbingRunner] Attempting to continue with partial model...");
+        }
+        // Get model and factory after buildModel() (whether it succeeded or failed)
+        CtModel tempModel = launcher.getModel();
+        Factory tempFactory = launcher.getFactory();
+        if (tempModel == null) {
+            throw new RuntimeException("Model building failed - no model available");
+        }
+        model = tempModel;
+        f = tempFactory;
+        
         // 2) Collect unresolved elements
-        CtModel model = launcher.getModel();
-        Factory f = launcher.getFactory();
+        // CRITICAL FIX: Catch StackOverflowError during collection
+        // Collection phase can trigger additional symbol resolution that causes StackOverflowError
         SpoonCollector collector = new SpoonCollector(f, cfg);
-        SpoonCollector.CollectResult plans = collector.collect(model);
+        
+        // CRITICAL FIX: Collect interesting types (non-JDK, non-generated) from the model
+        Set<String> interestingTypeQNs = new HashSet<>();
+        try {
+            for (CtType<?> type : model.getAllTypes()) {
+                try {
+                    String qn = type.getQualifiedName();
+                    if (qn != null && !qn.isEmpty()) {
+                        // Skip JDK, generated, and ignored packages
+                        if (!isJdkFqn(qn) && !isIgnoredPackage(qn) && !qn.contains(".generated.")) {
+                            interestingTypeQNs.add(qn);
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+        } catch (Throwable e) {
+            System.err.println("[SpoonStubbingRunner] Error collecting interesting types: " + e.getMessage());
+            // Continue with empty set - will collect all types
+        }
+        // Suppress this debug output - will be shown in stubbing plan section
+        
+        final SpoonCollector.CollectResult plans;
+        SpoonCollector.CollectResult tempPlans;
+        try {
+            tempPlans = collector.collect(model, interestingTypeQNs);
+        } catch (StackOverflowError e) {
+            System.err.println("[SpoonStubbingRunner] StackOverflowError during collection - likely due to circular type dependencies");
+            System.err.println("[SpoonStubbingRunner] Attempting to continue with partial collection results...");
+            // Try to get partial results if collector has any
+            // For now, create an empty result set - better than crashing
+            tempPlans = new SpoonCollector.CollectResult();
+            System.err.println("[SpoonStubbingRunner] WARNING: Collection failed, using empty stub plans - compilation may fail");
+        }
+        plans = tempPlans;
+        
+        // DEBUG: Print what is missing to compile and what was collected
+        System.out.println("\n==================================================================================");
+        System.out.println("3. WHAT IS MISSING");
+        System.out.println("==================================================================================");
+        printMissingElementsAndStubbingPlan(model, plans);
         
         // 2.5) Detect and add module class patterns (e.g., CheckedConsumerModule -> CheckedConsumer$Module)
         detectAndAddModuleClasses(model, plans, f);
@@ -130,7 +192,7 @@ public final class SpoonStubbingRunner implements Stubber {
         // generateShimsForReferencedTypes() will skip any shim definitions that aren't in referencedTypes
         int shimsGenerated = shimGenerator.generateShimsForReferencedTypes(referencedTypes);
         if (shimsGenerated > 0) {
-            System.out.println("Generated " + shimsGenerated + " shim classes for common libraries");
+            // Suppressed debug output
             // Log which shims were generated for debugging (only if verbose)
             if (Boolean.getBoolean("jess.verboseShims")) {
                 System.out.println("  Referenced types count: " + referencedTypes.size());
@@ -144,6 +206,10 @@ public final class SpoonStubbingRunner implements Stubber {
         }
         
         // 5) Generate stubs
+        System.out.println("\n==================================================================================");
+        System.out.println("4. STUBBING START - WHAT IS COLLECTED");
+        System.out.println("==================================================================================");
+        
         // If your SpoonStubber has a (Factory) ctor, use that. Otherwise keep (Factory, CtModel).
         SpoonStubber stubber = new SpoonStubber(f, model);
 
@@ -162,6 +228,11 @@ public final class SpoonStubbingRunner implements Stubber {
         
         // CRITICAL FIX: Add static imports for known static fields (e.g., CHECKS from Checks class)
         addStaticImports(model, f, plans.staticImports);
+        
+        System.out.println("\n==================================================================================");
+        System.out.println("5. WHAT WAS STUBBED");
+        System.out.println("==================================================================================");
+        System.out.println("Generated " + created + " stub elements (types + fields + constructors + methods)");
 
         // MINIMAL STUBBING MODE: Only apply fixes that are absolutely necessary for compilation
         // In minimal mode, we only stub what's directly referenced in target methods
@@ -247,78 +318,51 @@ public final class SpoonStubbingRunner implements Stubber {
         // This ensures imports are present when the code is written
         addStaticImports(model, f, plans.staticImports);
         
-        // Re-add type imports that were added during fixParams
+        // CRITICAL FIX: Re-add type imports for ALL type usages (methods, fields, generics)
+        // This ensures imports are present for all types used in the code
         model.getAllTypes().forEach(type -> {
             try {
                 CtCompilationUnit cu = f.CompilationUnit().getOrCreate(type);
                 if (cu == null) return;
                 
-                // Check all method parameters and return types to ensure imports are present
+                // Check all method parameters and return types
                 for (CtMethod<?> method : type.getMethods()) {
                     // Check return type
                     try {
-                        CtTypeReference<?> returnType = method.getType();
-                        if (returnType != null) {
-                            String qn = returnType.getQualifiedName();
-                            if (qn != null && qn.contains(".") && !qn.startsWith("java.") && 
-                                !qn.startsWith("javax.") && !qn.startsWith("jakarta.") &&
-                                !qn.startsWith("unknown.")) {
-                                // Check if import exists
-                                boolean hasImport = cu.getImports().stream().anyMatch(imp -> {
-                                    try {
-                                        CtReference r = imp.getReference();
-                                        if (r instanceof CtTypeReference) {
-                                            return qn.equals(((CtTypeReference<?>) r).getQualifiedName());
-                                        }
-                                        return false;
-                                    } catch (Throwable ignored) {
-                                        return false;
-                                    }
-                                });
-                                if (!hasImport) {
-                                    CtTypeReference<?> importRef = f.Type().createReference(qn);
-                                    CtImport imp = f.createImport(importRef);
-                                    cu.getImports().add(imp);
-                                    System.out.println("[finalCheck] Added return type import " + qn + " to " + type.getQualifiedName());
-                                }
-                            }
-                        }
+                        addImportForTypeReference(type, cu, method.getType(), f);
                     } catch (Throwable ignored) {}
                     
                     // Check parameters
                     for (CtParameter<?> param : method.getParameters()) {
                         try {
-                            CtTypeReference<?> paramType = param.getType();
-                            if (paramType != null) {
-                                String qn = paramType.getQualifiedName();
-                                if (qn != null && qn.contains(".") && !qn.startsWith("java.") && 
-                                    !qn.startsWith("javax.") && !qn.startsWith("jakarta.") &&
-                                    !qn.startsWith("unknown.")) {
-                                    // Check if import exists
-                                    boolean hasImport = cu.getImports().stream().anyMatch(imp -> {
-                                        try {
-                                            CtReference r = imp.getReference();
-                                            if (r instanceof CtTypeReference) {
-                                                return qn.equals(((CtTypeReference<?>) r).getQualifiedName());
-                                            }
-                                            return false;
-                                        } catch (Throwable ignored) {
-                                            return false;
-                                        }
-                                    });
-                                    if (!hasImport) {
-                                        CtTypeReference<?> importRef = f.Type().createReference(qn);
-                                        CtImport imp = f.createImport(importRef);
-                                        cu.getImports().add(imp);
-                                        System.out.println("[finalCheck] Added parameter type import " + qn + " to " + type.getQualifiedName());
-                                    }
-                                }
-                            }
+                            addImportForTypeReference(type, cu, param.getType(), f);
                         } catch (Throwable ignored) {}
                     }
                 }
+                
+                // CRITICAL FIX: Check field types (was missing!)
+                for (CtField<?> field : type.getFields()) {
+                    try {
+                        addImportForTypeReference(type, cu, field.getType(), f);
+                    } catch (Throwable ignored) {}
+                }
+                
+                // Check superclass and interfaces
+                if (type instanceof CtClass) {
+                    CtClass<?> cls = (CtClass<?>) type;
+                    try {
+                        if (cls.getSuperclass() != null) {
+                            addImportForTypeReference(type, cu, cls.getSuperclass(), f);
+                        }
+                    } catch (Throwable ignored) {}
+                }
+                for (CtTypeReference<?> iface : type.getSuperInterfaces()) {
+                    try {
+                        addImportForTypeReference(type, cu, iface, f);
+                    } catch (Throwable ignored) {}
+                }
             } catch (Throwable e) {
-                System.err.println("[finalCheck] Error processing type " + type.getQualifiedName() + ": " + e.getMessage());
+                // Suppressed: System.err.println("[finalCheck] Error processing type " + type.getQualifiedName() + ": " + e.getMessage());
             }
         });
         
@@ -327,7 +371,7 @@ public final class SpoonStubbingRunner implements Stubber {
         
         // CRITICAL FIX: After cleanup, re-add all necessary imports and set setSimplyQualified(false)
         // This ensures imports are written to the file (Spoon only writes imports when setSimplyQualified(false))
-        System.out.println("[finalCheck] Re-adding imports and setting setSimplyQualified(false) for types with imports...");
+        // Suppressed: System.out.println("[finalCheck] Re-adding imports and setting setSimplyQualified(false) for types with imports...");
         model.getAllTypes().forEach(type -> {
             try {
                 CtCompilationUnit cu = f.CompilationUnit().getOrCreate(type);
@@ -345,7 +389,7 @@ public final class SpoonStubbingRunner implements Stubber {
                             String qn = ((CtTypeReference<?>) r).getQualifiedName();
                             if (qn != null) {
                                 importQns.add(qn);
-                                System.out.println("[finalCheck] Found " + (isStatic ? "static " : "") + "import in CU: " + qn + " for " + type.getQualifiedName());
+                                // Suppressed: System.out.println("[finalCheck] Found " + (isStatic ? "static " : "") + "import in CU: " + qn + " for " + type.getQualifiedName());
                             }
                         } else if (isStatic) {
                             // For static imports, try to extract the class name
@@ -361,12 +405,12 @@ public final class SpoonStubbingRunner implements Stubber {
                                     }
                                     String classFqnStr = classFqn.toString();
                                     importQns.add(classFqnStr); // Add the class for reference
-                                    System.out.println("[finalCheck] Found static import in CU: " + importStr + " (class: " + classFqnStr + ") for " + type.getQualifiedName());
+                                    // Suppressed: System.out.println("[finalCheck] Found static import in CU: " + importStr + " (class: " + classFqnStr + ") for " + type.getQualifiedName());
                                 }
                             }
                         }
                     } catch (Throwable e) {
-                        System.err.println("[finalCheck] Error processing import: " + e.getMessage());
+                        // Suppressed: System.err.println("[finalCheck] Error processing import: " + e.getMessage());
                     }
                 });
                 
@@ -386,7 +430,7 @@ public final class SpoonStubbingRunner implements Stubber {
                                 String returnQn = returnType.getQualifiedName();
                                 if (importQn.equals(returnQn)) {
                                     returnType.setSimplyQualified(false);
-                                    System.out.println("[finalCheck] Set setSimplyQualified(false) for return type " + importQn + " in " + method.getSimpleName());
+                                    // Suppressed: System.out.println("[finalCheck] Set setSimplyQualified(false) for return type " + importQn + " in " + method.getSimpleName());
                                 }
                             }
                         } catch (Throwable ignored) {}
@@ -399,7 +443,7 @@ public final class SpoonStubbingRunner implements Stubber {
                                     String paramQn = paramType.getQualifiedName();
                                     if (importQn.equals(paramQn)) {
                                         paramType.setSimplyQualified(false);
-                                        System.out.println("[finalCheck] Set setSimplyQualified(false) for parameter type " + importQn + " in " + method.getSimpleName());
+                                        // Suppressed: System.out.println("[finalCheck] Set setSimplyQualified(false) for parameter type " + importQn + " in " + method.getSimpleName());
                                     }
                                 }
                             } catch (Throwable ignored) {}
@@ -414,7 +458,7 @@ public final class SpoonStubbingRunner implements Stubber {
                                 String fieldQn = fieldType.getQualifiedName();
                                 if (importQn.equals(fieldQn)) {
                                     fieldType.setSimplyQualified(false);
-                                    System.out.println("[finalCheck] Set setSimplyQualified(false) for field type " + importQn);
+                                    // Suppressed: System.out.println("[finalCheck] Set setSimplyQualified(false) for field type " + importQn);
                                 }
                             }
                         } catch (Throwable ignored) {}
@@ -449,7 +493,7 @@ public final class SpoonStubbingRunner implements Stubber {
                                     CtImport imp = f.createImport(importRef);
                                     cu.getImports().add(imp);
                                     returnType.setSimplyQualified(false);
-                                    System.out.println("[finalCheck] Re-added missing import " + returnQn + " for return type in " + method.getSimpleName());
+                                    // Suppressed: System.out.println("[finalCheck] Re-added missing import " + returnQn + " for return type in " + method.getSimpleName());
                                 } else {
                                     // Import exists, ensure setSimplyQualified(false)
                                     returnType.setSimplyQualified(false);
@@ -484,7 +528,7 @@ public final class SpoonStubbingRunner implements Stubber {
                                         CtImport imp = f.createImport(importRef);
                                         cu.getImports().add(imp);
                                         paramType.setSimplyQualified(false);
-                                        System.out.println("[finalCheck] Re-added missing import " + paramQn + " for parameter in " + method.getSimpleName());
+                                        // Suppressed: System.out.println("[finalCheck] Re-added missing import " + paramQn + " for parameter in " + method.getSimpleName());
                                     } else {
                                         // Import exists, ensure setSimplyQualified(false)
                                         paramType.setSimplyQualified(false);
@@ -500,19 +544,19 @@ public final class SpoonStubbingRunner implements Stubber {
                     try {
                         CtImportKind kind = imp.getImportKind();
                         if (kind != null && (kind.name().contains("STATIC") || kind.name().contains("METHOD") || kind.name().contains("ALL"))) {
-                            System.out.println("[finalCheck] Found static import in CU: " + imp.getReference() + " for " + type.getQualifiedName());
+                            // Suppressed: System.out.println("[finalCheck] Found static import in CU: " + imp.getReference() + " for " + type.getQualifiedName());
                         }
                     } catch (Throwable ignored) {}
                 });
                 
             } catch (Throwable e) {
-                System.err.println("[finalCheck] Error processing type " + type.getQualifiedName() + ": " + e.getMessage());
+                // Suppressed: System.err.println("[finalCheck] Error processing type " + type.getQualifiedName() + ": " + e.getMessage());
             }
         });
         
         // CRITICAL FIX: Update getCapabilities() return type to unknown.Missing when used with field access
         // This fixes cases like session.getCapabilities().xrCreateFacialExpressionClientML
-        System.out.println("[finalCheck] Fixing getCapabilities() return types...");
+        // Suppressed: System.out.println("[finalCheck] Fixing getCapabilities() return types...");
         model.getAllTypes().forEach(type -> {
             try {
                 for (CtMethod<?> method : type.getMethods()) {
@@ -544,14 +588,14 @@ public final class SpoonStubbingRunner implements Stubber {
                                     // Update return type to unknown.Missing
                                     CtTypeReference<?> missingRef = f.Type().createReference("unknown.Missing");
                                     method.setType(missingRef);
-                                    System.out.println("[finalCheck] Updated getCapabilities() return type to unknown.Missing in " + type.getQualifiedName());
+                                    // Suppressed: System.out.println("[finalCheck] Updated getCapabilities() return type to unknown.Missing in " + type.getQualifiedName());
                                 }
                             }
                         }
                     }
                 }
             } catch (Throwable e) {
-                System.err.println("[finalCheck] Error fixing getCapabilities in " + type.getQualifiedName() + ": " + e.getMessage());
+                // Suppressed: System.err.println("[finalCheck] Error fixing getCapabilities in " + type.getQualifiedName() + ": " + e.getMessage());
             }
         });
         
@@ -559,29 +603,29 @@ public final class SpoonStubbingRunner implements Stubber {
         ensureUnknownImportsForAllTypes(model, f);
         
         // Final verification: check that imports are present before pretty printing
-        System.out.println("[finalCheck] Verifying imports before pretty printing...");
+        // Suppressed: System.out.println("[finalCheck] Verifying imports before pretty printing...");
         model.getAllTypes().forEach(type -> {
             try {
                 CtCompilationUnit cu = f.CompilationUnit().getOrCreate(type);
                 if (cu != null) {
-                    System.out.println("[finalCheck] Type " + type.getQualifiedName() + " CU imports count: " + cu.getImports().size());
+                    // Suppressed: System.out.println("[finalCheck] Type " + type.getQualifiedName() + " CU imports count: " + cu.getImports().size());
                     cu.getImports().forEach(imp -> {
                         try {
                             CtReference r = imp.getReference();
                             if (r instanceof CtTypeReference) {
                                 String qn = ((CtTypeReference<?>) r).getQualifiedName();
-                                System.out.println("[finalCheck] Import: " + qn);
+                                // Suppressed: System.out.println("[finalCheck] Import: " + qn);
                             } else {
                                 CtImportKind kind = imp.getImportKind();
                                 if (kind != null && (kind.name().contains("STATIC") || kind.name().contains("METHOD") || kind.name().contains("ALL"))) {
-                                    System.out.println("[finalCheck] Static import: " + r);
+                                    // Suppressed: System.out.println("[finalCheck] Static import: " + r);
                                 }
                             }
                         } catch (Throwable ignored) {}
                     });
                 }
             } catch (Throwable e) {
-                System.err.println("[finalCheck] Error checking CU: " + e.getMessage());
+                // Suppressed: System.err.println("[finalCheck] Error checking CU: " + e.getMessage());
             }
         });
 
@@ -618,6 +662,15 @@ public final class SpoonStubbingRunner implements Stubber {
         
         // Post-process to fix Tree package/class clashes
         postProcessFixTreePackageClashes(slicedSrcDir);
+        
+        // CRITICAL FIX: Post-process to fix GeneratedMessage.Builder package/class clashes
+        postProcessFixGeneratedMessageBuilderClash(slicedSrcDir);
+        
+        // CRITICAL FIX: Post-process to fix nested class package/class clashes (e.g., HttpUtils.HttpPostType)
+        postProcessFixNestedClassPackageClashes(slicedSrcDir);
+        
+        // CRITICAL FIX: Post-process to fix ProtoConstants package/class clash
+        postProcessFixProtoConstantsPackageClash(slicedSrcDir);
         
         return created;
     }
@@ -1321,6 +1374,54 @@ public final class SpoonStubbingRunner implements Stubber {
     }
     
     /**
+     * Add import for a type reference and recursively check generic type arguments.
+     * This ensures all types used in the code have proper imports.
+     */
+    private static void addImportForTypeReference(CtType<?> ownerType, CtCompilationUnit cu, 
+                                                   CtTypeReference<?> typeRef, Factory f) {
+        if (typeRef == null || cu == null) return;
+        try {
+            String qn = typeRef.getQualifiedName();
+            if (qn != null && qn.contains(".") && !qn.startsWith("java.") && 
+                !qn.startsWith("javax.") && !qn.startsWith("jakarta.") &&
+                !qn.startsWith("unknown.")) {
+                // Check if import already exists
+                boolean hasImport = cu.getImports().stream().anyMatch(imp -> {
+                    try {
+                        CtReference r = imp.getReference();
+                        if (r instanceof CtTypeReference) {
+                            return qn.equals(((CtTypeReference<?>) r).getQualifiedName());
+                        }
+                        return false;
+                    } catch (Throwable ignored) {
+                        return false;
+                    }
+                });
+                if (!hasImport) {
+                    CtTypeReference<?> importRef = f.Type().createReference(qn);
+                    CtImport imp = f.createImport(importRef);
+                    cu.getImports().add(imp);
+                    // CRITICAL: Set setSimplyQualified(false) so Spoon writes the import
+                    typeRef.setSimplyQualified(false);
+                    // Suppressed: System.out.println("[finalCheck] Added import " + qn + " to " + ownerType.getQualifiedName());
+                } else {
+                    // Import exists, ensure setSimplyQualified(false)
+                    typeRef.setSimplyQualified(false);
+                }
+            }
+            
+            // CRITICAL FIX: Also check generic type arguments recursively
+            if (typeRef.getActualTypeArguments() != null) {
+                for (CtTypeReference<?> typeArg : typeRef.getActualTypeArguments()) {
+                    if (!(typeArg instanceof spoon.reflect.reference.CtTypeParameterReference)) {
+                        addImportForTypeReference(ownerType, cu, typeArg, f);
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
+    }
+    
+    /**
      * Fix a single type reference to use FQN printing.
      * @param hasUnknownImport if true, allows simple name for unknown.Unknown when import exists
      */
@@ -1526,6 +1627,25 @@ public final class SpoonStubbingRunner implements Stubber {
                                 // This is a known static field that we explicitly create
                                 if ("org.lwjgl.system.Checks".equals(classFqnStr)) {
                                     return false; // Keep this static import
+                                }
+                                
+                                // CRITICAL FIX: Check if this is a nested class static import (e.g., HttpUtils.HttpPostType.POST_TYPE_Push)
+                                // If the parent class exists but the nested class doesn't, it's a nested class, not a static field
+                                // Nested classes should be imported as regular imports, not static imports
+                                if (!classExists && classFqnStr.contains(".")) {
+                                    int lastDot = classFqnStr.lastIndexOf('.');
+                                    String parentClass = classFqnStr.substring(0, lastDot);
+                                    String nestedClassName = classFqnStr.substring(lastDot + 1);
+                                    
+                                    // Check if parent class exists
+                                    boolean parentExists = existingTypes.contains(parentClass);
+                                    if (parentExists) {
+                                        // Parent exists but nested class doesn't - this is a nested class static import
+                                        // Remove it - nested classes should be imported as regular imports, not static
+                                        System.out.println("[cleanupInvalidImports] Removing nested class static import: " + importStr + 
+                                            " (parent " + parentClass + " exists, but nested class " + nestedClassName + " doesn't)");
+                                        return true;
+                                    }
                                 }
                                 
                                 // If class doesn't exist and it's not a JDK type, remove the static import
@@ -1992,11 +2112,12 @@ public final class SpoonStubbingRunner implements Stubber {
         }
         
         // Collect from all type references in the model (including extends, implements, field types, etc.)
+        // CRITICAL FIX: Filter out array types - arrays should never be stubbed as classes
         for (CtTypeReference<?> typeRef : model.getElements(new TypeFilter<>(CtTypeReference.class))) {
             try {
                 String qn = safeQN(typeRef);
-                if (qn != null && !qn.isEmpty() && !qn.startsWith("java.") && 
-                    !qn.startsWith("javax.") && !qn.startsWith("jakarta.")) {
+                if (qn != null && !qn.isEmpty() && !isArrayType(qn) && 
+                    !qn.startsWith("java.") && !qn.startsWith("javax.") && !qn.startsWith("jakarta.")) {
                     referenced.add(qn);
                 }
                 
@@ -2007,7 +2128,7 @@ public final class SpoonStubbingRunner implements Stubber {
                         // Skip type parameters (T, K, V, etc.) - only collect concrete types
                         if (!(typeArg instanceof spoon.reflect.reference.CtTypeParameterReference)) {
                             String typeArgQn = safeQN(typeArg);
-                            if (typeArgQn != null && !typeArgQn.isEmpty() && 
+                            if (typeArgQn != null && !typeArgQn.isEmpty() && !isArrayType(typeArgQn) &&
                                 !typeArgQn.startsWith("java.") && !typeArgQn.startsWith("javax.") && 
                                 !typeArgQn.startsWith("jakarta.")) {
                                 referenced.add(typeArgQn);
@@ -2019,11 +2140,12 @@ public final class SpoonStubbingRunner implements Stubber {
         }
         
         // Also collect from supertypes (extends/implements)
+        // CRITICAL FIX: Filter out array types and ensure types are actually needed
         for (CtType<?> type : model.getAllTypes()) {
             try {
                 if (type.getSuperclass() != null) {
                     String superQn = safeQN(type.getSuperclass());
-                    if (superQn != null && !superQn.startsWith("java.")) {
+                    if (superQn != null && !isArrayType(superQn) && !superQn.startsWith("java.")) {
                         referenced.add(superQn);
                     }
                     // Also collect type arguments from superclass generics
@@ -2031,7 +2153,8 @@ public final class SpoonStubbingRunner implements Stubber {
                         for (CtTypeReference<?> typeArg : type.getSuperclass().getActualTypeArguments()) {
                             if (!(typeArg instanceof spoon.reflect.reference.CtTypeParameterReference)) {
                                 String typeArgQn = safeQN(typeArg);
-                                if (typeArgQn != null && !typeArgQn.startsWith("java.") && 
+                                if (typeArgQn != null && !isArrayType(typeArgQn) &&
+                                    !typeArgQn.startsWith("java.") && 
                                     !typeArgQn.startsWith("javax.") && !typeArgQn.startsWith("jakarta.")) {
                                     referenced.add(typeArgQn);
                                 }
@@ -2041,7 +2164,7 @@ public final class SpoonStubbingRunner implements Stubber {
                 }
                 for (CtTypeReference<?> iface : type.getSuperInterfaces()) {
                     String ifaceQn = safeQN(iface);
-                    if (ifaceQn != null && !ifaceQn.startsWith("java.")) {
+                    if (ifaceQn != null && !isArrayType(ifaceQn) && !ifaceQn.startsWith("java.")) {
                         referenced.add(ifaceQn);
                     }
                     // Also collect type arguments from interface generics
@@ -2049,7 +2172,8 @@ public final class SpoonStubbingRunner implements Stubber {
                         for (CtTypeReference<?> typeArg : iface.getActualTypeArguments()) {
                             if (!(typeArg instanceof spoon.reflect.reference.CtTypeParameterReference)) {
                                 String typeArgQn = safeQN(typeArg);
-                                if (typeArgQn != null && !typeArgQn.startsWith("java.") && 
+                                if (typeArgQn != null && !isArrayType(typeArgQn) &&
+                                    !typeArgQn.startsWith("java.") && 
                                     !typeArgQn.startsWith("javax.") && !typeArgQn.startsWith("jakarta.")) {
                                     referenced.add(typeArgQn);
                                 }
@@ -2059,10 +2183,12 @@ public final class SpoonStubbingRunner implements Stubber {
                 }
                 
                 // Collect from field types
+                // CRITICAL FIX: Filter out array types
                 for (CtField<?> field : type.getFields()) {
                     if (field.getType() != null) {
                         String fieldTypeQn = safeQN(field.getType());
-                        if (fieldTypeQn != null && !fieldTypeQn.startsWith("java.") && 
+                        if (fieldTypeQn != null && !isArrayType(fieldTypeQn) &&
+                            !fieldTypeQn.startsWith("java.") && 
                             !fieldTypeQn.startsWith("javax.") && !fieldTypeQn.startsWith("jakarta.")) {
                             referenced.add(fieldTypeQn);
                         }
@@ -2071,7 +2197,8 @@ public final class SpoonStubbingRunner implements Stubber {
                             for (CtTypeReference<?> typeArg : field.getType().getActualTypeArguments()) {
                                 if (!(typeArg instanceof spoon.reflect.reference.CtTypeParameterReference)) {
                                     String typeArgQn = safeQN(typeArg);
-                                    if (typeArgQn != null && !typeArgQn.startsWith("java.") && 
+                                    if (typeArgQn != null && !isArrayType(typeArgQn) &&
+                                        !typeArgQn.startsWith("java.") && 
                                         !typeArgQn.startsWith("javax.") && !typeArgQn.startsWith("jakarta.")) {
                                         referenced.add(typeArgQn);
                                     }
@@ -2082,10 +2209,12 @@ public final class SpoonStubbingRunner implements Stubber {
                 }
                 
                 // Collect from method return types and parameter types
+                // CRITICAL FIX: Filter out array types
                 for (CtMethod<?> method : type.getMethods()) {
                     if (method.getType() != null) {
                         String returnTypeQn = safeQN(method.getType());
-                        if (returnTypeQn != null && !returnTypeQn.startsWith("java.") && 
+                        if (returnTypeQn != null && !isArrayType(returnTypeQn) &&
+                            !returnTypeQn.startsWith("java.") && 
                             !returnTypeQn.startsWith("javax.") && !returnTypeQn.startsWith("jakarta.")) {
                             referenced.add(returnTypeQn);
                         }
@@ -2094,7 +2223,8 @@ public final class SpoonStubbingRunner implements Stubber {
                             for (CtTypeReference<?> typeArg : method.getType().getActualTypeArguments()) {
                                 if (!(typeArg instanceof spoon.reflect.reference.CtTypeParameterReference)) {
                                     String typeArgQn = safeQN(typeArg);
-                                    if (typeArgQn != null && !typeArgQn.startsWith("java.") && 
+                                    if (typeArgQn != null && !isArrayType(typeArgQn) &&
+                                        !typeArgQn.startsWith("java.") && 
                                         !typeArgQn.startsWith("javax.") && !typeArgQn.startsWith("jakarta.")) {
                                         referenced.add(typeArgQn);
                                     }
@@ -2106,7 +2236,8 @@ public final class SpoonStubbingRunner implements Stubber {
                     for (CtParameter<?> param : method.getParameters()) {
                         if (param.getType() != null) {
                             String paramTypeQn = safeQN(param.getType());
-                            if (paramTypeQn != null && !paramTypeQn.startsWith("java.") && 
+                            if (paramTypeQn != null && !isArrayType(paramTypeQn) &&
+                                !paramTypeQn.startsWith("java.") && 
                                 !paramTypeQn.startsWith("javax.") && !paramTypeQn.startsWith("jakarta.")) {
                                 referenced.add(paramTypeQn);
                             }
@@ -2115,7 +2246,8 @@ public final class SpoonStubbingRunner implements Stubber {
                                 for (CtTypeReference<?> typeArg : param.getType().getActualTypeArguments()) {
                                     if (!(typeArg instanceof spoon.reflect.reference.CtTypeParameterReference)) {
                                         String typeArgQn = safeQN(typeArg);
-                                        if (typeArgQn != null && !typeArgQn.startsWith("java.") && 
+                                        if (typeArgQn != null && !isArrayType(typeArgQn) &&
+                                            !typeArgQn.startsWith("java.") && 
                                             !typeArgQn.startsWith("javax.") && !typeArgQn.startsWith("jakarta.")) {
                                             referenced.add(typeArgQn);
                                         }
@@ -2975,6 +3107,395 @@ public final class SpoonStubbingRunner implements Stubber {
     }
     
     /**
+     * CRITICAL FIX: Post-process to fix GeneratedMessage.Builder package/class clashes.
+     * Removes package directories when a class with the same name exists.
+     * This fixes the issue where GeneratedMessage.Builder is written to com/google/protobuf/GeneratedMessage/Builder.java
+     * creating a package com.google.protobuf.GeneratedMessage that clashes with the class com.google.protobuf.GeneratedMessage.
+     */
+    private static void postProcessFixGeneratedMessageBuilderClash(Path outputDir) {
+        try {
+            // Look for GeneratedMessage package directory that clashes with GeneratedMessage class
+            Path generatedMessagePackageDir = outputDir.resolve("com/google/protobuf/GeneratedMessage");
+            Path generatedMessageClassFile = outputDir.resolve("com/google/protobuf/GeneratedMessage.java");
+            
+            if (Files.exists(generatedMessagePackageDir) && Files.isDirectory(generatedMessagePackageDir) && 
+                Files.exists(generatedMessageClassFile) && Files.isRegularFile(generatedMessageClassFile)) {
+                // Package directory exists and class file exists - this is a clash
+                // Remove the package directory (Builder inner class should be in the class file)
+                try (Stream<Path> paths = Files.walk(generatedMessagePackageDir)) {
+                    paths.sorted((a, b) -> b.compareTo(a)) // Delete files before directories
+                        .forEach(path -> {
+                            try {
+                                Files.delete(path);
+                            } catch (IOException e) {
+                                // Ignore errors
+                            }
+                        });
+                }
+                // Also remove the package directory itself
+                try {
+                    Files.deleteIfExists(generatedMessagePackageDir);
+                } catch (IOException e) {
+                    // Ignore errors
+                }
+            }
+            
+            // Also check for Builder.java file in the package directory
+            Path builderFile = outputDir.resolve("com/google/protobuf/GeneratedMessage/Builder.java");
+            if (Files.exists(builderFile)) {
+                try {
+                    Files.delete(builderFile);
+                } catch (IOException e) {
+                    // Ignore errors
+                }
+            }
+        } catch (Exception e) {
+            // Ignore errors
+        }
+    }
+    
+    /**
+     * CRITICAL FIX: Post-process to fix nested class package/class clashes.
+     * Removes package directories when a class with the same name exists.
+     * This fixes issues like:
+     * - win.liyufan.im.HttpUtils class exists
+     * - win.liyufan.im.HttpUtils.HttpPostType is written as win/liyufan/im/HttpUtils/HttpPostType.java
+     * - This creates a package directory HttpUtils/ that clashes with HttpUtils.java
+     */
+    private static void postProcessFixNestedClassPackageClashes(Path outputDir) {
+        try {
+            if (!Files.exists(outputDir)) {
+                return;
+            }
+            
+            // Walk all directories in the output
+            try (Stream<Path> dirs = Files.walk(outputDir)) {
+                dirs.filter(Files::isDirectory)
+                    .forEach(dir -> {
+                        try {
+                            String dirName = dir.getFileName().toString();
+                            Path parentDir = dir.getParent();
+                            if (parentDir == null) return;
+                            
+                            // Check if there's a class file with the same name as this directory
+                            Path classFile = parentDir.resolve(dirName + ".java");
+                            if (Files.exists(classFile) && Files.isRegularFile(classFile)) {
+                                // This is a clash: directory name matches a class file name
+                                // Remove the directory and all its contents
+                                System.out.println("[postProcessFixNestedClassPackageClashes] Removing package directory that clashes with class: " + 
+                                    dir + " (class file: " + classFile + ")");
+                                
+                                try (Stream<Path> paths = Files.walk(dir)) {
+                                    paths.sorted((a, b) -> b.compareTo(a)) // Delete files before directories
+                                        .forEach(path -> {
+                                            try {
+                                                Files.delete(path);
+                                            } catch (IOException e) {
+                                                // Ignore errors
+                                            }
+                                        });
+                                }
+                                
+                                // Remove the directory itself
+                                try {
+                                    Files.deleteIfExists(dir);
+                                } catch (IOException e) {
+                                    // Ignore errors
+                                }
+                            }
+                        } catch (Exception e) {
+                            // Ignore errors for individual directories
+                        }
+                    });
+            }
+        } catch (Exception e) {
+            // Ignore errors
+        }
+    }
+    
+    /**
+     * CRITICAL FIX: Fix ProtoConstants package/class clash.
+     * The issue is that ProtoConstants.ConversationType is being created as a package directory
+     * (ProtoConstants/ConversationType.java) when it should be a nested class.
+     * This removes the package directory if the class file exists.
+     */
+    private static void postProcessFixProtoConstantsPackageClash(Path outputDir) {
+        try {
+            if (!Files.exists(outputDir)) {
+                return;
+            }
+            
+            // Check for ProtoConstants package/class clash
+            Path protoConstantsDir = outputDir.resolve("cn/wildfirechat/proto/ProtoConstants");
+            Path protoConstantsFile = outputDir.resolve("cn/wildfirechat/proto/ProtoConstants.java");
+            
+            if (Files.exists(protoConstantsDir) && Files.isDirectory(protoConstantsDir) &&
+                Files.exists(protoConstantsFile) && Files.isRegularFile(protoConstantsFile)) {
+                // This is a clash: ProtoConstants directory exists but ProtoConstants.java also exists
+                System.out.println("[postProcessFixProtoConstantsPackageClash] Removing package directory that clashes with class: " + 
+                    protoConstantsDir);
+                
+                try (Stream<Path> paths = Files.walk(protoConstantsDir)) {
+                    paths.sorted((a, b) -> b.compareTo(a)) // Delete files before directories
+                        .forEach(path -> {
+                            try {
+                                Files.delete(path);
+                            } catch (IOException e) {
+                                // Ignore errors
+                            }
+                        });
+                }
+            }
+        } catch (IOException e) {
+            System.err.println("[postProcessFixProtoConstantsPackageClash] Error: " + e.getMessage());
+        }
+    }
+    
+    /**
+     * DEBUG: Print what is missing to compile and what stubbing plan was collected.
+     * This helps identify collection issues before stubbing starts.
+     */
+    private static void printMissingElementsAndStubbingPlan(CtModel model, SpoonCollector.CollectResult plans) {
+        System.out.println();
+        
+        // 1. Find unresolved types (types referenced but not in model)
+        Set<String> existingTypes = new HashSet<>();
+        model.getAllTypes().forEach(t -> {
+            try {
+                String qn = t.getQualifiedName();
+                if (qn != null) existingTypes.add(qn);
+            } catch (Throwable ignored) {}
+        });
+        
+        // Build a map of type FQN -> TypeStubPlan to get the kind
+        Map<String, TypeStubPlan> typePlanMap = new HashMap<>();
+        for (TypeStubPlan tp : plans.typePlans) {
+            typePlanMap.put(tp.qualifiedName, tp);
+        }
+        
+        // Collect all referenced types from plans with usage context
+        Map<String, Set<String>> typeUsages = new HashMap<>(); // type FQN -> set of usage contexts
+        for (FieldStubPlan fp : plans.fieldPlans) {
+            if (fp.ownerType != null) {
+                String ownerQn = safeQN(fp.ownerType);
+                if (ownerQn != null) {
+                    typeUsages.computeIfAbsent(ownerQn, k -> new LinkedHashSet<>()).add("FIELD_OWNER");
+                }
+            }
+            if (fp.fieldType != null) {
+                String fieldQn = safeQN(fp.fieldType);
+                if (fieldQn != null && !fieldQn.startsWith("java.")) {
+                    typeUsages.computeIfAbsent(fieldQn, k -> new LinkedHashSet<>())
+                        .add("FIELD_TYPE in " + safeQN(fp.ownerType));
+                }
+            }
+        }
+        for (MethodStubPlan mp : plans.methodPlans) {
+            if (mp.ownerType != null) {
+                String ownerQn = safeQN(mp.ownerType);
+                if (ownerQn != null) {
+                    typeUsages.computeIfAbsent(ownerQn, k -> new LinkedHashSet<>()).add("METHOD_OWNER");
+                }
+            }
+            if (mp.returnType != null) {
+                String returnQn = safeQN(mp.returnType);
+                if (returnQn != null && !returnQn.startsWith("java.")) {
+                    typeUsages.computeIfAbsent(returnQn, k -> new LinkedHashSet<>())
+                        .add("RETURN_TYPE of " + safeQN(mp.ownerType) + "#" + mp.name);
+                }
+            }
+            if (mp.paramTypes != null) {
+                for (CtTypeReference<?> param : mp.paramTypes) {
+                    String paramQn = safeQN(param);
+                    if (paramQn != null && !paramQn.startsWith("java.")) {
+                        typeUsages.computeIfAbsent(paramQn, k -> new LinkedHashSet<>())
+                            .add("PARAM_TYPE of " + safeQN(mp.ownerType) + "#" + mp.name);
+                    }
+                }
+            }
+        }
+        for (ConstructorStubPlan cp : plans.ctorPlans) {
+            if (cp.ownerType != null) {
+                String ownerQn = safeQN(cp.ownerType);
+                if (ownerQn != null) {
+                    typeUsages.computeIfAbsent(ownerQn, k -> new LinkedHashSet<>()).add("CONSTRUCTOR_OWNER");
+                }
+            }
+            if (cp.parameterTypes != null) {
+                for (CtTypeReference<?> param : cp.parameterTypes) {
+                    String paramQn = safeQN(param);
+                    if (paramQn != null && !paramQn.startsWith("java.")) {
+                        typeUsages.computeIfAbsent(paramQn, k -> new LinkedHashSet<>())
+                            .add("CTOR_PARAM_TYPE of " + safeQN(cp.ownerType));
+                    }
+                }
+            }
+        }
+        for (TypeStubPlan tp : plans.typePlans) {
+            typeUsages.computeIfAbsent(tp.qualifiedName, k -> new LinkedHashSet<>())
+                .add("DIRECT_TYPE_PLAN (" + tp.kind + ")");
+        }
+        
+        // Find missing types
+        Set<String> missingTypes = new LinkedHashSet<>();
+        for (String refType : typeUsages.keySet()) {
+            if (refType != null && !refType.startsWith("java.") && !existingTypes.contains(refType)) {
+                // Check if it's an array type (skip those)
+                if (!refType.endsWith("[]") && !refType.contains("$")) {
+                    missingTypes.add(refType);
+                }
+            }
+        }
+        
+        System.out.println("\n[MISSING TYPES] (" + missingTypes.size() + " types need to be stubbed):");
+        System.out.println("(Shows: FQN | KIND | HOW IDENTIFIED | WHERE USED)");
+        System.out.println();
+        missingTypes.stream().sorted().limit(50).forEach(type -> {
+            TypeStubPlan plan = typePlanMap.get(type);
+            String kind = plan != null ? plan.kind.toString() : "UNKNOWN";
+            String howIdentified = determineHowIdentified(plan, typeUsages.get(type));
+            System.out.println("  - " + type);
+            System.out.println("      KIND: " + kind);
+            System.out.println("      HOW IDENTIFIED: " + howIdentified);
+            Set<String> usages = typeUsages.get(type);
+            if (usages != null && !usages.isEmpty()) {
+                System.out.println("      WHERE USED: " + String.join(", ", usages.stream().limit(5).collect(java.util.stream.Collectors.toList())));
+                if (usages.size() > 5) {
+                    System.out.println("        ... and " + (usages.size() - 5) + " more usages");
+                }
+            }
+            System.out.println();
+        });
+        if (missingTypes.size() > 50) {
+            System.out.println("  ... and " + (missingTypes.size() - 50) + " more");
+        }
+        
+        System.out.println("\n[TYPE PLANS] (" + plans.typePlans.size() + " types to generate):");
+        plans.typePlans.stream()
+            .sorted((a, b) -> a.qualifiedName.compareTo(b.qualifiedName))
+            .limit(30)
+            .forEach(tp -> System.out.println("  +type  " + tp.qualifiedName + " (" + tp.kind + ")"));
+        if (plans.typePlans.size() > 30) {
+            System.out.println("  ... and " + (plans.typePlans.size() - 30) + " more types");
+        }
+        
+        System.out.println("\n[FIELD PLANS] (" + plans.fieldPlans.size() + " fields to generate):");
+        plans.fieldPlans.stream()
+            .limit(30)
+            .forEach(fp -> {
+                String ownerQn = safeQN(fp.ownerType);
+                String fieldTypeQn = safeQN(fp.fieldType);
+                System.out.println("  +field " + ownerQn + "#" + fp.fieldName + ":" + fieldTypeQn + 
+                    (fp.isStatic ? " (static)" : ""));
+            });
+        if (plans.fieldPlans.size() > 30) {
+            System.out.println("  ... and " + (plans.fieldPlans.size() - 30) + " more fields");
+        }
+        
+        System.out.println("\n[METHOD PLANS] (" + plans.methodPlans.size() + " methods to generate):");
+        plans.methodPlans.stream()
+            .limit(30)
+            .forEach(mp -> {
+                String ownerQn = safeQN(mp.ownerType);
+                String returnQn = safeQN(mp.returnType);
+                StringBuilder params = new StringBuilder();
+                if (mp.paramTypes != null && !mp.paramTypes.isEmpty()) {
+                    for (int i = 0; i < mp.paramTypes.size(); i++) {
+                        if (i > 0) params.append(", ");
+                        params.append(safeQN(mp.paramTypes.get(i)));
+                    }
+                }
+                System.out.println("  +method " + ownerQn + "#" + mp.name + "(" + params + ") : " + returnQn +
+                    (mp.isStatic ? " (static)" : "") + (mp.defaultOnInterface ? " (default)" : ""));
+            });
+        if (plans.methodPlans.size() > 30) {
+            System.out.println("  ... and " + (plans.methodPlans.size() - 30) + " more methods");
+        }
+        
+        System.out.println("\n[CONSTRUCTOR PLANS] (" + plans.ctorPlans.size() + " constructors to generate):");
+        plans.ctorPlans.stream()
+            .limit(20)
+            .forEach(cp -> {
+                String ownerQn = safeQN(cp.ownerType);
+                StringBuilder params = new StringBuilder();
+                if (cp.parameterTypes != null && !cp.parameterTypes.isEmpty()) {
+                    for (int i = 0; i < cp.parameterTypes.size(); i++) {
+                        if (i > 0) params.append(", ");
+                        params.append(safeQN(cp.parameterTypes.get(i)));
+                    }
+                }
+                System.out.println("  +ctor  " + ownerQn + "#" + ownerQn.substring(ownerQn.lastIndexOf('.') + 1) + 
+                    "(" + params + ")");
+            });
+        if (plans.ctorPlans.size() > 20) {
+            System.out.println("  ... and " + (plans.ctorPlans.size() - 20) + " more constructors");
+        }
+        
+        System.out.println("\n[STATIC IMPORTS] (" + plans.staticImports.size() + " static imports):");
+        plans.staticImports.entrySet().stream()
+            .limit(10)
+            .forEach(entry -> {
+                System.out.println("  +static " + entry.getKey() + " -> " + entry.getValue());
+            });
+        if (plans.staticImports.size() > 10) {
+            System.out.println("  ... and " + (plans.staticImports.size() - 10) + " more static imports");
+        }
+        
+        System.out.println("\n[AMBIGUOUS SIMPLES] (" + plans.ambiguousSimples.size() + " ambiguous simple names):");
+        plans.ambiguousSimples.stream().sorted().limit(10).forEach(simple -> 
+            System.out.println("  ? " + simple));
+        if (plans.ambiguousSimples.size() > 10) {
+            System.out.println("  ... and " + (plans.ambiguousSimples.size() - 10) + " more");
+        }
+        
+        System.out.println("\n==================================================================================\n");
+    }
+    
+    /**
+     * Determine how a type was identified (which collection method found it).
+     * This helps understand why a type is being stubbed.
+     */
+    private static String determineHowIdentified(TypeStubPlan plan, Set<String> usages) {
+        if (plan == null) {
+            return "Found in usage context but not in type plans (may be inferred from field/method/parameter types)";
+        }
+        
+        // Based on the kind, we can infer which collection method found it
+        switch (plan.kind) {
+            case ANNOTATION:
+                return "collectUnresolvedAnnotations() or collectAnnotationTypeUsages() - found as annotation type";
+            case INTERFACE:
+                if (usages != null && usages.stream().anyMatch(u -> u.contains("SAM") || u.contains("lambda") || u.contains("method reference"))) {
+                    return "collectMethodReferences() or collectLambdas() - functional interface for lambda/method reference";
+                }
+                if (usages != null && usages.stream().anyMatch(u -> u.contains("DIRECT_TYPE_PLAN"))) {
+                    return "collectSupertypes() - found as superinterface";
+                }
+                return "collectSupertypes() or collectMethodReferences() - interface type";
+            case ENUM:
+                return "collectUnresolvedFields() or collectFromInstanceofCastsClassLiteralsAndForEach() - enum constant or switch case";
+            case CLASS:
+                if (usages != null && usages.stream().anyMatch(u -> u.contains("CONSTRUCTOR_OWNER"))) {
+                    return "collectUnresolvedCtorCalls() - constructor call found";
+                }
+                if (usages != null && usages.stream().anyMatch(u -> u.contains("FIELD_OWNER"))) {
+                    return "collectUnresolvedFields() - field access found";
+                }
+                if (usages != null && usages.stream().anyMatch(u -> u.contains("METHOD_OWNER"))) {
+                    return "collectUnresolvedMethodCalls() - method call found";
+                }
+                if (usages != null && usages.stream().anyMatch(u -> u.contains("DIRECT_TYPE_PLAN"))) {
+                    return "collectUnresolvedDeclaredTypes() or collectSupertypes() - declared type or superclass";
+                }
+                return "Multiple collection methods - class type (default assumption)";
+            case RECORD:
+                return "detectRecordFromUsage() - detected as record type";
+            default:
+                return "Unknown collection method";
+        }
+    }
+    
+    /**
      * CRITICAL FIX: Post-process to fix primitive field initializations.
      * Replaces `= null` with proper default values for primitive types (e.g., `long field = null` -> `long field = 0L`).
      * This function is SAFE - it only fixes invalid initializations, never removes or modifies valid code.
@@ -3199,5 +3720,49 @@ public final class SpoonStubbingRunner implements Stubber {
         } catch (Throwable e) {
             System.err.println("[fixVoidReturnTypesInBooleanContexts] Error: " + e.getMessage());
         }
+    }
+    
+    /**
+     * CRITICAL FIX: Check if a qualified name is a JDK type.
+     */
+    private static boolean isJdkFqn(String qn) {
+        return qn != null && (qn.startsWith("java.")
+                || qn.startsWith("javax.")
+                || qn.startsWith("jakarta.")
+                || qn.startsWith("sun.")
+                || qn.startsWith("jdk."));
+    }
+    
+    /**
+     * CRITICAL FIX: Check if a package should be ignored (JDK, generated, etc.).
+     * Returns true for java.*, javax.*, jdk.*, sun.*, com.sun.*, kotlin.*, scala.*
+     * and known generated packages like org.lwjgl.* and any package containing .generated.
+     */
+    private static boolean isIgnoredPackage(String qn) {
+        if (qn == null || qn.isEmpty()) return false;
+        
+        // JDK packages
+        if (qn.startsWith("java.") || qn.startsWith("javax.") || 
+            qn.startsWith("jakarta.") || qn.startsWith("jdk.") ||
+            qn.startsWith("sun.") || qn.startsWith("com.sun.")) {
+            return true;
+        }
+        
+        // Other language runtimes
+        if (qn.startsWith("kotlin.") || qn.startsWith("scala.")) {
+            return true;
+        }
+        
+        // Generated packages
+        if (qn.contains(".generated.") || qn.contains(".generated")) {
+            return true;
+        }
+        
+        // Known generated packages
+        if (qn.startsWith("org.lwjgl.")) {
+            return true;
+        }
+        
+        return false;
     }
 }

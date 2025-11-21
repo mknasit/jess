@@ -18,7 +18,7 @@ public class JessConfiguration {
     private boolean includeJdkStubs = false; // Default to false - JDK types are available from JRE, stubs cause conflicts
     public enum StubberKind { JESS, SPOON }
 
-    private StubberKind stubberKind = StubberKind.SPOON ;
+    private StubberKind stubberKind = StubberKind.SPOON;
 
     private String targetVersion = null;
 

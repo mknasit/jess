@@ -39,7 +39,8 @@ public class RepositoryProcessorTest {
     // ============================================================================
 
     /** Project directory path (REQUIRED) */
-    private static final String PROJECT_DIR = "/Users/mitul/Documents/study/Thesis/partial compilation/jess/src/test/resources/project/lwjgl3";
+    //private static final String PROJECT_DIR = "/Users/mitul/Documents/study/Thesis/partial compilation/JessTesting/src/test/resources/projects/im-server";
+  private static final String PROJECT_DIR = "/Users/mitul/Documents/study/Thesis/partial compilation/jess/src/test/resources/project/server";
 
     /**
      * Source root directories (OPTIONAL - leave null to auto-detect like experiment script)
@@ -75,6 +76,23 @@ public class RepositoryProcessorTest {
 
     /** Minimum lines of code threshold (default: 3, actual threshold: MINIMUM_LOC + 2 = 5 lines) */
     private static final int MINIMUM_LOC = 3;
+
+    /**
+     * Method selection mode:
+     *   - RANDOM: Random selection with fixed seed (1234) - same methods each run (reproducible)
+     *   - SEQUENTIAL: Select first N methods in order - same methods each run (deterministic)
+     * 
+     * Use RANDOM for:
+     *   - Matching experiment setup (same as experiment script)
+     *   - Testing with diverse method samples
+     * 
+     * Use SEQUENTIAL for:
+     *   - Debugging specific methods (easier to predict which methods will be processed)
+     *   - Consistent testing (same methods processed in same order every time)
+     *   - Easier to track progress (methods 1, 2, 3, ... instead of random selection)
+     */
+    private static final RepositoryProcessor.SelectionMode SELECTION_MODE = RepositoryProcessor.SelectionMode.SEQUENTIAL;
+    // Alternative: RepositoryProcessor.SelectionMode.RANDOM
 
     // ============================================================================
 
@@ -129,22 +147,28 @@ public class RepositoryProcessorTest {
             System.out.println("Source Root Mode: " + sourceRootMode);
             System.out.println("Classpath Jars: " + CLASSPATH_JARS);
             System.out.println("Minimum LOC: " + MINIMUM_LOC + " (actual threshold: " + (MINIMUM_LOC + 2) + " lines)");
-            System.out.println("Random Selection: Enabled (seed=1234, same as experiment setup)");
+            if (SELECTION_MODE == RepositoryProcessor.SelectionMode.RANDOM) {
+                System.out.println("Selection Mode: RANDOM (seed=1234, same as experiment setup)");
+            } else {
+                System.out.println("Selection Mode: SEQUENTIAL (first N methods in order)");
+            }
             if (MAX_METHODS > 0) {
-                System.out.println("Method Limit: " + MAX_METHODS + " methods (randomly selected)");
+                System.out.println("Method Limit: " + MAX_METHODS + " methods (" + 
+                    (SELECTION_MODE == RepositoryProcessor.SelectionMode.RANDOM ? "randomly selected" : "sequentially selected") + ")");
             } else {
                 System.out.println("Method Limit: Unlimited");
             }
             System.out.println("=".repeat(80));
             System.out.println();
 
-            // Create processor with filtering threshold
+            // Create processor with filtering threshold and selection mode
             RepositoryProcessor processor = new RepositoryProcessor(
                     PROJECT_DIR,
                     sourceRoots,
                     CLASSPATH_JARS,
                     MAX_METHODS,
-                    MINIMUM_LOC
+                    MINIMUM_LOC,
+                    SELECTION_MODE
             );
 
             // Process repository (statistics are logged during processing)
@@ -305,6 +329,7 @@ public class RepositoryProcessorTest {
             content.append("Source Roots: ").append(SOURCE_ROOTS).append("\n");
             content.append("Classpath Jars: ").append(CLASSPATH_JARS).append("\n");
             content.append("Max Methods: ").append(MAX_METHODS > 0 ? MAX_METHODS : "Unlimited").append("\n");
+            content.append("Selection Mode: ").append(SELECTION_MODE).append("\n");
             content.append("\n");
 
             // Exception information if test failed

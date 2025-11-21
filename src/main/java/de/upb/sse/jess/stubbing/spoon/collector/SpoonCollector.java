@@ -53,6 +53,18 @@ public final class SpoonCollector {
         // Track static imports that need to be added: Map<TypeFQN, Set<FieldName>>
         public final Map<String, Set<String>> staticImports = new LinkedHashMap<>();
 
+        // CRITICAL FIX: Strong deduplication - canonical keys for plans
+        public final Set<String> typePlanKeys = new HashSet<>();
+        public final Set<String> methodPlanKeys = new HashSet<>();
+        public final Set<String> fieldPlanKeys = new HashSet<>();
+        public final Set<String> ctorPlanKeys = new HashSet<>();
+        
+        // CRITICAL FIX: Demand-driven collection - referenced types/owners
+        public final Set<String> referencedTypes = new HashSet<>();
+        public final Set<String> referencedOwners = new HashSet<>();
+        public final Set<String> neededTypes = new HashSet<>();
+        public final Set<String> neededOwners = new HashSet<>();
+
 
     }
 
@@ -145,6 +157,15 @@ public final class SpoonCollector {
         METHOD_RETURN_TYPES.put("canRead", "boolean");
         METHOD_RETURN_TYPES.put("canWrite", "boolean");
         METHOD_RETURN_TYPES.put("exists", "boolean");
+        
+        // Apache Ant Task methods
+        METHOD_RETURN_TYPES.put("getProject", "org.apache.tools.ant.Project");
+        METHOD_RETURN_TYPES.put("getProperties", "java.util.Properties");
+        
+        // Map/Properties methods
+        METHOD_RETURN_TYPES.put("entrySet", "java.util.Set");
+        METHOD_RETURN_TYPES.put("keySet", "java.util.Set");
+        METHOD_RETURN_TYPES.put("values", "java.util.Collection");
     }
 
     /* ======================================================================
@@ -175,53 +196,85 @@ public final class SpoonCollector {
 
     /**
      * Main entry: scan the model and produce an aggregated set of stub plans.
+     * CRITICAL FIX: Each collection phase is wrapped in try-catch to handle StackOverflowError.
+     * If one phase fails, we continue with others to maximize stub generation.
+     * 
+     * @param model The Spoon model to analyze
+     * @param interestingTypeQNs Set of interesting type qualified names (non-JDK, non-generated) to focus on
      */
-    public CollectResult collect(CtModel model) {
+    public CollectResult collect(CtModel model, Set<String> interestingTypeQNs) {
         CollectResult result = new CollectResult();
 
-        ensureRepeatablesForDuplicateUses(model);
-        rebindUnknownHomonyms(model,result);
+        // CRITICAL FIX: Store interesting types for filtering
+        result.neededOwners.addAll(interestingTypeQNs);
+        result.neededTypes.addAll(interestingTypeQNs);
+
+        // CRITICAL FIX: Wrap each collection phase in try-catch to handle StackOverflowError
+        // This allows us to continue with other phases even if one fails
+        safeCollect(() -> ensureRepeatablesForDuplicateUses(model), "ensureRepeatablesForDuplicateUses");
+        safeCollect(() -> rebindUnknownHomonyms(model, result), "rebindUnknownHomonyms");
+        
         // --- order matters only for readability; each pass is independent ---
-        collectTryWithResources(model, result);
-        collectUnresolvedFields(model, result);
-        collectUnresolvedCtorCalls(model, result);
-        collectForEachLoops(model, result);
-        collectStreamApiMethods(model, result);  // Collect Stream API methods (stream(), forEach, map, filter, etc.)
-        collectMethodReferences(model, result);  // Collect method references FIRST (creates functional interface SAM methods)
-        collectUnresolvedMethodCalls(model, result);  // Collect method calls (may create SAM methods from calls like f.apply(1))
-        collectLambdas(model, result);  // Collect lambdas LAST and remove/replace any existing SAM methods with correct signature from lambda
-        collectUnresolvedAnnotations(model, result);
+        safeCollect(() -> collectTryWithResources(model, result), "collectTryWithResources");
+        safeCollect(() -> collectUnresolvedFields(model, result), "collectUnresolvedFields");
+        safeCollect(() -> collectUnresolvedCtorCalls(model, result), "collectUnresolvedCtorCalls");
+        safeCollect(() -> collectForEachLoops(model, result), "collectForEachLoops");
+        safeCollect(() -> collectStreamApiMethods(model, result), "collectStreamApiMethods");
+        safeCollect(() -> collectMethodReferences(model, result), "collectMethodReferences");
+        safeCollect(() -> collectUnresolvedMethodCalls(model, result), "collectUnresolvedMethodCalls");
+        safeCollect(() -> collectLambdas(model, result), "collectLambdas");
+        safeCollect(() -> collectUnresolvedAnnotations(model, result), "collectUnresolvedAnnotations");
 
-        collectExceptionTypes(model, result);
-        collectSupertypes(model, result);
+        safeCollect(() -> collectExceptionTypes(model, result), "collectExceptionTypes");
+        safeCollect(() -> collectSupertypes(model, result), "collectSupertypes");
 
-        collectFromInstanceofCastsClassLiteralsAndForEach(model, result);
-        collectUnresolvedDeclaredTypes(model, result);
-        collectAnnotationTypeUsages(model, result);
-        collectOverloadGaps(model, result);  // This runs AFTER collectLambdas, so it might re-add methods - need to prevent duplicates
+        safeCollect(() -> collectFromInstanceofCastsClassLiteralsAndForEach(model, result), "collectFromInstanceofCastsClassLiteralsAndForEach");
+        safeCollect(() -> collectUnresolvedDeclaredTypes(model, result), "collectUnresolvedDeclaredTypes");
+        safeCollect(() -> collectAnnotationTypeUsages(model, result), "collectAnnotationTypeUsages");
+        safeCollect(() -> collectOverloadGaps(model, result), "collectOverloadGaps");
 
-        seedOnDemandImportAnchors(model, result);
-        seedExplicitTypeImports(model, result);
+        safeCollect(() -> seedOnDemandImportAnchors(model, result), "seedOnDemandImportAnchors");
+        safeCollect(() -> seedExplicitTypeImports(model, result), "seedExplicitTypeImports");
 
         // Final cleanup: Remove duplicate SAM methods from functional interfaces
         // This ensures that functional interfaces have only ONE abstract method
         // Even if different collection phases added methods with different parameter types (int vs Integer)
-        removeDuplicateSamMethods(result);
+        safeCollect(() -> removeDuplicateSamMethods(result), "removeDuplicateSamMethods");
 
         // CRITICAL FIX: Post-process ALL method plans to fix return types using method name mappings
         // This catches methods added from ANY of the 17+ collection points
         // (collectUnresolvedMethodCalls, collectOverloadGaps, collectForEachLoops, etc.)
-        fixMethodReturnTypesFromMethodNames(result);
+        safeCollect(() -> fixMethodReturnTypesFromMethodNames(result), "fixMethodReturnTypesFromMethodNames");
+        
+        // CRITICAL FIX: Deduplicate method plans by signature + varargs flag
+        // Same method with same parameters but different varargs flag should be treated as different
+        safeCollect(() -> deduplicateMethodPlansBySignature(result), "deduplicateMethodPlansBySignature");
+
+        // CRITICAL FIX: Remove static field types from type plans (they should be static imports, not types)
+        // This fixes cases where PUSH_ANDROID_SERVER_ADDRESS is collected as a type instead of a static field
+        safeCollect(() -> removeStaticFieldTypesFromPlans(model, result), "removeStaticFieldTypesFromPlans");
+        
+        // CRITICAL FIX: Handle static constants referenced via simple names (ALL_CAPS)
+        // When a simple name is ALL_CAPS and corresponds to a static field on a known class,
+        // remove unknown.* type plans and add static field stub + static import
+        safeCollect(() -> fixStaticConstantsFromSimpleNames(model, result), "fixStaticConstantsFromSimpleNames");
 
         // Ensure owners exist for any planned members / references discovered above.
-        result.typePlans.addAll(ownersNeedingTypes(result));
+        // CRITICAL FIX: Use addTypePlanIfNonJdk to prevent duplicates
+        safeCollect(() -> {
+            for (TypeStubPlan plan : ownersNeedingTypes(result)) {
+                addTypePlanIfNonJdk(result, plan.qualifiedName, plan.kind);
+            }
+        }, "ownersNeedingTypes");
 
         // --- compute scoped ambiguous simple names ---
         Map<String, Set<String>> simpleToPkgs = new HashMap<>();
 
 
 // (1) add existing model types
-        model.getAllTypes().forEach(t -> {
+        // CRITICAL FIX: Safely get all types - getAllTypes() can trigger StackOverflowError
+        Collection<CtType<?>> allTypes = safeGetAllTypes(model);
+        allTypes.forEach(t -> {
             String qn = safeQN(t.getReference());
             if (qn == null) return;
             int lastDot = qn.lastIndexOf('.');
@@ -273,6 +326,7 @@ public final class SpoonCollector {
 
     /**
      * Collect field stubs from unresolved field accesses (including static and instance cases).
+     * CRITICAL FIX: Only collect for interesting owners (demand-driven collection).
      */
     private void collectUnresolvedFields(CtModel model, CollectResult out) {
         List<CtFieldAccess<?>> unresolved = model.getElements((CtFieldAccess<?> fa) -> {
@@ -281,6 +335,22 @@ public final class SpoonCollector {
         });
 
         for (CtFieldAccess<?> fa : unresolved) {
+            // CRITICAL FIX: Skip ignored packages
+            try {
+                CtTypeReference<?> ownerRef = resolveOwnerTypeFromFieldAccess(fa);
+                if (ownerRef != null) {
+                    String ownerQn = safeQN(ownerRef);
+                    if (ownerQn != null && isIgnoredPackage(ownerQn)) {
+                        continue; // Skip ignored packages
+                    }
+                    // CRITICAL FIX: Only collect for interesting owners
+                    if (!isInterestingOwner(out, ownerRef)) {
+                        continue; // Skip if owner is not in interesting types
+                    }
+                }
+            } catch (Throwable ignored) {
+                // Continue if we can't determine owner
+            }
             if (fa.getParent(CtExecutableReferenceExpression.class) != null) {
                 continue; // In A::inc the 'A' token isn't a field; it's a type name
             }
@@ -333,7 +403,7 @@ public final class SpoonCollector {
                         .anyMatch(p -> p.qualifiedName.equals(switchTypeQn) && p.kind == TypeStubPlan.Kind.ENUM);
                     if (!hasEnumPlan) {
                         out.typePlans.removeIf(p -> p.qualifiedName.equals(switchTypeQn) && p.kind == TypeStubPlan.Kind.CLASS);
-                        out.typePlans.add(new TypeStubPlan(switchTypeQn, TypeStubPlan.Kind.ENUM));
+                        addTypePlanIfNonJdk(out, switchTypeQn, TypeStubPlan.Kind.ENUM);
                     }
                 }
             }
@@ -439,7 +509,7 @@ public final class SpoonCollector {
                                     // Remove any existing CLASS plan for this type
                                     out.typePlans.removeIf(p -> p.qualifiedName.equals(ownerQn) && p.kind == TypeStubPlan.Kind.CLASS);
                                     // Add ENUM plan
-                                    out.typePlans.add(new TypeStubPlan(ownerQn, TypeStubPlan.Kind.ENUM));
+                                    addTypePlanIfNonJdk(out, ownerQn, TypeStubPlan.Kind.ENUM);
                                 }
                             }
                             fieldType = ownerRef; // Use the owner type as enum type
@@ -457,7 +527,33 @@ public final class SpoonCollector {
                 }
             }
 
-            out.fieldPlans.add(new FieldStubPlan(ownerRef, fieldName, fieldType, isStatic));
+            // CRITICAL FIX: Check for duplicate field plans before adding
+            // This prevents the same field from being collected multiple times with different types
+            String ownerQn = safeQN(ownerRef);
+            String fieldTypeQn = safeQN(fieldType);
+            boolean fieldAlreadyExists = out.fieldPlans.stream()
+                .anyMatch(p -> {
+                    try {
+                        String pOwnerQn = safeQN(p.ownerType);
+                        String pFieldTypeQn = safeQN(p.fieldType);
+                        return ownerQn != null && ownerQn.equals(pOwnerQn) && 
+                               fieldName.equals(p.fieldName) && 
+                               isStatic == p.isStatic &&
+                               // If types match or both are Object/Unknown, consider duplicate
+                               (fieldTypeQn != null && fieldTypeQn.equals(pFieldTypeQn) ||
+                                (fieldTypeQn != null && pFieldTypeQn != null && 
+                                 (fieldTypeQn.equals("java.lang.Object") || fieldTypeQn.equals("unknown.Unknown")) &&
+                                 (pFieldTypeQn.equals("java.lang.Object") || pFieldTypeQn.equals("unknown.Unknown"))));
+                    } catch (Throwable ignored) {
+                        return false;
+                    }
+                });
+            
+            if (!fieldAlreadyExists) {
+                // CRITICAL FIX: Use addFieldPlan for deduplication
+                FieldStubPlan fieldPlan = new FieldStubPlan(ownerRef, fieldName, fieldType, isStatic);
+                addFieldPlan(out, fieldPlan);
+            }
         }
     }
 
@@ -562,6 +658,45 @@ public final class SpoonCollector {
             }
         }
 
+        // CRITICAL FIX: When field access has no explicit receiver (e.g., just "deviceToken_"),
+        // try to infer the owner from the enclosing class/method context
+        // This prevents fields from being created as separate classes (e.g., deviceToken_.java)
+        try {
+            // Also try to get from enclosing method's declaring class (most reliable)
+            CtMethod<?> enclosingMethod = fa.getParent(CtMethod.class);
+            if (enclosingMethod != null) {
+                CtType<?> declaringType = enclosingMethod.getDeclaringType();
+                if (declaringType != null) {
+                    CtTypeReference<?> declaringRef = declaringType.getReference();
+                    if (declaringRef != null) {
+                        String declaringQn = safeQN(declaringRef);
+                        // Only use if it's a real class (not unknown.* and not a field name pattern ending with _)
+                        if (declaringQn != null && !declaringQn.startsWith("unknown.") && 
+                            !declaringQn.endsWith("_")) {
+                            return chooseOwnerPackage(declaringRef, fa);
+                        }
+                    }
+                }
+            }
+            
+            // Fallback: Try to get the enclosing class from the field access context
+            CtType<?> enclosingType = fa.getParent(CtType.class);
+            if (enclosingType != null) {
+                CtTypeReference<?> enclosingRef = enclosingType.getReference();
+                if (enclosingRef != null) {
+                    String enclosingQn = safeQN(enclosingRef);
+                    // Only use if it's a real class (not unknown.* and not a field name pattern ending with _)
+                    if (enclosingQn != null && !enclosingQn.startsWith("unknown.") && 
+                        !enclosingQn.endsWith("_")) {
+                        return chooseOwnerPackage(enclosingRef, fa);
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+            // Fall through to default behavior
+        }
+
+        // Last resort: create unknown.* type (but this should rarely happen now)
         String simple = (fa.getVariable() != null ? fa.getVariable().getSimpleName() : "Owner");
         return f.Type().createReference("unknown." + simple);
     }
@@ -737,10 +872,10 @@ public final class SpoonCollector {
                     addTypePlanIfNonJdk(out, outerFqn, TypeStubPlan.Kind.CLASS);
                     String innerFqn = outerFqn + "$" + innerSimple;
                     if (!isJdkFqn(innerFqn)) {
-                        out.typePlans.add(new TypeStubPlan(innerFqn, TypeStubPlan.Kind.CLASS, true)); // non-static inner
+                        addTypePlanIfNonJdk(out, innerFqn, TypeStubPlan.Kind.CLASS); // non-static inner
                     }
 
-                    out.ctorPlans.add(new ConstructorStubPlan(memberOwner, ps));
+                    addConstructorPlanIfNotExists(out, memberOwner, ps);
                     // do NOT fall through to generic path
                     continue;
                 }
@@ -808,7 +943,7 @@ public final class SpoonCollector {
 
                 // preserve nested owners ($)
                 String ownerFqn = nestedAwareFqnOf(owner);
-                out.ctorPlans.add(new ConstructorStubPlan(f.Type().createReference(ownerFqn), ps));
+                addConstructorPlanIfNotExists(out, f.Type().createReference(ownerFqn), ps);
             }
         }
     }
@@ -884,7 +1019,7 @@ public final class SpoonCollector {
                 CtTypeReference<?> ownerForCtor = chooseOwnerPackage(resolveOwnerTypeFromInvocation(inv), inv);
                 if (!isJdkType(ownerForCtor)) {
                     List<CtTypeReference<?>> ps = inferParamTypesFromCall(ex, inv.getArguments());
-                    out.ctorPlans.add(new ConstructorStubPlan(ownerForCtor, ps));
+                    addConstructorPlanIfNotExists(out, ownerForCtor, ps);
                 }
                 continue;
             }
@@ -1204,7 +1339,35 @@ public final class SpoonCollector {
             }
 
 // --- varargs element type coercion (when call looks varargs) ---
-            if (makeVarargs && !paramTypes.isEmpty()) {
+            // CRITICAL FIX: When varargs is detected, consolidate all vararg arguments into a single vararg parameter
+            // Example: info("msg", arg1, arg2, arg3) should become info(String, Object...) not info(String, String, int, String)
+            if (makeVarargs && !paramTypes.isEmpty() && paramTypes.size() > 1) {
+                // For Logger.info() and similar methods, first param is usually the format string, rest are varargs
+                // Consolidate all vararg arguments (from index 1 onwards) into a single Object vararg parameter
+                int varargStartIndex = 1; // First parameter is usually the format string, rest are varargs
+                if (paramTypes.size() > varargStartIndex) {
+                    // Get the element type from all vararg arguments (use Object as common type)
+                    CtTypeReference<?> varargElementType = f.Type().OBJECT;
+                    
+                    // Try to infer better element type from actual arguments if possible
+                    if (args.size() > varargStartIndex) {
+                        List<CtTypeReference<?>> coerced = coerceVarargs(args, varargStartIndex, varargElementType);
+                        if (!coerced.isEmpty() && coerced.get(0) != null) {
+                            varargElementType = coerced.get(0);
+                        }
+                    }
+                    
+                    // Create new parameter list: fixed params + single vararg element type
+                    List<CtTypeReference<?>> newParamTypes = new ArrayList<>();
+                    newParamTypes.add(paramTypes.get(0)); // Keep first parameter (format string)
+                    newParamTypes.add(varargElementType); // Single vararg element type (will be marked as varargs)
+                    paramTypes = newParamTypes;
+                    
+                    System.out.println("[collectUnresolvedMethodCalls] Varargs consolidation: " + args.size() + 
+                        " args -> " + newParamTypes.size() + " params (varargs=" + makeVarargs + ")");
+                }
+            } else if (makeVarargs && !paramTypes.isEmpty()) {
+                // Original logic for single vararg parameter case
                 int varargIndex = paramTypes.size() - 1;
                 CtTypeReference<?> currentElem = paramTypes.get(varargIndex);
                 List<CtTypeReference<?>> coerced =
@@ -1499,7 +1662,7 @@ public final class SpoonCollector {
                         // Remove any existing CLASS plan for this type
                         out.typePlans.removeIf(p -> p.qualifiedName.equals(ownerQn) && p.kind == TypeStubPlan.Kind.CLASS);
                         // Add ENUM plan
-                        out.typePlans.add(new TypeStubPlan(ownerQn, TypeStubPlan.Kind.ENUM));
+                                    addTypePlanIfNonJdk(out, ownerQn, TypeStubPlan.Kind.ENUM);
                     }
                 }
             }
@@ -1514,7 +1677,7 @@ public final class SpoonCollector {
                         .anyMatch(p -> p.qualifiedName.equals(enumTypeQn) && p.kind == TypeStubPlan.Kind.ENUM);
                     if (!hasEnumPlan) {
                         out.typePlans.removeIf(p -> p.qualifiedName.equals(enumTypeQn) && p.kind == TypeStubPlan.Kind.CLASS);
-                        out.typePlans.add(new TypeStubPlan(enumTypeQn, TypeStubPlan.Kind.ENUM));
+                        addTypePlanIfNonJdk(out, enumTypeQn, TypeStubPlan.Kind.ENUM);
                     }
                 }
             }
@@ -1531,7 +1694,7 @@ public final class SpoonCollector {
                                 .anyMatch(p -> p.qualifiedName.equals(enumTypeQn) && p.kind == TypeStubPlan.Kind.ENUM);
                             if (!hasEnumPlan) {
                                 out.typePlans.removeIf(p -> p.qualifiedName.equals(enumTypeQn) && p.kind == TypeStubPlan.Kind.CLASS);
-                                out.typePlans.add(new TypeStubPlan(enumTypeQn, TypeStubPlan.Kind.ENUM));
+                                addTypePlanIfNonJdk(out, enumTypeQn, TypeStubPlan.Kind.ENUM);
                             }
                         }
                     }
@@ -1556,19 +1719,21 @@ public final class SpoonCollector {
                     ((CtArrayTypeReference<?>) arrOfOwner).setComponentType(owner.clone());
 
                     if (looksEnumValues) {
-                        out.methodPlans.add(new MethodStubPlan(
+                        MethodStubPlan valuesPlan = new MethodStubPlan(
                                 owner, "values", arrOfOwner,
                                 Collections.emptyList(),
                                 /*isStatic*/ true, MethodStubPlan.Visibility.PUBLIC,
                                 Collections.emptyList(),
-                                /*defaultOnIface*/ false, /*isAbstract*/ false, /*isFinal*/ true, null));
+                                /*defaultOnIface*/ false, /*isAbstract*/ false, /*isFinal*/ true, null);
+                        addMethodPlan(out, valuesPlan);
                     } else {
-                        out.methodPlans.add(new MethodStubPlan(
+                        MethodStubPlan valueOfPlan = new MethodStubPlan(
                                 owner, "valueOf", owner.clone(),
                                 List.of(f.Type().createReference("java.lang.String")),
                                 /*isStatic*/ true, MethodStubPlan.Visibility.PUBLIC,
                                 Collections.emptyList(),
-                                /*defaultOnIface*/ false, /*isAbstract*/ false, /*isFinal*/ true, null));
+                                /*defaultOnIface*/ false, /*isAbstract*/ false, /*isFinal*/ true, null);
+                        addMethodPlan(out, valueOfPlan);
                     }
                 }
                 // NOTE: don't "continue" — let normal flow still plan 'name()' if seen elsewhere.
@@ -1595,19 +1760,74 @@ public final class SpoonCollector {
                 continue;
             }
             
+            // CRITICAL FIX: Check if owner is interesting before collecting
+            if (!isInterestingOwner(out, owner)) {
+                continue; // Skip if owner is not in interesting types
+            }
+            
+            // CRITICAL FIX: For varargs methods, prefer single Object... variant
+            // Avoid generating multiple variants for same owner+name
+            if (makeVarargs && !paramTypes.isEmpty()) {
+                // Check if we already have a varargs method for this owner+name
+                String ownerQn = safeQN(owner);
+                boolean hasVarargsVariant = out.methodPlanKeys.stream()
+                    .anyMatch(k -> k.startsWith("METHOD:" + ownerQn + "#" + name + "(") && k.contains("[varargs]"));
+                if (hasVarargsVariant) {
+                    // Already have a varargs variant - skip to avoid duplicates
+                    continue;
+                }
+                // Ensure varargs parameter is Object... (most compatible)
+                if (paramTypes.size() > 1) {
+                    // Replace all vararg parameters with single Object...
+                    List<CtTypeReference<?>> newParamTypes = new ArrayList<>();
+                    newParamTypes.add(paramTypes.get(0)); // Keep first param (usually format string)
+                    newParamTypes.add(f.Type().OBJECT); // Use Object... for varargs
+                    paramTypes = newParamTypes;
+                } else if (!paramTypes.isEmpty()) {
+                    // Single param - ensure it's Object for varargs
+                    paramTypes = Collections.singletonList(f.Type().OBJECT);
+                }
+            }
+            
+            // CRITICAL FIX: Strip type parameters from return type and parameter types before creating plan
+            // This prevents Tuple4<T1, T2, T3, T4> from being stored in the method plan
+            CtTypeReference<?> cleanReturnType = (returnType != null ? returnType : f.Type().VOID_PRIMITIVE);
+            cleanReturnType = stripTypeParameterArguments(cleanReturnType);
+            
+            // CRITICAL FIX: Filter out void from parameter types - void can NEVER be a parameter type
+            List<CtTypeReference<?>> cleanParamTypes = new ArrayList<>();
+            for (CtTypeReference<?> paramType : paramTypes) {
+                // Strip type parameters first
+                paramType = stripTypeParameterArguments(paramType);
+                
+                // CRITICAL: Filter out void - void can only be a return type, never a parameter
+                if (paramType != null) {
+                    try {
+                        if (paramType.equals(f.Type().VOID_PRIMITIVE) || 
+                            "void".equals(paramType.getSimpleName()) || 
+                            "void".equals(safeQN(paramType))) {
+                            // Replace void with Object (void cannot be a parameter type)
+                            paramType = f.Type().createReference("java.lang.Object");
+                        }
+                    } catch (Throwable ignored) {}
+                }
+                cleanParamTypes.add(paramType);
+            }
+            
             // enqueue plan — NOTE: no mirroring when owner is already unknown.*
-            out.methodPlans.add(new MethodStubPlan(
+            MethodStubPlan methodPlan = new MethodStubPlan(
                     owner, name,
-                    (returnType != null ? returnType : f.Type().VOID_PRIMITIVE),
-                    paramTypes,
+                    cleanReturnType,
+                    cleanParamTypes,
                     makeStatic, vis, thrown, defaultOnIface,
                     /* varargs */ makeVarargs,
                     /* mirror   */ false,
                     /* mirrorOwnerRef */ null
-            ));
+            );
+            addMethodPlan(out, methodPlan);
 
             if (mirror && mirrorOwnerRef != null) {
-                out.methodPlans.add(new MethodStubPlan(
+                MethodStubPlan mirrorPlan = new MethodStubPlan(
                         mirrorOwnerRef, name,
                         (returnType != null ? returnType : f.Type().VOID_PRIMITIVE),
                         paramTypes,
@@ -1615,7 +1835,8 @@ public final class SpoonCollector {
                         makeVarargs,
                         /* mirror */ false,
                         /* mirrorOwnerRef */ null
-                ));
+                );
+                addMethodPlan(out, mirrorPlan);
             }
 
         }
@@ -1737,6 +1958,14 @@ public final class SpoonCollector {
             CtInvocation<?> outerInv = (CtInvocation<?>) p;
             if (outerInv.getTarget() == inv) {
                 // This is obj.method().method2() - method must return an object, not void
+                // CRITICAL FIX: Use method name mapping for chained calls (e.g., getProperties().entrySet())
+                String methodName = inv.getExecutable() != null ? inv.getExecutable().getSimpleName() : null;
+                if (methodName != null) {
+                    CtTypeReference<?> mappedType = inferReturnTypeFromMethodName(methodName, null);
+                    if (mappedType != null && !isUnknownOrVoidPrimitive(mappedType)) {
+                        return mappedType;
+                    }
+                }
                 // Try to infer from the outer invocation's target type
                 try {
                     CtTypeReference<?> outerTargetType = outerInv.getTarget() != null ? outerInv.getTarget().getType() : null;
@@ -2101,7 +2330,7 @@ public final class SpoonCollector {
                     String simple = resolved.getSimpleName();
                     String containerSimple = simple.endsWith("s") ? simple + "es" : simple + "s";
                     String containerFqn = (pkg.isEmpty() ? containerSimple : pkg + "." + containerSimple);
-                    out.typePlans.add(new TypeStubPlan(containerFqn, TypeStubPlan.Kind.ANNOTATION));
+                    addTypePlanIfNonJdk(out, containerFqn, TypeStubPlan.Kind.ANNOTATION);
                     continue;
                 }
             }
@@ -2118,7 +2347,7 @@ public final class SpoonCollector {
                 String simple = at.getSimpleName();
                 String containerSimple = simple.endsWith("s") ? simple + "es" : simple + "s";
                 String containerFqn = (pkg.isEmpty() ? containerSimple : pkg + "." + containerSimple);
-                out.typePlans.add(new TypeStubPlan(containerFqn, TypeStubPlan.Kind.ANNOTATION));
+                addTypePlanIfNonJdk(out, containerFqn, TypeStubPlan.Kind.ANNOTATION);
             }
         }
     }
@@ -2139,7 +2368,21 @@ public final class SpoonCollector {
                 CtTypeReference<?> owner = chooseOwnerPackage(t, m);
                 if (isJdkType(owner)) continue;
                 addTypePlanFromRef(out, owner, TypeStubPlan.Kind.CLASS);
-                out.ctorPlans.add(new ConstructorStubPlan(owner, Collections.emptyList()));
+                // CRITICAL FIX: Check for duplicate constructor plans before adding
+                String ownerQn = safeQN(owner);
+                boolean ctorAlreadyExists = out.ctorPlans.stream()
+                    .anyMatch(p -> {
+                        try {
+                            String pOwnerQn = safeQN(p.ownerType);
+                            return ownerQn != null && ownerQn.equals(pOwnerQn) && 
+                                   (p.parameterTypes == null || p.parameterTypes.isEmpty());
+                        } catch (Throwable ignored) {
+                            return false;
+                        }
+                    });
+                if (!ctorAlreadyExists) {
+                    addConstructorPlanIfNotExists(out, owner, Collections.emptyList());
+                }
             }
         }
 
@@ -2151,7 +2394,21 @@ public final class SpoonCollector {
                 CtTypeReference<?> owner = chooseOwnerPackage(t, c);
                 if (isJdkType(owner)) continue;
                 addTypePlanFromRef(out, owner, TypeStubPlan.Kind.CLASS);
-                out.ctorPlans.add(new ConstructorStubPlan(owner, Collections.emptyList()));
+                // CRITICAL FIX: Check for duplicate constructor plans before adding
+                String ownerQn = safeQN(owner);
+                boolean ctorAlreadyExists = out.ctorPlans.stream()
+                    .anyMatch(p -> {
+                        try {
+                            String pOwnerQn = safeQN(p.ownerType);
+                            return ownerQn != null && ownerQn.equals(pOwnerQn) && 
+                                   (p.parameterTypes == null || p.parameterTypes.isEmpty());
+                        } catch (Throwable ignored) {
+                            return false;
+                        }
+                    });
+                if (!ctorAlreadyExists) {
+                    addConstructorPlanIfNotExists(out, owner, Collections.emptyList());
+                }
             }
         }
 
@@ -2173,7 +2430,21 @@ public final class SpoonCollector {
                 CtTypeReference<?> owner = chooseOwnerPackage(raw, cat);
                 if (isJdkType(owner)) continue;
                 addTypePlanFromRef(out, owner, TypeStubPlan.Kind.CLASS);
-                out.ctorPlans.add(new ConstructorStubPlan(owner, Collections.emptyList()));
+                // CRITICAL FIX: Check for duplicate constructor plans before adding
+                String ownerQn = safeQN(owner);
+                boolean ctorAlreadyExists = out.ctorPlans.stream()
+                    .anyMatch(p -> {
+                        try {
+                            String pOwnerQn = safeQN(p.ownerType);
+                            return ownerQn != null && ownerQn.equals(pOwnerQn) && 
+                                   (p.parameterTypes == null || p.parameterTypes.isEmpty());
+                        } catch (Throwable ignored) {
+                            return false;
+                        }
+                    });
+                if (!ctorAlreadyExists) {
+                    addConstructorPlanIfNotExists(out, owner, Collections.emptyList());
+                }
             }
         }
 
@@ -2187,7 +2458,7 @@ public final class SpoonCollector {
                 if (!isJdkType(owner)) {
                     addTypePlanFromRef(out, owner, TypeStubPlan.Kind.CLASS);
                     List<CtTypeReference<?>> ps = inferParamTypesFromCall(cc.getExecutable(), cc.getArguments());
-                    out.ctorPlans.add(new ConstructorStubPlan(owner, ps));
+                    addConstructorPlanIfNotExists(out, owner, ps);
                 }
             } else if (ex != null) {
                 try {
@@ -2195,7 +2466,21 @@ public final class SpoonCollector {
                     if (t != null && !isJdkType(t) && t.getDeclaration() == null) {
                         CtTypeReference<?> owner = chooseOwnerPackage(t, thr);
                         addTypePlanIfNonJdk(out, owner.getQualifiedName(), TypeStubPlan.Kind.CLASS);
-                        out.ctorPlans.add(new ConstructorStubPlan(owner, Collections.emptyList()));
+                        // CRITICAL FIX: Check for duplicate constructor plans before adding
+                String ownerQn = safeQN(owner);
+                boolean ctorAlreadyExists = out.ctorPlans.stream()
+                    .anyMatch(p -> {
+                        try {
+                            String pOwnerQn = safeQN(p.ownerType);
+                            return ownerQn != null && ownerQn.equals(pOwnerQn) && 
+                                   (p.parameterTypes == null || p.parameterTypes.isEmpty());
+                        } catch (Throwable ignored) {
+                            return false;
+                        }
+                    });
+                if (!ctorAlreadyExists) {
+                    addConstructorPlanIfNotExists(out, owner, Collections.emptyList());
+                }
                     }
                 } catch (Throwable ignored) {
                 }
@@ -2221,6 +2506,13 @@ public final class SpoonCollector {
             collectTypeRefDeep(p, p.getType(), out);
         }
         for (CtMethod<?> m : model.getElements((CtMethod<?> mm) -> true)) {
+            // CRITICAL FIX: Collect method return types (was missing!)
+            try {
+                CtTypeReference<?> returnType = m.getType();
+                if (returnType != null) {
+                    collectTypeRefDeep(m, returnType, out);
+                }
+            } catch (Throwable ignored) {}
             for (CtTypeReference<? extends Throwable> thr : m.getThrownTypes()) {
                 collectTypeRefDeep(m, thr, out);
             }
@@ -2238,6 +2530,15 @@ public final class SpoonCollector {
     @SuppressWarnings("unchecked")
     private void maybePlanDeclaredType(CtElement ctx, CtTypeReference<?> t, CollectResult out) {
         if (t == null) return;
+
+        // CRITICAL FIX: Type parameters should NEVER be stubbed as classes
+        // Type parameters like T1, T2, T3, T4, R are part of the generic type system
+        // and should not be collected as classes in unknown.* package
+        try {
+            if (t instanceof CtTypeParameterReference) {
+                return; // Skip type parameters - they're not classes
+            }
+        } catch (Throwable ignored) {}
 
         // arrays → recurse on component
         try {
@@ -2271,9 +2572,58 @@ public final class SpoonCollector {
         if (isPrimitiveTypeName(simple)) {
             return;
         }
+        
+        // CRITICAL FIX: Detect type parameters by name pattern
+        // Type parameters are typically: T, R, U, V, E, K, V, or T1, T2, T3, etc.
+        // Single uppercase letter or T/U/R followed by number pattern
+        if (isLikelyTypeParameter(simple)) {
+            // Check if this is actually a type parameter in the current context
+            // by checking if the owner type has this as a formal type parameter
+            try {
+                CtElement parent = ctx;
+                while (parent != null) {
+                    if (parent instanceof CtFormalTypeDeclarer) {
+                        CtFormalTypeDeclarer declarer = (CtFormalTypeDeclarer) parent;
+                        List<CtTypeParameter> typeParams = declarer.getFormalCtTypeParameters();
+                        if (typeParams != null) {
+                            for (CtTypeParameter tp : typeParams) {
+                                if (simple.equals(tp.getSimpleName())) {
+                                    // This is a type parameter - don't stub it
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    parent = parent.getParent();
+                }
+            } catch (Throwable ignored) {
+                // If we can't check, be conservative and skip single-letter uppercase names
+                // that look like type parameters
+                if (simple.length() == 1 && Character.isUpperCase(simple.charAt(0))) {
+                    return; // Likely a type parameter like T, R, U, V
+                }
+                if (simple.matches("^[TUR][0-9]+$")) {
+                    return; // Likely a type parameter like T1, T2, U1, R1
+                }
+            }
+        }
 
         // ---- SIMPLE NAME branch -------------------------------------------------
         if (!qn.contains(".")) {
+            // 0) CRITICAL FIX: Check if this is a static field from a static import
+            // This prevents static fields like PUSH_ANDROID_SERVER_ADDRESS from being collected as types
+            CtTypeReference<?> staticFieldOwner = resolveStaticFieldFromImports(ctx, simple);
+            if (staticFieldOwner != null) {
+                // This is a static field, not a type - add to static imports instead
+                String ownerFqn = staticFieldOwner.getQualifiedName();
+                if (ownerFqn != null && !isJdkFqn(ownerFqn)) {
+                    out.staticImports.computeIfAbsent(ownerFqn, k -> new LinkedHashSet<>()).add(simple);
+                    System.out.println("[maybePlanDeclaredType] Detected static field from import: " + simple + 
+                        " from " + ownerFqn + " - adding to static imports instead of creating type");
+                    return; // Don't create a type for static fields
+                }
+            }
+            
             // 1) explicit single-type import wins
             CtTypeReference<?> explicit = resolveFromExplicitTypeImports(ctx, simple);
             if (explicit != null) {
@@ -2318,6 +2668,70 @@ public final class SpoonCollector {
                 return;
             }
 
+            // CRITICAL FIX: Before falling back to unknown.*, try to infer package from context
+            // If this type is used as a return type or parameter of a method on a known type,
+            // use that type's package (e.g., Tuple4 used in io.vavr.Tuple#of -> io.vavr.Tuple4)
+            try {
+                CtElement parent = ctx;
+                while (parent != null) {
+                    // Check if we're in a method call context
+                    if (parent instanceof CtInvocation) {
+                        CtInvocation<?> inv = (CtInvocation<?>) parent;
+                        CtExecutableReference<?> exec = inv.getExecutable();
+                        if (exec != null) {
+                            CtTypeReference<?> ownerType = exec.getDeclaringType();
+                            if (ownerType != null) {
+                                String ownerQn = safeQN(ownerType);
+                                if (ownerQn != null && ownerQn.contains(".")) {
+                                    // Extract package from owner type
+                                    int lastDot = ownerQn.lastIndexOf('.');
+                                    if (lastDot > 0) {
+                                        String ownerPkg = ownerQn.substring(0, lastDot);
+                                        // Use owner's package for the type (e.g., io.vavr.Tuple -> io.vavr.Tuple4)
+                                        String inferredFqn = ownerPkg + "." + simple;
+                                        // Check if this type exists in the model
+                                        try {
+                                            CtType<?> existingType = f.Type().get(inferredFqn);
+                                            if (existingType != null) {
+                                                addTypePlanIfNonJdk(out, inferredFqn, TypeStubPlan.Kind.CLASS);
+                                                return;
+                                            }
+                                        } catch (Throwable ignored) {}
+                                        // Even if not in model, prefer owner's package over unknown
+                                        if (!isJdkPackage(ownerPkg) && !"unknown".equals(ownerPkg)) {
+                                            addTypePlanIfNonJdk(out, inferredFqn, TypeStubPlan.Kind.CLASS);
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Check if we're in a method declaration context
+                    if (parent instanceof CtMethod) {
+                        CtMethod<?> method = (CtMethod<?>) parent;
+                        CtTypeReference<?> ownerType = method.getDeclaringType() != null ? 
+                            method.getDeclaringType().getReference() : null;
+                        if (ownerType != null) {
+                            String ownerQn = safeQN(ownerType);
+                            if (ownerQn != null && ownerQn.contains(".")) {
+                                int lastDot = ownerQn.lastIndexOf('.');
+                                if (lastDot > 0) {
+                                    String ownerPkg = ownerQn.substring(0, lastDot);
+                                    String inferredFqn = ownerPkg + "." + simple;
+                                    if (!isJdkPackage(ownerPkg) && !"unknown".equals(ownerPkg)) {
+                                        addTypePlanIfNonJdk(out, inferredFqn, TypeStubPlan.Kind.CLASS);
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    parent = parent.getParent();
+                }
+            } catch (Throwable ignored) {
+                // If inference fails, continue to fallback
+            }
 
             // 3) fallback to unknown.*
             addTypePlanIfNonJdk(out, "unknown." + simple, TypeStubPlan.Kind.CLASS);
@@ -2722,7 +3136,7 @@ public final class SpoonCollector {
 
             for (String fqn : fqns) {
                 if (isJdkPkg(fqn)) continue;
-                out.typePlans.add(new TypeStubPlan(fqn, TypeStubPlan.Kind.CLASS));
+                addTypePlanIfNonJdk(out, fqn, TypeStubPlan.Kind.CLASS);
             }
         });
     }
@@ -2735,9 +3149,35 @@ public final class SpoonCollector {
      * Detect invocations where an owner type and same-name methods exist, but no overload matches
      * the given argument types. Emit a plan to create a matching overload.
      */
+    /**
+     * CRITICAL FIX: Collect overload gaps - only for interesting owners (demand-driven).
+     */
     private void collectOverloadGaps(CtModel model, CollectResult out) {
-        System.err.println("[collectOverloadGaps] Starting, current method plans: " + out.methodPlans.size());
+        // Suppressed debug output
         List<CtInvocation<?>> invocations = model.getElements((CtInvocation<?> inv) -> {
+            // CRITICAL FIX: Filter by interesting owners
+            try {
+                CtExpression<?> target = inv.getTarget();
+                CtTypeReference<?> ownerType = null;
+                if (target instanceof CtTypeAccess<?>) {
+                    ownerType = ((CtTypeAccess<?>) target).getAccessedType();
+                } else if (target != null) {
+                    ownerType = target.getType();
+                }
+                if (ownerType != null) {
+                    String ownerQn = safeQN(ownerType);
+                    if (ownerQn != null && isIgnoredPackage(ownerQn)) {
+                        return false; // Skip ignored packages
+                    }
+                    // Only collect for interesting owners
+                    if (!isInterestingOwner(out, ownerType)) {
+                        return false; // Skip if owner is not in interesting types
+                    }
+                }
+            } catch (Throwable ignored) {
+                // Continue if we can't determine owner
+            }
+            
             CtExecutableReference<?> ex = inv.getExecutable();
             String name = (ex != null ? ex.getSimpleName() : null);
             if (name == null || "<init>".equals(name)) return false;
@@ -2912,6 +3352,75 @@ public final class SpoonCollector {
                 );
             }
 
+            // CRITICAL FIX: Check if this method already exists in plans BEFORE adding
+            // This prevents over-collection and duplicate method generation
+            String finalOwnerQn = ownerQn;
+            String finalOwnerQnErased = erasureFqn(owner);
+            boolean methodAlreadyExists = out.methodPlans.stream()
+                    .anyMatch(p -> {
+                        try {
+                            String pOwnerQn = safeQN(p.ownerType);
+                            // Check if owner matches (exact or erased)
+                            boolean ownerMatches = finalOwnerQn != null && finalOwnerQn.equals(pOwnerQn);
+                            if (!ownerMatches && finalOwnerQnErased != null) {
+                                String pOwnerQnErased = erasureFqn(p.ownerType);
+                                ownerMatches = finalOwnerQnErased.equals(pOwnerQnErased);
+                            }
+                            if (!ownerMatches || !name.equals(p.name)) return false;
+                            
+                            // Check if parameter count matches
+                            if (p.paramTypes == null || p.paramTypes.size() != paramTypes.size()) {
+                                return false;
+                            }
+                            
+                            // For functional interface SAM methods (make/apply), check if any SAM already exists
+                            // Java autoboxing allows int/Integer to be compatible, so we only need one SAM
+                            if ("make".equals(name) || "apply".equals(name)) {
+                                // If this is a SAM method and owner already has a SAM, skip
+                                return !p.defaultOnInterface && !p.isStatic;
+                            }
+                            
+                            // For other methods, check if parameter types are compatible
+                            // Use relaxed matching: exact match OR primitive/boxed pair OR both Object/Unknown
+                            boolean allParamsCompatible = true;
+                            for (int i = 0; i < paramTypes.size(); i++) {
+                                CtTypeReference<?> pParam = p.paramTypes.get(i);
+                                CtTypeReference<?> newParam = paramTypes.get(i);
+                                if (pParam == null || newParam == null) {
+                                    allParamsCompatible = false;
+                                    break;
+                                }
+                                String pParamQn = safeQN(pParam);
+                                String newParamQn = safeQN(newParam);
+                                if (pParamQn == null || newParamQn == null) {
+                                    allParamsCompatible = false;
+                                    break;
+                                }
+                                // Exact match
+                                if (pParamQn.equals(newParamQn)) continue;
+                                // Primitive/boxed pair
+                                if (isPrimitiveBoxPair(pParamQn, newParamQn)) continue;
+                                // Both are Object or Unknown (compatible for method resolution)
+                                if ((pParamQn.equals("java.lang.Object") || pParamQn.contains("Unknown")) &&
+                                    (newParamQn.equals("java.lang.Object") || newParamQn.contains("Unknown"))) {
+                                    continue;
+                                }
+                                allParamsCompatible = false;
+                                break;
+                            }
+                            return allParamsCompatible;
+                        } catch (Throwable ignored) {
+                            return false;
+                        }
+                    });
+            
+            if (methodAlreadyExists) {
+                // Method already exists in plans - skip to prevent duplicate
+                System.err.println("[collectOverloadGaps] Skipping duplicate method: " + finalOwnerQn + "#" + name + 
+                    "(" + paramTypes.size() + " params) - already exists in plans");
+                continue;
+            }
+
             // Check if this is a method call on a functional interface
             // Functional interfaces should only have ONE abstract method (the SAM)
             // If the owner already has a SAM method plan (make/apply), skip adding any other SAM method
@@ -2920,9 +3429,7 @@ public final class SpoonCollector {
             // because Java autoboxing allows apply(1) to call apply(Integer)
             boolean isFunctionalInterfaceMethod = ("make".equals(name) || "apply".equals(name));
             if (isFunctionalInterfaceMethod) {
-                String finalOwnerQn = ownerQn;
                 // Also check erased FQN to handle generics (F vs F<Integer>)
-                String finalOwnerQnErased = erasureFqn(owner);
                 boolean alreadyHasSam = out.methodPlans.stream()
                         .anyMatch(p -> {
                             try {
@@ -2951,13 +3458,15 @@ public final class SpoonCollector {
                 }
             }
 
-            out.methodPlans.add(new MethodStubPlan(owner, name, returnType, paramTypes, isStatic, vis, thrown));
+            // CRITICAL FIX: Use addMethodPlan for deduplication
+            MethodStubPlan plan = new MethodStubPlan(owner, name, returnType, paramTypes, isStatic, vis, thrown);
+            addMethodPlan(out, plan);
             if (("apply".equals(name) || "make".equals(name))) {
                 System.err.println("[collectOverloadGaps] Added SAM method: " + ownerQn + "#" + name + "(" + 
                     paramTypes.stream().map(t -> safeQN(t)).collect(Collectors.joining(", ")) + ")");
         }
         }
-        System.err.println("[collectOverloadGaps] Finished, total method plans: " + out.methodPlans.size());
+        // Suppressed debug output
     }
 
     /**
@@ -3017,20 +3526,95 @@ public final class SpoonCollector {
     private void collectTypeRefDeep(CtElement ctx, CtTypeReference<?> t, CollectResult out) {
         if (t == null) return;
 
-        maybePlanDeclaredType(ctx, t, out);
+        // CRITICAL FIX: Before planning the type, strip type parameters that are from enclosing context
+        // This prevents Tuple4<T1, T2, T3, T4> from being collected as Tuple4 with T1, T2, T3, T4 as classes
+        // We only want to collect the base type (Tuple4), not its type arguments if they're type parameters
+        CtTypeReference<?> baseType = stripTypeParameterArguments(t);
+        maybePlanDeclaredType(ctx, baseType, out);
 
         try {
             for (CtTypeReference<?> arg : t.getActualTypeArguments()) {
                 if (arg == null) continue;
+                
+                // CRITICAL FIX: Skip type parameters - they're not classes to stub
+                // Type parameters like T1, T2, T3, T4, R are part of the generic type system
+                // and should NOT be collected as classes
+                if (arg instanceof CtTypeParameterReference) {
+                    continue; // Skip type parameters - they're not classes
+                }
+                
                 if (arg instanceof CtWildcardReference) {
                     var w = (CtWildcardReference) arg;
                     CtTypeReference<?> bound = w.getBoundingType();
-                    if (bound != null) collectTypeRefDeep(ctx, bound, out);
+                    if (bound != null) {
+                        // Also check if bound is a type parameter
+                        if (!(bound instanceof CtTypeParameterReference)) {
+                            collectTypeRefDeep(ctx, bound, out);
+                        }
+                    }
                 } else {
                     collectTypeRefDeep(ctx, arg, out);
                 }
             }
         } catch (Throwable ignored) {
+        }
+    }
+    
+    /**
+     * CRITICAL FIX: Strip type parameter arguments from a type reference.
+     * If a type is Tuple4<T1, T2, T3, T4> where T1, T2, T3, T4 are type parameters,
+     * return just Tuple4 (without the type arguments).
+     * This prevents type parameters from being collected as classes.
+     */
+    private CtTypeReference<?> stripTypeParameterArguments(CtTypeReference<?> t) {
+        if (t == null) return t;
+        
+        try {
+            List<CtTypeReference<?>> typeArgs = t.getActualTypeArguments();
+            if (typeArgs == null || typeArgs.isEmpty()) {
+                return t; // No type arguments, return as-is
+            }
+            
+            // Check if all type arguments are type parameters
+            boolean allAreTypeParams = true;
+            for (CtTypeReference<?> arg : typeArgs) {
+                if (!(arg instanceof CtTypeParameterReference)) {
+                    allAreTypeParams = false;
+                    break;
+                }
+            }
+            
+            // If all type arguments are type parameters, strip them by creating a new reference
+            if (allAreTypeParams) {
+                // CRITICAL: Create a completely new type reference that's not linked to the model
+                // Extract package and simple name to create a raw reference
+                String qn = safeQN(t);
+                if (qn != null && !qn.isEmpty()) {
+                    int lastDot = qn.lastIndexOf('.');
+                    String packageName = (lastDot > 0 ? qn.substring(0, lastDot) : "");
+                    String simpleName = (lastDot > 0 ? qn.substring(lastDot + 1) : qn);
+                    
+                    // Create a fresh reference using Core factory to avoid model linkage
+                    CtTypeReference<?> baseType = f.Core().createTypeReference();
+                    baseType.setSimpleName(simpleName);
+                    if (!packageName.isEmpty()) {
+                        baseType.setPackage(f.Package().createReference(packageName));
+                    }
+                    // CRITICAL: Ensure no type arguments are set
+                    baseType.setActualTypeArguments(Collections.emptyList());
+                    return baseType;
+                } else {
+                    // Fallback to clone if we can't get qualified name
+                    CtTypeReference<?> baseType = t.clone();
+                    baseType.setActualTypeArguments(Collections.emptyList());
+                    return baseType;
+                }
+            }
+            
+            // Otherwise, return as-is (has non-type-parameter arguments like String, Integer, etc.)
+            return t;
+        } catch (Throwable ignored) {
+            return t; // If anything fails, return original
         }
     }
 
@@ -3046,38 +3630,78 @@ public final class SpoonCollector {
         for (CtClass<?> c : model.getElements((CtClass<?> cc) -> true)) {
             CtTypeReference<?> sup = null;
             try {
-
-                System.out.println("[collect] " + c.getQualifiedName() + " extends raw=" + safeQN(sup));
-                CtTypeReference<?> owner = chooseOwnerPackage(sup, c);
                 sup = c.getSuperclass();
-                System.out.println("[collect] " + c.getQualifiedName() + " extends chosen=" + safeQN(owner));
+                // Suppressed debug output
             } catch (Throwable ignored) {
             }
             if (sup != null) {
                 String sqn = safeQN(sup);
-                if (sqn != null && sqn.startsWith("unknown.")) {
-                    // CRITICAL FIX: For superclasses, prefer the child's package instead of unknown
-                    // This ensures parent classes are created in the correct package (e.g., org.lwjgl.vulkan)
-                    String childPkg = null;
+                // CRITICAL FIX: Check if superclass is from imports (e.g., org.apache.tools.ant.Task)
+                // If the simple name matches an imported type, use the imported FQN
+                if (sqn != null && (sqn.startsWith("unknown.") || sqn.equals(sup.getSimpleName()))) {
+                    // Check imports for the superclass name
                     try {
-                        CtPackage pkg = c.getPackage();
-                        if (pkg != null) {
-                            childPkg = pkg.getQualifiedName();
+                        CtCompilationUnit cu = f.CompilationUnit().getOrCreate(c);
+                        if (cu != null) {
+                            String superSimple = sup.getSimpleName();
+                            for (CtImport imp : cu.getImports()) {
+                                try {
+                                    if (imp.getImportKind() == CtImportKind.TYPE) {
+                                        CtTypeReference<?> impRef = (CtTypeReference<?>) imp.getReference();
+                                        if (impRef != null && superSimple.equals(impRef.getSimpleName())) {
+                                            String impFqn = impRef.getQualifiedName();
+                                            if (impFqn != null && !impFqn.isEmpty()) {
+                                                // Found matching import - use it
+                                                sup = f.Type().createReference(impFqn);
+                                                System.out.println("[collect] " + c.getQualifiedName() + 
+                                                    " extends (from import)=" + impFqn);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                } catch (Throwable ignored) {}
+                            }
                         }
                     } catch (Throwable ignored) {}
                     
-                    if (childPkg != null && !childPkg.isEmpty() && !childPkg.startsWith("java.")) {
-                        // Use child's package for superclass
-                        String superSimple = sup.getSimpleName();
-                        String candidateFqn = childPkg + "." + superSimple;
-                        sup = f.Type().createReference(candidateFqn);
-                    } else {
-                        sup = f.Type().createReference(sup.getSimpleName());
+                    // If still unknown, try child's package
+                    if (sqn != null && sqn.startsWith("unknown.")) {
+                        String childPkg = null;
+                        try {
+                            CtPackage pkg = c.getPackage();
+                            if (pkg != null) {
+                                childPkg = pkg.getQualifiedName();
+                            }
+                        } catch (Throwable ignored) {}
+                        
+                        if (childPkg != null && !childPkg.isEmpty() && !childPkg.startsWith("java.")) {
+                            // Use child's package for superclass
+                            String superSimple = sup.getSimpleName();
+                            String candidateFqn = childPkg + "." + superSimple;
+                            sup = f.Type().createReference(candidateFqn);
+                        } else {
+                            sup = f.Type().createReference(sup.getSimpleName());
+                        }
                     }
                 }
                 CtTypeReference<?> owner = chooseOwnerPackage(sup, c);
+                // Suppressed debug output
                 if (owner != null && !isJdkType(owner)) {
                     addTypePlanFromRef(out, owner, TypeStubPlan.Kind.CLASS);
+                    
+                    // CRITICAL FIX: Collect common superclass methods (e.g., getProject() from Task)
+                    // If superclass is Task or extends Task, add getProject() method
+                    String ownerQn = safeQN(owner);
+                    if (ownerQn != null && (ownerQn.contains("Task") || ownerQn.equals("org.apache.tools.ant.Task"))) {
+                        // Add getProject() method to Task class
+                        CtTypeReference<?> projectType = f.Type().createReference("org.apache.tools.ant.Project");
+                        MethodStubPlan getProjectPlan = new MethodStubPlan(
+                            owner, "getProject", projectType, Collections.emptyList(),
+                            false, MethodStubPlan.Visibility.PUBLIC, Collections.emptyList(),
+                            false, false, false, null
+                        );
+                        addMethodPlan(out, getProjectPlan);
+                    }
                 }
             }
             for (CtTypeReference<?> si : safe(c.getSuperInterfaces())) {
@@ -3184,10 +3808,12 @@ public final class SpoonCollector {
                     CtTypeReference<?> iterRef = f.Type().createReference("java.util.Iterator");
                     if (elem != null) iterRef.addActualTypeArgument(elem);
 
-                    out.methodPlans.add(new MethodStubPlan(
+                    // CRITICAL FIX: Use addMethodPlan for deduplication
+                    MethodStubPlan iteratorPlan = new MethodStubPlan(
                             owner, "iterator", iterRef, Collections.emptyList(),
                             false, MethodStubPlan.Visibility.PUBLIC, Collections.emptyList()
-                    ));
+                    );
+                    addMethodPlan(out, iteratorPlan);
                 }
             }
         }
@@ -3552,14 +4178,134 @@ public final class SpoonCollector {
         }
         return null;
     }
+    
+    /**
+     * CRITICAL FIX: Check if a simple name is a static field from a static import.
+     * This prevents static fields like PUSH_ANDROID_SERVER_ADDRESS from being collected as types.
+     * 
+     * @param ctx The context element (where the identifier is used)
+     * @param fieldSimple The simple name of the field (e.g., "PUSH_ANDROID_SERVER_ADDRESS")
+     * @return The owner type if it's a static field from a static import, null otherwise
+     */
+    private CtTypeReference<?> resolveStaticFieldFromImports(CtElement ctx, String fieldSimple) {
+        if (fieldSimple == null || fieldSimple.isEmpty()) return null;
+        
+        // Only check for ALL_UPPERCASE identifiers (typical static field naming)
+        if (!fieldSimple.matches("^[A-Z_][A-Z0-9_]*$")) {
+            return null; // Not a typical static field name
+        }
+        
+        var type = ctx.getParent(CtType.class);
+        var pos = (type != null ? type.getPosition() : null);
+        var cu = (pos != null ? pos.getCompilationUnit() : null);
+        if (cu == null) return null;
+
+        // 1) Check Spoon-parsed static imports
+        for (CtImport imp : cu.getImports()) {
+            try {
+                // On-demand static: import static pkg.Api.*;
+                if (imp.getImportKind().name().contains("ALL") && imp.getReference() instanceof CtTypeReference) {
+                    CtTypeReference<?> tr = (CtTypeReference<?>) imp.getReference();
+                    String ownerFqn = tr.getQualifiedName();
+                    if (ownerFqn != null) {
+                        // Check if this class has or will have this static field
+                        CtType<?> ownerType = f.Type().get(ownerFqn);
+                        if (ownerType != null) {
+                            // Check if the class has this static field
+                            boolean hasStaticField = ownerType.getFields().stream()
+                                .anyMatch(f -> fieldSimple.equals(f.getSimpleName()) && 
+                                    f.hasModifier(ModifierKind.STATIC));
+                            if (hasStaticField) {
+                                return tr;
+                            }
+                        }
+                        // Even if not found in model, if there's a static import, assume it's a static field
+                        // This handles cases where the class is not in the model yet
+                        return tr;
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+
+        // 2) Raw-source fallback: parse import static statements
+        try {
+            String src = cu.getOriginalSourceCode();
+            if (src != null) {
+                // Pattern: import static pkg.Class.*;
+                Pattern staticStarPattern = Pattern.compile("\\bimport\\s+static\\s+([\\w\\.]+)\\.\\*\\s*;");
+                Matcher m = staticStarPattern.matcher(src);
+                while (m.find()) {
+                    String clsFqn = m.group(1);
+                    // Check if this class exists and has the static field
+                    CtType<?> ownerType = f.Type().get(clsFqn);
+                    if (ownerType != null) {
+                        boolean hasStaticField = ownerType.getFields().stream()
+                            .anyMatch(f -> fieldSimple.equals(f.getSimpleName()) && 
+                                f.hasModifier(ModifierKind.STATIC));
+                        if (hasStaticField) {
+                            return f.Type().createReference(clsFqn);
+                        }
+                    }
+                    // If class not in model but has static import, assume it's a static field
+                    // This is a heuristic - better to add static import than create wrong type
+                    return f.Type().createReference(clsFqn);
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
 
 
     private boolean looksLikeVarargs(CtInvocation<?> inv) {
         var args = inv.getArguments();
         if (args == null || args.size() < 2) return false;
+        
+        // Original logic: check if last 2 args have same type
         CtTypeReference<?> a = paramTypeOrObject(args.get(args.size() - 1));
         CtTypeReference<?> b = paramTypeOrObject(args.get(args.size() - 2));
-        return erasedEq(a, b);
+        if (erasedEq(a, b)) return true;
+        
+        // CRITICAL FIX: For logging methods (info, debug, warn, error, trace), 
+        // any call with 3+ arguments is likely varargs (format string + 2+ values)
+        String methodName = (inv.getExecutable() != null ? inv.getExecutable().getSimpleName() : null);
+        if (methodName != null && (methodName.equals("info") || methodName.equals("debug") || 
+            methodName.equals("warn") || methodName.equals("error") || methodName.equals("trace"))) {
+            // For logging methods, if there are 3+ arguments, it's likely varargs
+            // Pattern: info("format {}", arg1, arg2, ...)
+            if (args.size() >= 3) {
+                // Check if first arg is a String (format string)
+                CtTypeReference<?> firstArgType = paramTypeOrObject(args.get(0));
+                if (firstArgType != null) {
+                    String firstQn = safeQN(firstArgType);
+                    if (firstQn != null && (firstQn.equals("java.lang.String") || 
+                        firstQn.equals("String") || firstArgType.equals(f.Type().STRING))) {
+                        // First arg is String, and we have 3+ args total - this is varargs
+                        return true;
+                    }
+                }
+            }
+        }
+        
+        // Also check if there are 3+ arguments with different types (common varargs pattern)
+        if (args.size() >= 3) {
+            // If we have 3+ arguments and they're not all the same type, it's likely varargs
+            Set<String> uniqueTypes = new HashSet<>();
+            for (int i = 1; i < args.size(); i++) { // Skip first arg (might be format string)
+                CtTypeReference<?> argType = paramTypeOrObject(args.get(i));
+                if (argType != null) {
+                    String qn = safeQN(argType);
+                    if (qn != null) uniqueTypes.add(qn);
+                }
+            }
+            // If we have multiple different types in the arguments, it's likely varargs
+            if (uniqueTypes.size() >= 2) {
+                return true;
+            }
+        }
+        
+        return false;
     }
 
     private boolean erasedEq(CtTypeReference<?> x, CtTypeReference<?> y) {
@@ -3824,6 +4570,11 @@ public final class SpoonCollector {
                 CtTypeReference<?> owner = chooseOwnerPackage(rt, twr);
                 // skip JDK types and unknowns
                 if (owner == null || isJdkType(owner)) continue;
+                
+                // CRITICAL FIX: Check if owner is interesting before collecting
+                if (!isInterestingOwner(out, owner)) {
+                    continue; // Skip if owner is not in interesting types
+                }
 
                 // Attach AutoCloseable (do NOT create java.lang.AutoCloseable)
                 out.implementsPlans
@@ -3831,7 +4582,7 @@ public final class SpoonCollector {
                         .add(f.Type().createReference("java.lang.AutoCloseable"));
 
                 // Plan abstract close()
-                out.methodPlans.add(new MethodStubPlan(
+                MethodStubPlan closePlan = new MethodStubPlan(
                         owner,
                         "close",
                         f.Type().VOID_PRIMITIVE,
@@ -3843,7 +4594,8 @@ public final class SpoonCollector {
                         /*isAbstract*/ true,
                         /*isFinal*/ false,
                         /*varargsOnLast*/ null
-                ));
+                );
+                addMethodPlan(out, closePlan);
             }
         }
     }
@@ -3973,6 +4725,8 @@ public final class SpoonCollector {
     private void addTypePlanIfNonJdk(CollectResult out, String fqn, TypeStubPlan.Kind kind) {
         if (fqn == null || fqn.isEmpty()) return;
         if (isJdkFqn(fqn)) return;
+        // CRITICAL FIX: Skip ignored packages
+        if (isIgnoredPackage(fqn)) return;
         // Validate FQN: must have a simple name (not just a package)
         // Reject FQNs like "unknown." or "package." (ending with dot but no simple name)
         if (fqn.endsWith(".")) return; // Invalid: ends with dot but no simple name
@@ -3987,7 +4741,96 @@ public final class SpoonCollector {
         // Also check if simple name is an array type
         if (isArrayType(simpleName)) return;
         
-        out.typePlans.add(new TypeStubPlan(fqn, kind));
+        // CRITICAL FIX: Filter out primitive types and invalid types
+        if (isPrimitiveTypeName(simpleName)) return; // int, void, boolean, etc.
+        if ("void".equals(fqn) || "int".equals(fqn) || "long".equals(fqn) || 
+            "short".equals(fqn) || "byte".equals(fqn) || "char".equals(fqn) ||
+            "float".equals(fqn) || "double".equals(fqn) || "boolean".equals(fqn)) {
+            return; // Primitive types
+        }
+        
+        // Filter out known invalid types that shouldn't be stubbed
+        if ("unknown.PackageAnchor".equals(fqn)) return; // Package anchor is not a real type
+        if (fqn.startsWith("unknown.") && simpleName.equals("PackageAnchor")) return;
+        
+        // CRITICAL FIX: Use canonical key for deduplication
+        TypeStubPlan plan = new TypeStubPlan(fqn, kind);
+        String key = canonicalKey(plan);
+        if (out.typePlanKeys.contains(key)) {
+            // Already exists - check if we need to update the kind
+            for (TypeStubPlan existing : out.typePlans) {
+                if (fqn.equals(existing.qualifiedName)) {
+                    // Update kind if new kind is more specific (INTERFACE > CLASS, ENUM > CLASS)
+                    if (kind == TypeStubPlan.Kind.INTERFACE && existing.kind == TypeStubPlan.Kind.CLASS) {
+                        out.typePlans.remove(existing);
+                        out.typePlans.add(plan);
+                        out.typePlanKeys.add(key);
+                        return;
+                    }
+                    if (kind == TypeStubPlan.Kind.ENUM && existing.kind == TypeStubPlan.Kind.CLASS) {
+                        out.typePlans.remove(existing);
+                        out.typePlans.add(plan);
+                        out.typePlanKeys.add(key);
+                        return;
+                    }
+                    // CRITICAL FIX: Don't add CLASS if INTERFACE already exists (prevents interface/class confusion)
+                    if (kind == TypeStubPlan.Kind.CLASS && existing.kind == TypeStubPlan.Kind.INTERFACE) {
+                        // Interface already exists, don't add as class
+                        return;
+                    }
+                    // Already exists with same or better kind - skip
+                    return;
+                }
+            }
+            return;
+        }
+        
+        // Add the type plan with canonical key
+        out.typePlans.add(plan);
+        out.typePlanKeys.add(key);
+    }
+    
+    /**
+     * Add a constructor plan if it doesn't already exist (prevents duplicates).
+     */
+    private void addConstructorPlanIfNotExists(CollectResult out, CtTypeReference<?> owner, List<CtTypeReference<?>> paramTypes) {
+        if (owner == null) return;
+        String ownerQn = safeQN(owner);
+        if (ownerQn == null) return;
+        
+        // Check for duplicate constructor plans
+        boolean alreadyExists = out.ctorPlans.stream()
+            .anyMatch(p -> {
+                try {
+                    String pOwnerQn = safeQN(p.ownerType);
+                    if (ownerQn == null || !ownerQn.equals(pOwnerQn)) return false;
+                    
+                    // Check parameter types match
+                    List<CtTypeReference<?>> pParams = p.parameterTypes;
+                    if (paramTypes == null || paramTypes.isEmpty()) {
+                        return (pParams == null || pParams.isEmpty());
+                    }
+                    if (pParams == null || pParams.size() != paramTypes.size()) {
+                        return false;
+                    }
+                    // Check if all parameter types match (by qualified name)
+                    for (int i = 0; i < paramTypes.size(); i++) {
+                        String paramQn = safeQN(paramTypes.get(i));
+                        String pParamQn = safeQN(pParams.get(i));
+                        if (paramQn == null || !paramQn.equals(pParamQn)) {
+                            return false;
+                        }
+                    }
+                    return true;
+                } catch (Throwable ignored) {
+                    return false;
+                }
+            });
+        
+        if (!alreadyExists) {
+            ConstructorStubPlan plan = new ConstructorStubPlan(owner, paramTypes);
+            addConstructorPlan(out, plan);
+        }
     }
     
     /**
@@ -4022,6 +4865,517 @@ public final class SpoonCollector {
                 || qn.startsWith("jakarta.")
                 || qn.startsWith("sun.")
                 || qn.startsWith("jdk."));
+    }
+    
+    /**
+     * CRITICAL FIX: Check if a simple name looks like a type parameter.
+     * Type parameters are typically: T, R, U, V, E, K, V (single uppercase letter)
+     * or T1, T2, T3, U1, R1, etc. (letter followed by number).
+     */
+    private static boolean isLikelyTypeParameter(String simpleName) {
+        if (simpleName == null || simpleName.isEmpty()) return false;
+        
+        // Single uppercase letter (T, R, U, V, E, K, etc.)
+        if (simpleName.length() == 1 && Character.isUpperCase(simpleName.charAt(0))) {
+            return true;
+        }
+        
+        // Pattern: T1, T2, T3, U1, R1, etc. (letter followed by digits)
+        if (simpleName.matches("^[A-Z][0-9]+$")) {
+            return true;
+        }
+        
+        return false;
+    }
+    
+    /**
+     * CRITICAL FIX: Check if a package should be ignored (JDK, generated, etc.).
+     * Returns true for java.*, javax.*, jdk.*, sun.*, com.sun.*, kotlin.*, scala.*
+     * and known generated packages like org.lwjgl.* and any package containing .generated.
+     */
+    private static boolean isIgnoredPackage(String qn) {
+        if (qn == null || qn.isEmpty()) return false;
+        
+        // JDK packages
+        if (qn.startsWith("java.") || qn.startsWith("javax.") || 
+            qn.startsWith("jakarta.") || qn.startsWith("jdk.") ||
+            qn.startsWith("sun.") || qn.startsWith("com.sun.")) {
+            return true;
+        }
+        
+        // Other language runtimes
+        if (qn.startsWith("kotlin.") || qn.startsWith("scala.")) {
+            return true;
+        }
+        
+        // Generated packages
+        if (qn.contains(".generated.") || qn.contains(".generated")) {
+            return true;
+        }
+        
+        // Known generated packages
+        if (qn.startsWith("org.lwjgl.")) {
+            return true;
+        }
+        
+        return false;
+    }
+    
+    /**
+     * CRITICAL FIX: Generate canonical key for TypeStubPlan.
+     */
+    private String canonicalKey(TypeStubPlan plan) {
+        return "TYPE:" + plan.qualifiedName + ":" + plan.kind;
+    }
+    
+    /**
+     * CRITICAL FIX: Generate canonical key for MethodStubPlan.
+     */
+    private String canonicalKey(MethodStubPlan plan) {
+        try {
+            String ownerQn = safeQN(plan.ownerType);
+            if (ownerQn == null) ownerQn = "?";
+            StringBuilder key = new StringBuilder("METHOD:").append(ownerQn).append("#").append(plan.name).append("(");
+            for (int i = 0; i < plan.paramTypes.size(); i++) {
+                if (i > 0) key.append(",");
+                String paramQn = safeQN(plan.paramTypes.get(i));
+                key.append(paramQn != null ? paramQn : "?");
+            }
+            key.append(")");
+            if (plan.varargs) key.append("[varargs]");
+            return key.toString();
+        } catch (Throwable e) {
+            return "METHOD:?:" + plan.name;
+        }
+    }
+    
+    /**
+     * CRITICAL FIX: Generate canonical key for FieldStubPlan.
+     */
+    private String canonicalKey(FieldStubPlan plan) {
+        try {
+            String ownerQn = safeQN(plan.ownerType);
+            if (ownerQn == null) ownerQn = "?";
+            return "FIELD:" + ownerQn + "#" + plan.fieldName + (plan.isStatic ? ":static" : "");
+        } catch (Throwable e) {
+            return "FIELD:?:" + plan.fieldName;
+        }
+    }
+    
+    /**
+     * CRITICAL FIX: Generate canonical key for ConstructorStubPlan.
+     */
+    private String canonicalKey(ConstructorStubPlan plan) {
+        try {
+            String ownerQn = safeQN(plan.ownerType);
+            if (ownerQn == null) ownerQn = "?";
+            StringBuilder key = new StringBuilder("CTOR:").append(ownerQn).append("(");
+            if (plan.parameterTypes != null) {
+                for (int i = 0; i < plan.parameterTypes.size(); i++) {
+                    if (i > 0) key.append(",");
+                    String paramQn = safeQN(plan.parameterTypes.get(i));
+                    key.append(paramQn != null ? paramQn : "?");
+                }
+            }
+            key.append(")");
+            return key.toString();
+        } catch (Throwable e) {
+            return "CTOR:?:()";
+        }
+    }
+    
+    /**
+     * CRITICAL FIX: Add method plan with deduplication using canonical key.
+     */
+    private boolean addMethodPlan(CollectResult out, MethodStubPlan plan) {
+        String key = canonicalKey(plan);
+        if (out.methodPlanKeys.contains(key)) {
+            return false; // Already exists
+        }
+        out.methodPlans.add(plan);
+        out.methodPlanKeys.add(key);
+        return true;
+    }
+    
+    /**
+     * CRITICAL FIX: Add field plan with deduplication using canonical key.
+     */
+    private boolean addFieldPlan(CollectResult out, FieldStubPlan plan) {
+        String key = canonicalKey(plan);
+        if (out.fieldPlanKeys.contains(key)) {
+            return false; // Already exists
+        }
+        out.fieldPlans.add(plan);
+        out.fieldPlanKeys.add(key);
+        return true;
+    }
+    
+    /**
+     * CRITICAL FIX: Add constructor plan with deduplication using canonical key.
+     */
+    private boolean addConstructorPlan(CollectResult out, ConstructorStubPlan plan) {
+        String key = canonicalKey(plan);
+        if (out.ctorPlanKeys.contains(key)) {
+            return false; // Already exists
+        }
+        out.ctorPlans.add(plan);
+        out.ctorPlanKeys.add(key);
+        return true;
+    }
+    
+    /**
+     * CRITICAL FIX: Check if owner type should be collected.
+     * We should collect for ALL referenced types (not just interesting ones).
+     * The interesting types set is used to avoid over-collection, but we still need
+     * to collect referenced types that aren't in the slice.
+     * 
+     * We should NOT collect for:
+     * - Ignored packages (JDK, generated, etc.)
+     */
+    private boolean isInterestingOwner(CollectResult out, CtTypeReference<?> ownerType) {
+        if (ownerType == null) return false;
+        try {
+            String ownerQn = safeQN(ownerType);
+            if (ownerQn == null) return false;
+            
+            // CRITICAL FIX: Skip ignored packages (JDK, generated, etc.)
+            if (isIgnoredPackage(ownerQn)) return false;
+            
+            // CRITICAL FIX: Track referenced owners for later use
+            out.referencedOwners.add(ownerQn);
+            
+            // CRITICAL FIX: Collect for ALL non-ignored types
+            // The interesting types set is used to prioritize, not to filter
+            // We need to stub all referenced types, not just those in the slice
+            return true;
+        } catch (Throwable e) {
+            return false;
+        }
+    }
+    
+    /**
+     * CRITICAL FIX: Remove static field types from type plans.
+     * Static fields like PUSH_ANDROID_SERVER_ADDRESS should be static imports, not separate types.
+     * This post-processes the type plans to remove any that are actually static fields from static imports.
+     */
+    private void removeStaticFieldTypesFromPlans(CtModel model, CollectResult out) {
+        // Find all static imports in the model AND in source code
+        Map<String, Set<String>> staticImportsByOwner = new HashMap<>();
+        
+        // 1) Check all types in the model for static imports
+        for (CtType<?> type : model.getAllTypes()) {
+            try {
+                CtCompilationUnit cu = f.CompilationUnit().getOrCreate(type);
+                if (cu == null) continue;
+                
+                // Check Spoon-parsed imports
+                for (CtImport imp : cu.getImports()) {
+                    try {
+                        // On-demand static: import static pkg.Api.*;
+                        if (imp.getImportKind().name().contains("ALL") && imp.getReference() instanceof CtTypeReference) {
+                            CtTypeReference<?> tr = (CtTypeReference<?>) imp.getReference();
+                            String ownerFqn = tr.getQualifiedName();
+                            if (ownerFqn != null) {
+                                collectStaticFieldsFromClass(ownerFqn, staticImportsByOwner);
+                            }
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+                
+                // 2) Check raw source for import static statements (more reliable)
+                try {
+                    String src = cu.getOriginalSourceCode();
+                    if (src != null) {
+                        Pattern staticStarPattern = Pattern.compile("\\bimport\\s+static\\s+([\\w\\.]+)\\.\\*\\s*;");
+                        Matcher m = staticStarPattern.matcher(src);
+                        while (m.find()) {
+                            String clsFqn = m.group(1);
+                            collectStaticFieldsFromClass(clsFqn, staticImportsByOwner);
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        
+        // 3) Also check type plans for classes that have static fields (e.g., BrokerConstants)
+        // If a class like BrokerConstants is in type plans and has static fields, mark those fields
+        for (TypeStubPlan plan : out.typePlans) {
+            String fqn = plan.qualifiedName;
+            if (fqn == null || fqn.startsWith("unknown.")) continue;
+            
+            // Check if this class exists in model and has static fields
+            CtType<?> ownerType = f.Type().get(fqn);
+            if (ownerType != null) {
+                for (CtField<?> field : ownerType.getFields()) {
+                    if (field.hasModifier(ModifierKind.STATIC)) {
+                        String fieldName = field.getSimpleName();
+                        if (fieldName != null && fieldName.matches("^[A-Z_][A-Z0-9_]*$")) {
+                            staticImportsByOwner.computeIfAbsent(fqn, k -> new HashSet<>()).add(fieldName);
+                            System.out.println("[removeStaticFieldTypesFromPlans] Found static field " + fieldName + 
+                                " in class " + fqn + " (from type plans)");
+                        }
+                    }
+                }
+            } else {
+                // CRITICAL FIX: Class not in model yet, but check if it's in sliced source
+                // For classes like BrokerConstants that are in sliced source, we need to check the source directly
+                // Look for the class in all compilation units
+                for (CtType<?> type : model.getAllTypes()) {
+                    try {
+                        CtCompilationUnit cu = f.CompilationUnit().getOrCreate(type);
+                        if (cu == null) continue;
+                        
+                        String src = cu.getOriginalSourceCode();
+                        if (src != null) {
+                            // Check if this file contains the class definition
+                            String simpleName = fqn.substring(fqn.lastIndexOf('.') + 1);
+                            Pattern classPattern = Pattern.compile("\\bclass\\s+" + Pattern.quote(simpleName) + "\\b");
+                            if (classPattern.matcher(src).find()) {
+                                // Found the class - extract static fields from source
+                                Pattern staticFieldPattern = Pattern.compile(
+                                    "\\bpublic\\s+static\\s+final\\s+String\\s+([A-Z_][A-Z0-9_]*)\\s*=");
+                                Matcher fieldMatcher = staticFieldPattern.matcher(src);
+                                while (fieldMatcher.find()) {
+                                    String fieldName = fieldMatcher.group(1);
+                                    staticImportsByOwner.computeIfAbsent(fqn, k -> new HashSet<>()).add(fieldName);
+                                    System.out.println("[removeStaticFieldTypesFromPlans] Found static field " + fieldName + 
+                                        " in class " + fqn + " (from source code)");
+                                }
+                                break; // Found the class, no need to check other files
+                            }
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+        }
+        
+        // 4) Now remove type plans that match static field names from static imports
+        List<TypeStubPlan> toRemove = new ArrayList<>();
+        for (TypeStubPlan plan : out.typePlans) {
+            String fqn = plan.qualifiedName;
+            if (fqn == null) continue;
+            
+            // Extract simple name (works for both unknown.* and fully qualified names)
+            String simpleName;
+            if (fqn.startsWith("unknown.")) {
+                simpleName = fqn.substring("unknown.".length());
+            } else {
+                // For fully qualified names like io.moquette.server.config.PUSH_ANDROID_SERVER_ADDRESS
+                int lastDot = fqn.lastIndexOf('.');
+                simpleName = (lastDot >= 0 ? fqn.substring(lastDot + 1) : fqn);
+            }
+            
+            // Check if this matches a static field from any static import
+            for (Map.Entry<String, Set<String>> entry : staticImportsByOwner.entrySet()) {
+                if (entry.getValue().contains(simpleName)) {
+                    // This is a static field, not a type - remove it and add to static imports
+                    toRemove.add(plan);
+                    out.staticImports.computeIfAbsent(entry.getKey(), k -> new LinkedHashSet<>()).add(simpleName);
+                    System.out.println("[removeStaticFieldTypesFromPlans] Removed static field type: " + fqn + 
+                        " - adding as static import from " + entry.getKey());
+                    break;
+                }
+            }
+        }
+        
+        out.typePlans.removeAll(toRemove);
+    }
+    
+    /**
+     * CRITICAL FIX: Deduplicate method plans by signature + varargs flag.
+     * Same method with same owner, name, and parameter types but different varargs flag
+     * should be treated as different methods (e.g., method(T) vs method(T...)).
+     * Keep the one with varargs=true if both exist, as it's more general.
+     */
+    private void deduplicateMethodPlansBySignature(CollectResult out) {
+        Map<String, MethodStubPlan> signatureToPlan = new LinkedHashMap<>();
+        List<MethodStubPlan> toRemove = new ArrayList<>();
+        
+        for (MethodStubPlan plan : out.methodPlans) {
+            try {
+                String ownerQn = safeQN(plan.ownerType);
+                if (ownerQn == null) continue;
+                
+                // Create signature key: owner#name(param1,param2,...)[varargs]
+                StringBuilder sig = new StringBuilder();
+                sig.append(ownerQn).append("#").append(plan.name).append("(");
+                for (int i = 0; i < plan.paramTypes.size(); i++) {
+                    if (i > 0) sig.append(",");
+                    String paramQn = safeQN(plan.paramTypes.get(i));
+                    sig.append(paramQn != null ? paramQn : "?");
+                }
+                sig.append(")");
+                if (plan.varargs) {
+                    sig.append("[varargs]");
+                }
+                String signature = sig.toString();
+                
+                MethodStubPlan existing = signatureToPlan.get(signature);
+                if (existing != null) {
+                    // Duplicate found - keep the one with varargs=true if both exist
+                    if (plan.varargs && !existing.varargs) {
+                        // Replace existing with varargs version
+                        toRemove.add(existing);
+                        signatureToPlan.put(signature, plan);
+                        // Suppressed: System.out.println("[deduplicateMethodPlansBySignature] Replaced with varargs version: " + signature);
+                    } else {
+                        // Keep existing, remove this one
+                        toRemove.add(plan);
+                        // Suppressed: System.out.println("[deduplicateMethodPlansBySignature] Removed duplicate: " + signature);
+                    }
+                } else {
+                    signatureToPlan.put(signature, plan);
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        
+        out.methodPlans.removeAll(toRemove);
+        // Suppressed debug output
+    }
+    
+    /**
+     * CRITICAL FIX: Handle static constants referenced via simple names (ALL_CAPS pattern).
+     * When a simple name is ALL_CAPS and corresponds to a static field on a known class
+     * (e.g., BrokerConstants.PUSH_ANDROID_SERVER_ADDRESS), remove any unknown.* type plans
+     * for it and instead:
+     * 1. Add/augment a type plan for the owner class with a static field stub
+     * 2. Add a static import for that field on the CU where it's used
+     */
+    private void fixStaticConstantsFromSimpleNames(CtModel model, CollectResult out) {
+        // Find all ALL_CAPS simple names that are in unknown.* type plans
+        List<TypeStubPlan> unknownPlansToCheck = new ArrayList<>();
+        for (TypeStubPlan plan : out.typePlans) {
+            if (plan.qualifiedName != null && plan.qualifiedName.startsWith("unknown.")) {
+                String simpleName = plan.qualifiedName.substring("unknown.".length());
+                // Check if it's ALL_CAPS (static constant pattern)
+                if (simpleName != null && simpleName.matches("^[A-Z_][A-Z0-9_]*$")) {
+                    unknownPlansToCheck.add(plan);
+                }
+            }
+        }
+        
+        // For each ALL_CAPS unknown.* type, try to find a known class that has this static field
+        for (TypeStubPlan unknownPlan : unknownPlansToCheck) {
+            String simpleName = unknownPlan.qualifiedName.substring("unknown.".length());
+            
+            // Search all types in the model for classes with this static field
+            Collection<CtType<?>> allTypes = safeGetAllTypes(model);
+            for (CtType<?> type : allTypes) {
+                try {
+                    // Check if this type has a static field with this name
+                    for (CtField<?> field : type.getFields()) {
+                        if (field.hasModifier(ModifierKind.STATIC) && 
+                            simpleName.equals(field.getSimpleName())) {
+                            // Found a match! This is a static field, not a type
+                            String ownerFqn = type.getQualifiedName();
+                            if (ownerFqn != null && !isJdkFqn(ownerFqn)) {
+                                // Remove the unknown.* type plan
+                                out.typePlans.remove(unknownPlan);
+                                
+                                // Add/augment type plan for the owner class
+                                addTypePlanIfNonJdk(out, ownerFqn, TypeStubPlan.Kind.CLASS);
+                                
+                                // Add static field to field plans
+                                CtTypeReference<?> ownerRef = f.Type().createReference(ownerFqn);
+                                CtTypeReference<?> fieldType = field.getType();
+                                if (fieldType == null) {
+                                    fieldType = f.Type().createReference(UnknownType.CLASS);
+                                }
+                                
+                                // Check if field plan already exists
+                                boolean fieldExists = out.fieldPlans.stream()
+                                    .anyMatch(fp -> {
+                                        String fpOwner = safeQN(fp.ownerType);
+                                        return ownerFqn.equals(fpOwner) && simpleName.equals(fp.fieldName);
+                                    });
+                                
+                                if (!fieldExists) {
+                                    // CRITICAL FIX: Use addFieldPlan for deduplication
+                                    FieldStubPlan fieldPlan = new FieldStubPlan(ownerRef, simpleName, fieldType, true);
+                                    addFieldPlan(out, fieldPlan);
+                                    System.out.println("[fixStaticConstantsFromSimpleNames] Added static field: " + 
+                                        ownerFqn + "." + simpleName);
+                                }
+                                
+                                // Add static import (will be added to CU where it's used)
+                                out.staticImports.computeIfAbsent(ownerFqn, k -> new LinkedHashSet<>()).add(simpleName);
+                                System.out.println("[fixStaticConstantsFromSimpleNames] Removed unknown.* type: " + 
+                                    unknownPlan.qualifiedName + " -> static field " + ownerFqn + "." + simpleName);
+                                break; // Found match, no need to check other types
+                            }
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+    }
+    
+    /**
+     * CRITICAL FIX: Safe collection wrapper that catches StackOverflowError and continues.
+     * This allows collection to continue even if one phase fails due to circular dependencies.
+     */
+    private void safeCollect(Runnable collectionPhase, String phaseName) {
+        try {
+            collectionPhase.run();
+        } catch (StackOverflowError e) {
+            System.err.println("[SpoonCollector] StackOverflowError in " + phaseName + 
+                " - skipping this phase (likely circular type dependencies)");
+            System.err.println("[SpoonCollector] Continuing with other collection phases...");
+            // Continue - don't rethrow, allow other phases to run
+        } catch (Throwable e) {
+            System.err.println("[SpoonCollector] Error in " + phaseName + ": " + e.getMessage());
+            // Continue - don't rethrow, allow other phases to run
+        }
+    }
+    
+    /**
+     * CRITICAL FIX: Safely get all types from model.
+     * model.getAllTypes() can trigger StackOverflowError when there are circular dependencies.
+     * This method catches the error and returns an empty collection, allowing processing to continue.
+     */
+    private Collection<CtType<?>> safeGetAllTypes(CtModel model) {
+        try {
+            return model.getAllTypes();
+        } catch (StackOverflowError e) {
+            System.err.println("[SpoonCollector] StackOverflowError getting all types - likely circular dependencies");
+            System.err.println("[SpoonCollector] Returning empty collection - some stubs may be missing");
+            return Collections.emptyList();
+        } catch (Throwable e) {
+            System.err.println("[SpoonCollector] Error getting all types: " + e.getMessage());
+            return Collections.emptyList();
+        }
+    }
+    
+    /**
+     * Helper method to collect static fields from a class (checks both model and type plans).
+     */
+    private void collectStaticFieldsFromClass(String ownerFqn, Map<String, Set<String>> staticImportsByOwner) {
+        if (ownerFqn == null) return;
+        
+        // Check if class exists in model
+        CtType<?> ownerType = f.Type().get(ownerFqn);
+        if (ownerType != null) {
+            for (CtField<?> field : ownerType.getFields()) {
+                if (field.hasModifier(ModifierKind.STATIC)) {
+                    String fieldName = field.getSimpleName();
+                    if (fieldName != null && fieldName.matches("^[A-Z_][A-Z0-9_]*$")) {
+                        // This is a static field that could be imported
+                        staticImportsByOwner.computeIfAbsent(ownerFqn, k -> new HashSet<>()).add(fieldName);
+                    }
+                }
+            }
+        } else {
+            // Class doesn't exist in model yet - check if it's in type plans (will be created)
+            // For now, if we see a static import for a class, assume ALL_UPPERCASE identifiers are static fields
+            // This is a heuristic but better than creating them as types
+            System.out.println("[removeStaticFieldTypesFromPlans] Class " + ownerFqn + " not in model yet, but has static import - will treat ALL_UPPERCASE as static fields");
+        }
     }
 
     // Return (ret, params) shape from FI type if we have it; otherwise default to (int -> int)
@@ -4093,7 +5447,7 @@ public final class SpoonCollector {
                     && !(fiQn.startsWith("java.") || fiQn.startsWith("javax.") ||
                     fiQn.startsWith("jakarta.") || fiQn.startsWith("sun.")  ||
                     fiQn.startsWith("jdk."))) {
-                out.typePlans.add(new TypeStubPlan(fiQn, TypeStubPlan.Kind.INTERFACE));
+                addTypePlanIfNonJdk(out, fiQn, TypeStubPlan.Kind.INTERFACE);
 
                 // Figure out SAM (return + params) with your helper
                 var shape = samShapeOrDefault(fiType); // Pair<ret, List<params>>
@@ -4163,7 +5517,30 @@ public final class SpoonCollector {
                 // For constructor references, we'll infer params from the constructor below
                 // Don't set default params here - let the constructor reference handling do it
                 if (fiType != null && !isJdkType(fiType)) {
-                    out.methodPlans.add(new MethodStubPlan(
+                    // CRITICAL FIX: Check for duplicate SAM method before adding
+                    // This prevents duplicate functional interface SAM methods
+                    String fiQnFinal = fiQn;
+                    String fiQnErased = erasureFqn(fiType);
+                    boolean samAlreadyExists = out.methodPlans.stream()
+                        .anyMatch(p -> {
+                            try {
+                                String pOwnerQn = safeQN(p.ownerType);
+                                String pOwnerQnErased = erasureFqn(p.ownerType);
+                                boolean ownerMatches = fiQnFinal != null && fiQnFinal.equals(pOwnerQn);
+                                if (!ownerMatches && fiQnErased != null) {
+                                    ownerMatches = fiQnErased.equals(pOwnerQnErased);
+                                }
+                                return ownerMatches && 
+                                       (samMethodName.equals(p.name)) &&
+                                       !p.defaultOnInterface && !p.isStatic;
+                            } catch (Throwable ignored) {
+                                return false;
+                            }
+                        });
+                    
+                    if (!samAlreadyExists) {
+                        // CRITICAL FIX: Use addMethodPlan for deduplication
+                        MethodStubPlan plan = new MethodStubPlan(
                             fiType,
                             samMethodName,
                             samRet,
@@ -4175,7 +5552,11 @@ public final class SpoonCollector {
                             /*varargs*/ false,
                             /*mirror*/ false,
                             /*mirrorOwnerRef*/ null
-                    ));
+                        );
+                        addMethodPlan(out, plan);
+                    } else {
+                        System.err.println("[collectMethodReferences] Skipping duplicate SAM method: " + fiQnFinal + "#" + samMethodName);
+                    }
                 }
             }
 
@@ -4223,7 +5604,7 @@ public final class SpoonCollector {
                         
                         // Ensure the owner type is stubbed (e.g., "A" in "A::inc")
                         if (forcedQN != null && !isJdkFqn(forcedQN)) {
-                            out.typePlans.add(new TypeStubPlan(forcedQN, TypeStubPlan.Kind.CLASS));
+                            addTypePlanIfNonJdk(out, forcedQN, TypeStubPlan.Kind.CLASS);
                         }
                     } else if (target instanceof CtTypeAccess<?>) {
                         // Fallback: try to get the type from the target directly
@@ -4249,7 +5630,7 @@ public final class SpoonCollector {
                                     }
                                     if (forcedQN != null && !isJdkFqn(forcedQN)) {
                                         ownerRef = f.Type().createReference(forcedQN);
-                                        out.typePlans.add(new TypeStubPlan(forcedQN, TypeStubPlan.Kind.CLASS));
+                                        addTypePlanIfNonJdk(out, forcedQN, TypeStubPlan.Kind.CLASS);
                                     }
                                 }
                             }
@@ -4303,7 +5684,7 @@ public final class SpoonCollector {
                         isStatic = true;
                         // Ensure the owner type is stubbed
                         if (!isJdkFqn(forcedQN)) {
-                            out.typePlans.add(new TypeStubPlan(forcedQN, TypeStubPlan.Kind.CLASS));
+                            addTypePlanIfNonJdk(out, forcedQN, TypeStubPlan.Kind.CLASS);
                         }
                     } else if (!left.isEmpty() && left.indexOf('.') < 0) {
                         // Simple name without package - try current package first
@@ -4312,14 +5693,14 @@ public final class SpoonCollector {
                             ownerRef = f.Type().createReference(forcedQN);
                             isStatic = true;
                             if (!isJdkFqn(forcedQN)) {
-                                out.typePlans.add(new TypeStubPlan(forcedQN, TypeStubPlan.Kind.CLASS));
+                                addTypePlanIfNonJdk(out, forcedQN, TypeStubPlan.Kind.CLASS);
                             }
                         } else {
                             // No package info - create as-is (will be in default package or unknown)
                             ownerRef = f.Type().createReference(left);
                             isStatic = true;
                             if (!isJdkFqn(left)) {
-                                out.typePlans.add(new TypeStubPlan(left, TypeStubPlan.Kind.CLASS));
+                                addTypePlanIfNonJdk(out, left, TypeStubPlan.Kind.CLASS);
                             }
                         }
                     } else {
@@ -4447,7 +5828,7 @@ public final class SpoonCollector {
                     ctorParams.stream().map(t -> safeQN(t)).collect(Collectors.joining(", ")) + 
                     " (size: " + ctorParams.size() + ")");
                 
-                out.ctorPlans.add(new ConstructorStubPlan(ownerRef, ctorParams));
+                addConstructorPlanIfNotExists(out, ownerRef, ctorParams);
                 
                 // For constructor references, create/update the SAM method plan with correct signature
                 if (fiQn != null && !isJdkFqn(fiQn)) {
@@ -4468,7 +5849,8 @@ public final class SpoonCollector {
                     
                     // Add the correct "make" method plan with constructor parameters
                     if (fiType != null && !isJdkType(fiType)) {
-                        out.methodPlans.add(new MethodStubPlan(
+                        // CRITICAL FIX: Use addMethodPlan for deduplication
+                        MethodStubPlan plan = new MethodStubPlan(
                                 fiType,
                                 "make",
                                 ctorReturnType,
@@ -4480,14 +5862,16 @@ public final class SpoonCollector {
                                 /*varargs*/ false,
                                 /*mirror*/ false,
                                 /*mirrorOwnerRef*/ null
-                        ));
+                        );
+                        addMethodPlan(out, plan);
                     }
                 }
                 continue; // do not add a method plan for ::new
             }
 
 // Existing method plan path
-            out.methodPlans.add(new MethodStubPlan(
+            // CRITICAL FIX: Use addMethodPlan for deduplication
+            MethodStubPlan plan = new MethodStubPlan(
                     ownerRef, name, samRet2, samParams2,
                     /*isStatic*/ isStatic,
                     MethodStubPlan.Visibility.PUBLIC,
@@ -4496,7 +5880,8 @@ public final class SpoonCollector {
                     /*varargs*/ false,
                     /*mirror*/ false,
                     /*mirrorOwnerRef*/ null
-            ));
+            );
+            addMethodPlan(out, plan);
 
         }
     }
@@ -4527,7 +5912,7 @@ public final class SpoonCollector {
                             if (plan.kind == TypeStubPlan.Kind.CLASS) {
                                 // Replace CLASS plan with INTERFACE plan
                                 out.typePlans.remove(plan);
-                                out.typePlans.add(new TypeStubPlan(fiQn, TypeStubPlan.Kind.INTERFACE));
+                                addTypePlanIfNonJdk(out, fiQn, TypeStubPlan.Kind.INTERFACE);
                             }
                             found = true;
                             break;
@@ -4535,7 +5920,7 @@ public final class SpoonCollector {
                     }
                     if (!found) {
                         // Add new INTERFACE plan
-                        out.typePlans.add(new TypeStubPlan(fiQn, TypeStubPlan.Kind.INTERFACE));
+                        addTypePlanIfNonJdk(out, fiQn, TypeStubPlan.Kind.INTERFACE);
                     }
                     
                     // Infer SAM signature from lambda
@@ -4757,7 +6142,7 @@ public final class SpoonCollector {
                                     /*mirror*/ false,
                                     /*mirrorOwnerRef*/ null
                             );
-                            out.methodPlans.add(lambdaMethodPlan);
+                            addMethodPlan(out, lambdaMethodPlan);
                         }
                         
                         // Debug: log what we're adding
@@ -4777,10 +6162,7 @@ public final class SpoonCollector {
      * For each functional interface, keep only ONE "apply" or "make" method (prefer the one from lambda if available).
      */
     private void removeDuplicateSamMethods(CollectResult out) {
-        System.err.println("[removeDuplicateSamMethods] Starting cleanup, total method plans: " + out.methodPlans.size());
-        
-        // Debug: log all SAM methods before grouping
-        System.err.println("[removeDuplicateSamMethods] All SAM methods before grouping:");
+        // Suppressed debug output
         for (MethodStubPlan p : out.methodPlans) {
             if (("apply".equals(p.name) || "make".equals(p.name)) && !p.defaultOnInterface && !p.isStatic) {
                 try {
@@ -4813,20 +6195,20 @@ public final class SpoonCollector {
             }
         }
         
-        System.err.println("[removeDuplicateSamMethods] Found " + ownerToMethods.size() + " functional interfaces with SAM methods");
+        // Suppressed debug output
         
         // For each functional interface with multiple SAM methods, keep only one
         for (Map.Entry<String, List<MethodStubPlan>> entry : ownerToMethods.entrySet()) {
             List<MethodStubPlan> methods = entry.getValue();
-            System.err.println("[removeDuplicateSamMethods] " + entry.getKey() + " has " + methods.size() + " SAM method(s)");
+                // Suppressed debug output
             if (methods.size() > 1) {
                 String ownerQn = entry.getKey();
-                System.err.println("[removeDuplicateSamMethods] Found " + methods.size() + " SAM methods for " + ownerQn + ", keeping only one");
+                // Suppressed: System.err.println("[removeDuplicateSamMethods] Found " + methods.size() + " SAM methods for " + ownerQn + ", keeping only one");
                 
                 // Prefer the method with non-primitive parameters (Integer over int) as it's more general
                 // This handles the case where we have both apply(int) and apply(Integer)
                 // Also log all methods for debugging
-                System.err.println("[removeDuplicateSamMethods] All methods for " + ownerQn + ":");
+                // Suppressed: System.err.println("[removeDuplicateSamMethods] All methods for " + ownerQn + ":");
                 for (MethodStubPlan p : methods) {
                     System.err.println("  - " + safeQN(p.ownerType) + "#" + p.name + "(" + 
                         p.paramTypes.stream().map(t -> safeQN(t)).collect(Collectors.joining(", ")) + 
@@ -4851,9 +6233,7 @@ public final class SpoonCollector {
                 // If we found a method with fewer parameters, prefer it (likely matches actual call site)
                 if (matchingCallSite != null && minParams < methods.stream().mapToInt(m -> m.paramTypes.size()).max().orElse(Integer.MAX_VALUE)) {
                     toKeep = matchingCallSite;
-                    System.err.println("[removeDuplicateSamMethods] Preferring method with fewer parameters (matches call site): " + 
-                        safeQN(toKeep.ownerType) + "#" + toKeep.name + "(" + 
-                        toKeep.paramTypes.stream().map(t -> safeQN(t)).collect(Collectors.joining(", ")) + ")");
+                    // Suppressed debug output
                 } else {
                     // Otherwise, prefer the method with non-primitive parameters (Integer over int)
                     for (MethodStubPlan candidate : methods) {
@@ -4884,8 +6264,7 @@ public final class SpoonCollector {
                                     // If at same position, candidate is non-primitive and other is primitive, candidate is better
                                     if (!candidateIsPrimitive && otherIsPrimitive) {
                                         candidateIsBetter = true;
-                                        System.err.println("[removeDuplicateSamMethods] Preferring method with non-primitive param at position " + i + 
-                                            ": " + candidateParamQn + " over " + otherParamQn);
+                                        // Suppressed debug output
                                         break;
                                     }
                                 } catch (Throwable ignored) {}
@@ -4930,7 +6309,7 @@ public final class SpoonCollector {
      * Since MethodStubPlan is immutable, we remove old plans and add new ones with correct signatures.
      */
     private void fixMethodReturnTypesFromMethodNames(CollectResult result) {
-        System.err.println("[fixMethodReturnTypes] Post-processing " + result.methodPlans.size() + " method plans");
+        // Suppressed: System.err.println("[fixMethodReturnTypes] Post-processing " + result.methodPlans.size() + " method plans");
         
         // DEBUG: Log all apply/test/accept methods to understand why they're not being fixed
         for (MethodStubPlan plan : result.methodPlans) {
@@ -4975,7 +6354,7 @@ public final class SpoonCollector {
                                     fixedParams.add(typeArgs.get(i).clone());
                                 }
                                 needsFix = true;
-                                System.err.println("[fixMethodReturnTypes] Fixed functional interface: " + ownerQn + "#apply");
+                                // Suppressed: System.err.println("[fixMethodReturnTypes] Fixed functional interface: " + ownerQn + "#apply");
                             }
                         }
                         // Predicate<T> → boolean test(T t)
@@ -4985,7 +6364,7 @@ public final class SpoonCollector {
                                 fixedParams = new ArrayList<>();
                                 fixedParams.add(typeArgs.get(0).clone());
                                 needsFix = true;
-                                System.err.println("[fixMethodReturnTypes] Fixed Predicate: " + ownerQn + "#test");
+                                // Suppressed: System.err.println("[fixMethodReturnTypes] Fixed Predicate: " + ownerQn + "#test");
                             }
                         }
                         // Consumer<T> → void accept(T t)
@@ -4995,7 +6374,7 @@ public final class SpoonCollector {
                                 fixedParams = new ArrayList<>();
                                 fixedParams.add(typeArgs.get(0).clone());
                                 needsFix = true;
-                                System.err.println("[fixMethodReturnTypes] Fixed Consumer: " + ownerQn + "#accept");
+                                // Suppressed: System.err.println("[fixMethodReturnTypes] Fixed Consumer: " + ownerQn + "#accept");
                             }
                         }
                     } catch (Throwable ignored) {}
@@ -5047,15 +6426,14 @@ public final class SpoonCollector {
             plansToRemove.add(plan);
             plansToAdd.add(fixedPlan);
             
-            System.err.println("[fixMethodReturnTypes] Fixed: " + safeQN(plan.ownerType) + "#" + plan.name + 
-                "(" + plan.paramTypes.size() + " params) : " + oldType + " -> " + newType);
+            // Suppressed debug output
         }
         
         // Apply changes
         result.methodPlans.removeAll(plansToRemove);
         result.methodPlans.addAll(plansToAdd);
         
-        System.err.println("[fixMethodReturnTypes] Fixed " + plansToAdd.size() + " method signatures");
+        // Suppressed: System.err.println("[fixMethodReturnTypes] Fixed " + plansToAdd.size() + " method signatures");
     }
 
     // In SpoonCollector
@@ -5176,10 +6554,12 @@ public final class SpoonCollector {
                             });
                             if (!exists) {
                                 List<CtTypeReference<?>> params = Collections.emptyList();
-                                out.methodPlans.add(new MethodStubPlan(
+                                // CRITICAL FIX: Use addMethodPlan for deduplication
+                                MethodStubPlan plan = new MethodStubPlan(
                                         owner, methodName, streamType, params,
                                         false, MethodStubPlan.Visibility.PUBLIC, Collections.emptyList()
-                                ));
+                                );
+                                addMethodPlan(out, plan);
                             }
                         }
                     }
@@ -5236,10 +6616,12 @@ public final class SpoonCollector {
                                 });
                                 if (!exists) {
                                     List<CtTypeReference<?>> params = Collections.singletonList(consumerType);
-                                    out.methodPlans.add(new MethodStubPlan(
+                                    // CRITICAL FIX: Use addMethodPlan for deduplication
+                                    MethodStubPlan plan = new MethodStubPlan(
                                             owner, "forEach", f.Type().VOID_PRIMITIVE, params,
                                             false, MethodStubPlan.Visibility.PUBLIC, Collections.emptyList()
-                                    ));
+                                    );
+                                    addMethodPlan(out, plan);
                                 }
                             }
                         }
@@ -5478,10 +6860,12 @@ public final class SpoonCollector {
                                         }
                                         
                                         List<CtTypeReference<?>> params = Collections.singletonList(functionType);
-                                        out.methodPlans.add(new MethodStubPlan(
+                                        // CRITICAL FIX: Use addMethodPlan for deduplication
+                                        MethodStubPlan plan = new MethodStubPlan(
                                                 owner, "map", returnMaybeType, params,
                                                 false, MethodStubPlan.Visibility.PUBLIC, Collections.emptyList()
-                                        ));
+                                        );
+                                        addMethodPlan(out, plan);
                                     }
                                 }
                                 // For orElse(), just return the element type
@@ -5499,10 +6883,12 @@ public final class SpoonCollector {
                                     });
                                     if (!exists) {
                                         List<CtTypeReference<?>> params = Collections.singletonList(elementType.clone());
-                                        out.methodPlans.add(new MethodStubPlan(
+                                        // CRITICAL FIX: Use addMethodPlan for deduplication
+                                        MethodStubPlan plan = new MethodStubPlan(
                                                 owner, "orElse", elementType.clone(), params,
                                                 false, MethodStubPlan.Visibility.PUBLIC, Collections.emptyList()
-                                        ));
+                                        );
+                                        addMethodPlan(out, plan);
                                         System.err.println("[collectStreamApiMethods] Added orElse() to " + safeQN(owner) + " with element type " + safeQN(elementType));
                                     }
                                 }
@@ -5647,10 +7033,12 @@ public final class SpoonCollector {
                                         }
                                         
                                         List<CtTypeReference<?>> params = Collections.singletonList(functionType);
-                                        out.methodPlans.add(new MethodStubPlan(
+                                        // CRITICAL FIX: Use addMethodPlan for deduplication
+                                        MethodStubPlan plan = new MethodStubPlan(
                                                 owner, "thenApply", returnFutureType, params,
                                                 false, MethodStubPlan.Visibility.PUBLIC, Collections.emptyList()
-                                        ));
+                                        );
+                                        addMethodPlan(out, plan);
                                     }
                                 }
                             }
@@ -6042,7 +7430,8 @@ public final class SpoonCollector {
                 CtTypeReference<?> iteratorRef = f.Type().createReference("java.util.Iterator");
                 iteratorRef.addActualTypeArgument(elem.clone());
 
-                out.methodPlans.add(new MethodStubPlan(
+                // CRITICAL FIX: Use addMethodPlan for deduplication
+                MethodStubPlan iteratorPlan = new MethodStubPlan(
                         ownerRef,
                         "iterator",
                         iteratorRef,
@@ -6054,7 +7443,8 @@ public final class SpoonCollector {
                         /*varargs*/ false,
                         /*mirror*/ false,
                         /*mirrorOwnerRef*/ null
-                ));
+                );
+                addMethodPlan(out, iteratorPlan);
 
                 // Ensure the owner type will exist (class by default)
                 addTypePlanIfNonJdk(out, ownerQn, TypeStubPlan.Kind.CLASS);

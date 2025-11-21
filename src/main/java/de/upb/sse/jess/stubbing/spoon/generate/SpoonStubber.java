@@ -1066,6 +1066,10 @@ public final class SpoonStubber {
             // IMPORTANT: Check for type parameters BEFORE normalization
             CtTypeReference<?> rt0 = (p.returnType != null ? p.returnType : f.Type().VOID_PRIMITIVE);
             
+            // CRITICAL FIX: Strip type parameters from return type before using it
+            // This prevents Tuple4<T1, T2, T3, T4> from being used when we only want Tuple4
+            rt0 = stripTypeParameterArguments(rt0);
+            
             // Ensure that if return type references a package (e.g., android.net.Uri),
             // the package and type exist before we try to use it
             if (rt0 != null) {
@@ -1177,8 +1181,14 @@ public final class SpoonStubber {
             
             // Now normalize (but type parameter references should already be resolved)
             // IMPORTANT: If rt0 is already a type parameter reference, don't normalize it
+            // CRITICAL: After stripping type parameters, we need to ensure normalizeUnknownRef
+            // doesn't restore them from the model. The stripped type should already be clean.
             if (!(rt0 instanceof CtTypeParameterReference)) {
+                // Only normalize if the type still has type parameters (shouldn't happen after strip)
+                // But we normalize anyway to handle unknown.Unknown and other cases
                 rt0 = normalizeUnknownRef(rt0);
+                // CRITICAL: After normalization, strip again in case normalizeUnknownRef restored type parameters
+                rt0 = stripTypeParameterArguments(rt0);
             }
             if (rt0 == null) {
                 rt0 = f.Type().VOID_PRIMITIVE;
@@ -1193,6 +1203,10 @@ public final class SpoonStubber {
             List<CtTypeReference<?>> normParams = new ArrayList<>(p.paramTypes.size());
             for (int i = 0; i < p.paramTypes.size(); i++) {
                 CtTypeReference<?> t = p.paramTypes.get(i);
+                
+                // CRITICAL FIX: Strip type parameters from parameter types before using them
+                // This prevents Tuple4<T1, T2, T3, T4> from being used when we only want Tuple4
+                t = stripTypeParameterArguments(t);
                 
                 // CRITICAL: Filter out void as parameter type - void can only be a return type
                 if (t != null) {
@@ -1275,8 +1289,14 @@ public final class SpoonStubber {
                 
                 // Now normalize (but type parameter references should already be resolved)
                 // IMPORTANT: If t is already a type parameter reference, don't normalize it
+                // CRITICAL: After stripping type parameters, we need to ensure normalizeUnknownRef
+                // doesn't restore them from the model. The stripped type should already be clean.
                 if (!(t instanceof CtTypeParameterReference)) {
+                    // Only normalize if the type still has type parameters (shouldn't happen after strip)
+                    // But we normalize anyway to handle unknown.Unknown and other cases
                     t = normalizeUnknownRef(t);
+                    // CRITICAL: After normalization, strip again in case normalizeUnknownRef restored type parameters
+                    t = stripTypeParameterArguments(t);
                 }
                 if (t == null) {
                     // Fallback to Object if normalization fails
@@ -1718,7 +1738,7 @@ public final class SpoonStubber {
      * Print a simple creation report to stdout.
      */
     public void report() {
-        System.out.println("\n== SPOON STUBS generated ==");
+        // Suppressed debug output
         for (String t : createdTypes) System.out.println(" +type  " + t);
         for (String s : createdFields) System.out.println(" +field " + s);
         for (String s : createdCtors) System.out.println(" +ctor  " + s);
@@ -2187,6 +2207,9 @@ public final class SpoonStubber {
                 CtType<?> concrete = findConcreteBySimple(simple);
                 if (concrete != null) {
                     CtTypeReference<?> concreteRef = concrete.getReference();
+                    // CRITICAL FIX: Strip type parameters from concrete reference
+                    // Concrete types might be generic (e.g., Tuple4<T, R, U, V>), but we want just Tuple4
+                    concreteRef = stripTypeParameterArguments(concreteRef);
                     concreteRef.setImplicit(false);
                     // Use simple name for concrete types (import will be added if needed)
                     concreteRef.setSimplyQualified(false);
@@ -2206,6 +2229,66 @@ public final class SpoonStubber {
         }
     }
 
+    /**
+     * CRITICAL FIX: Strip type parameter arguments from a type reference.
+     * If a type is Tuple4<T1, T2, T3, T4> where T1, T2, T3, T4 are type parameters,
+     * return just Tuple4 (without the type arguments).
+     * This prevents type parameters from being used in method stubs.
+     */
+    private CtTypeReference<?> stripTypeParameterArguments(CtTypeReference<?> t) {
+        if (t == null) return t;
+        
+        try {
+            List<CtTypeReference<?>> typeArgs = t.getActualTypeArguments();
+            if (typeArgs == null || typeArgs.isEmpty()) {
+                return t; // No type arguments, return as-is
+            }
+            
+            // Check if all type arguments are type parameters
+            boolean allAreTypeParams = true;
+            for (CtTypeReference<?> arg : typeArgs) {
+                if (!(arg instanceof CtTypeParameterReference)) {
+                    allAreTypeParams = false;
+                    break;
+                }
+            }
+            
+            // If all type arguments are type parameters, strip them by creating a new reference
+            if (allAreTypeParams) {
+                // CRITICAL: Create a completely new type reference instead of cloning
+                // Cloning might preserve shared state that causes type parameters to reappear
+                String qn = safeQN(t);
+                if (qn != null && !qn.isEmpty()) {
+                    // CRITICAL: Create a completely fresh type reference that's not linked to the model
+                    // Extract package and simple name to create a raw reference
+                    int lastDot = qn.lastIndexOf('.');
+                    String packageName = (lastDot > 0 ? qn.substring(0, lastDot) : "");
+                    String simpleName = (lastDot > 0 ? qn.substring(lastDot + 1) : qn);
+                    
+                    // Create a fresh reference using Core factory to avoid model linkage
+                    CtTypeReference<?> baseType = f.Core().createTypeReference();
+                    baseType.setSimpleName(simpleName);
+                    if (!packageName.isEmpty()) {
+                        baseType.setPackage(f.Package().createReference(packageName));
+                    }
+                    // CRITICAL: Ensure no type arguments are set
+                    baseType.setActualTypeArguments(Collections.emptyList());
+                    return baseType;
+                } else {
+                    // Fallback to clone if we can't get qualified name
+                    CtTypeReference<?> baseType = t.clone();
+                    baseType.setActualTypeArguments(Collections.emptyList());
+                    return baseType;
+                }
+            }
+            
+            // Otherwise, return as-is (has non-type-parameter arguments like String, Integer, etc.)
+            return t;
+        } catch (Throwable ignored) {
+            return t; // If anything fails, return original
+        }
+    }
+    
     /**
      * Adds `import unknown.Unknown;` to the owner's CU once (idempotent).
      */
@@ -2443,7 +2526,7 @@ public final class SpoonStubber {
         if (decl.getFormalCtTypeParameters() != null && !decl.getFormalCtTypeParameters().isEmpty()) return;
 
         String createdQn = safeQN(created.getReference());
-        System.err.println("[addTypeParameters] Creating " + arity + " type parameter(s) for " + createdQn);
+        // Suppressed debug output
 
         for (int i = 0; i < arity; i++) {
             CtTypeParameter tp = f.Core().createTypeParameter();
