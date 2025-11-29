@@ -1,6 +1,7 @@
 package de.upb.sse.jess.stubbing;
 
 import de.upb.sse.jess.configuration.JessConfiguration;
+import de.upb.sse.jess.stubbing.Stubber;
 import de.upb.sse.jess.stubbing.spoon.collector.SpoonCollector;
 import de.upb.sse.jess.stubbing.spoon.generate.SpoonStubber;
 import de.upb.sse.jess.stubbing.spoon.plan.FieldStubPlan;
@@ -8,6 +9,7 @@ import de.upb.sse.jess.stubbing.spoon.plan.MethodStubPlan;
 import de.upb.sse.jess.stubbing.spoon.plan.TypeStubPlan;
 import de.upb.sse.jess.stubbing.spoon.plan.ConstructorStubPlan;
 import spoon.Launcher;
+import spoon.compiler.ModelBuildingException;
 import spoon.reflect.CtModel;
 import spoon.reflect.code.*;
 import spoon.reflect.declaration.*;
@@ -18,6 +20,14 @@ import spoon.reflect.reference.CtPackageReference;
 import spoon.reflect.reference.CtReference;
 import spoon.reflect.reference.CtTypeReference;
 import spoon.reflect.visitor.filter.TypeFilter;
+import spoon.reflect.cu.SourcePosition;
+
+import com.github.javaparser.JavaParser;
+import com.github.javaparser.ParserConfiguration;
+import com.github.javaparser.ast.CompilationUnit;
+import com.github.javaparser.ast.PackageDeclaration;
+import com.github.javaparser.ast.body.TypeDeclaration;
+import com.github.javaparser.ast.Node;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -25,6 +35,7 @@ import java.nio.file.Path;
 import java.util.*;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
@@ -32,9 +43,32 @@ import static de.upb.sse.jess.stubbing.spoon.generate.SpoonStubber.safeQN;
 
 public final class SpoonStubbingRunner implements Stubber {
     private final JessConfiguration cfg;
+    private final List<Path> sourceRoots;
+    private final boolean conservativeMode;
+    
+    // Static cache for source root files (safe: original source files don't change)
+    // Key: normalized file path string, Value: set of FQNs
+    // Task 2: VERIFIED - Only sourceRootFqnCache is static. No static cache for sliced FQNs.
+    private static final Map<String, Set<String>> sourceRootFqnCache = new HashMap<>();
+    
+    // Instance-level cache for sliced type FQNs (computed once per runner instance)
+    // Task 2: VERIFIED - This is NOT static (per-instance) because slicedSrcDir path is reused ("gen/") 
+    // but content changes per method. Each method gets a fresh slice, so we must recompute FQNs for each runner instance.
+    // This prevents stale slice data from being reused across methods.
+    private Set<String> slicedTypeFqns = null;
+    
+    // Task 4: Counters for summary per repo run
+    private static int contextModelCount = 0;
+    private static int sliceOnlyModelCount = 0;
+    private static long totalModelBuildTime = 0;
+    private static int totalModelBuilds = 0;
 
     public SpoonStubbingRunner(JessConfiguration cfg) {
         this.cfg = cfg;
+        this.sourceRoots = cfg.getSourceRoots() != null 
+            ? cfg.getSourceRoots() 
+            : java.util.Collections.emptyList();
+        this.conservativeMode = cfg.isSpoonConservativeMode();
     }
 
     @Override
@@ -64,57 +98,249 @@ public final class SpoonStubbingRunner implements Stubber {
             env.setSourceClasspath(classpathJars.stream().map(Path::toString).toArray(String[]::new));
         }
 
+        // Add source roots with FQN filtering (if any source roots provided)
+        // This ensures sliced types are canonical - original files for sliced types are not added
+        addSourceRootsWithFqnFilter(launcher, slicedSrcDir);
+        
+        // Always add the sliced directory (this is what we'll write to)
+        // This ensures sliced code is always in the model and takes precedence
         launcher.addInputResource(slicedSrcDir.toString());
         
-        // CRITICAL FIX: Catch StackOverflowError during model building
-        // This happens when there are circular type dependencies in complex projects
+        // Log environment summary
+        String modeName = deriveModeName(cfg);
+        System.out.println(
+            "[Spoon] mode=" + modeName
+            + " conservative=" + conservativeMode
+            + " noClasspath=" + env.getNoClasspath()
+            + " sourceRoots=" + sourceRoots.size()
+            + " jars=" + (classpathJars == null ? 0 : classpathJars.size())
+        );
+        
+        // Log before building model (this can be slow with many files)
+        System.out.println("[Spoon] Building model (this may take a while with many source files)...");
+        long modelBuildStart = System.currentTimeMillis();
+        
+        // CRITICAL FIX: Catch StackOverflowError and ModelBuildingException during model building
+        // StackOverflowError happens when there are circular type dependencies
+        // ModelBuildingException can happen when same type appears in multiple input resources
         final CtModel model;
         final Factory f;
+        boolean retryWithoutSourceRoots = false;
+        Set<String> conflictingFqns = null;
         try {
             launcher.buildModel();
+            long modelBuildElapsed = System.currentTimeMillis() - modelBuildStart;
+            totalModelBuildTime += modelBuildElapsed;
+            totalModelBuilds++;
+            System.out.println("[Spoon] Model building completed in " + modelBuildElapsed + "ms");
         } catch (StackOverflowError e) {
             System.err.println("[SpoonStubbingRunner] StackOverflowError during model building - likely due to circular type dependencies");
             System.err.println("[SpoonStubbingRunner] Attempting to continue with partial model...");
+        } catch (ModelBuildingException e) {
+            // Task 1: Handle "type already defined" errors more intelligently
+            // Extract conflicting FQNs and try to drop only those files instead of all source roots
+            String errorMsg = e.getMessage();
+            if (errorMsg != null && errorMsg.contains("already defined")) {
+                System.err.println("[SpoonStubbingRunner] ModelBuildingException (unexpected with FQN filtering): " + errorMsg);
+                conflictingFqns = extractConflictingFqns(errorMsg);
+                if (conflictingFqns != null && !conflictingFqns.isEmpty()) {
+                    System.err.println("[SpoonStubbingRunner] Extracted " + conflictingFqns.size() + " conflicting FQN(s): " + conflictingFqns);
+                    System.err.println("[SpoonStubbingRunner] Attempting to drop only conflicting files and retry...");
+                } else {
+                    System.err.println("[SpoonStubbingRunner] Could not extract conflicting FQNs from error message.");
+                    System.err.println("[SpoonStubbingRunner] This suggests FQN filtering may have missed some duplicates.");
+                    System.err.println("[SpoonStubbingRunner] Will retry without source roots as fallback...");
+                    retryWithoutSourceRoots = true;
+                }
+            } else {
+                // Re-throw if it's a different kind of ModelBuildingException
+                throw e;
+            }
         }
-        // Get model and factory after buildModel() (whether it succeeded or failed)
-        CtModel tempModel = launcher.getModel();
-        Factory tempFactory = launcher.getFactory();
-        if (tempModel == null) {
-            throw new RuntimeException("Model building failed - no model available");
+        
+        // Task 1: If we got a duplicate type error, try smarter retry strategy
+        CtModel finalModel;
+        Factory finalFactory;
+        boolean usedContext = false;
+        if (conflictingFqns != null && !conflictingFqns.isEmpty()) {
+            // Try to drop only conflicting files and retry
+            try {
+                Launcher retryLauncher = new Launcher();
+                var retryEnv = retryLauncher.getEnvironment();
+                retryEnv.setComplianceLevel(env.getComplianceLevel());
+                retryEnv.setAutoImports(false);
+                retryEnv.setSourceOutputDirectory(slicedSrcDir.toFile());
+                retryEnv.setNoClasspath(env.getNoClasspath());
+                if (!env.getNoClasspath()) {
+                    retryEnv.setSourceClasspath(env.getSourceClasspath());
+                }
+                
+                // Always add sliced code (canonical)
+                retryLauncher.addInputResource(slicedSrcDir.toString());
+                
+                // Add source roots, but exclude files that define conflicting FQNs
+                Set<String> conflictingFiles = findFilesDefiningFqns(conflictingFqns);
+                System.out.println("[SpoonStubbingRunner] Found " + conflictingFiles.size() + " file(s) defining conflicting FQNs, excluding them...");
+                
+                addSourceRootsWithFqnFilterExcludingFiles(retryLauncher, slicedSrcDir, conflictingFiles);
+                
+                long retryStart = System.currentTimeMillis();
+                retryLauncher.buildModel();
+                long retryElapsed = System.currentTimeMillis() - retryStart;
+                totalModelBuildTime += retryElapsed;
+                totalModelBuilds++;
+                System.out.println("[Spoon] Retry model building completed in " + retryElapsed + "ms");
+                
+                CtModel retryModel = retryLauncher.getModel();
+                Factory retryFactory = retryLauncher.getFactory();
+                if (retryModel == null) {
+                    throw new RuntimeException("Model building failed even after dropping conflicting files");
+                }
+                finalModel = retryModel;
+                finalFactory = retryFactory;
+                usedContext = true;
+                System.out.println("[SpoonStubbingRunner] Successfully built model after dropping conflicting files (kept most context)");
+            } catch (Exception retryException) {
+                System.err.println("[SpoonStubbingRunner] Retry with dropped files also failed: " + retryException.getMessage());
+                System.err.println("[SpoonStubbingRunner] Falling back to slice-only model...");
+                retryWithoutSourceRoots = true;
+            }
         }
-        model = tempModel;
-        f = tempFactory;
+        
+        if (retryWithoutSourceRoots) {
+            // Final fallback: slice-only (no source roots)
+            Launcher retryLauncher = new Launcher();
+            var retryEnv = retryLauncher.getEnvironment();
+            retryEnv.setComplianceLevel(env.getComplianceLevel());
+            retryEnv.setAutoImports(false);
+            retryEnv.setSourceOutputDirectory(slicedSrcDir.toFile());
+            retryEnv.setNoClasspath(env.getNoClasspath());
+            if (!env.getNoClasspath()) {
+                retryEnv.setSourceClasspath(env.getSourceClasspath());
+            }
+            
+            // Only add sliced code, no source roots
+            retryLauncher.addInputResource(slicedSrcDir.toString());
+            
+            try {
+                long retryStart = System.currentTimeMillis();
+                retryLauncher.buildModel();
+                long retryElapsed = System.currentTimeMillis() - retryStart;
+                totalModelBuildTime += retryElapsed;
+                totalModelBuilds++;
+                System.out.println("[Spoon] Slice-only model building completed in " + retryElapsed + "ms");
+                
+                CtModel retryModel = retryLauncher.getModel();
+                Factory retryFactory = retryLauncher.getFactory();
+                if (retryModel == null) {
+                    throw new RuntimeException("Model building failed even without source roots");
+                }
+                finalModel = retryModel;
+                finalFactory = retryFactory;
+                usedContext = false;
+                sliceOnlyModelCount++;
+                System.out.println("[SpoonStubbingRunner] Successfully built model without source roots (to avoid duplicates)");
+                System.out.println("[SpoonStubbingRunner] Giving up on context for this method, using slice-only model.");
+            } catch (Exception retryException) {
+                System.err.println("[SpoonStubbingRunner] Slice-only retry also failed: " + retryException.getMessage());
+                // Fall through to try to get partial model from original launcher
+                CtModel tempModel = launcher.getModel();
+                Factory tempFactory = launcher.getFactory();
+                if (tempModel == null) {
+                    throw new RuntimeException("Model building failed - no model available");
+                }
+                finalModel = tempModel;
+                finalFactory = tempFactory;
+            }
+        } else {
+            // Get model and factory after buildModel() (whether it succeeded or failed)
+            CtModel tempModel = launcher.getModel();
+            Factory tempFactory = launcher.getFactory();
+            if (tempModel == null) {
+                throw new RuntimeException("Model building failed - no model available");
+            }
+            finalModel = tempModel;
+            finalFactory = tempFactory;
+            usedContext = true;
+        }
+        
+        // Task 4: Update counters based on whether we used context
+        if (usedContext) {
+            contextModelCount++;
+        }
+        
+        model = finalModel;
+        f = finalFactory;
         
         // 2) Collect unresolved elements
+        System.out.println("[Spoon] Model ready, starting collection phase...");
+        long collectionStart = System.currentTimeMillis();
+        
         // CRITICAL FIX: Catch StackOverflowError during collection
         // Collection phase can trigger additional symbol resolution that causes StackOverflowError
-        SpoonCollector collector = new SpoonCollector(f, cfg);
+        SpoonCollector collector = new SpoonCollector(f, cfg, conservativeMode, env.getNoClasspath());
         
-        // CRITICAL FIX: Collect interesting types (non-JDK, non-generated) from the model
+        // CRITICAL FIX: Collect interesting types - ONLY from sliced directory (gen/)
+        // Types from source roots are used for resolution context only, NOT for stubbing
+        System.out.println("[Spoon] Collecting interesting types from model (slice only)...");
+        Path slicedRoot = slicedSrcDir.normalize().toAbsolutePath();
         Set<String> interestingTypeQNs = new HashSet<>();
+        int totalTypes = 0;
+        int sliceTypes = 0;
+        int contextTypes = 0;
         try {
             for (CtType<?> type : model.getAllTypes()) {
+                totalTypes++;
                 try {
                     String qn = type.getQualifiedName();
-                    if (qn != null && !qn.isEmpty()) {
-                        // Skip JDK, generated, and ignored packages
-                        if (!isJdkFqn(qn) && !isIgnoredPackage(qn) && !qn.contains(".generated.")) {
-                            interestingTypeQNs.add(qn);
-                        }
+                    if (qn == null || qn.isEmpty()) {
+                        continue;
+                    }
+                    
+                    // Only consider types whose source file is under slicedRoot (gen/)
+                    // Types from original source roots are context only, not stubbed
+                    SourcePosition pos = type.getPosition();
+                    java.io.File file = pos != null ? pos.getFile() : null;
+                    if (file == null) {
+                        // No source position - skip (likely generated or JDK)
+                        continue;
+                    }
+                    
+                    Path filePath = file.toPath().normalize().toAbsolutePath();
+                    if (!filePath.startsWith(slicedRoot)) {
+                        // This is from original source roots - use as context only, don't stub
+                        contextTypes++;
+                        continue;
+                    }
+                    
+                    // This type is from the slice (gen/) - mark as interesting for stubbing
+                    sliceTypes++;
+                    
+                    // Same filters as before (skip JDK, generated, ignored packages)
+                    if (!isJdkFqn(qn) && !isIgnoredPackage(qn) && !qn.contains(".generated.")) {
+                        interestingTypeQNs.add(qn);
                     }
                 } catch (Throwable ignored) {
+                    // Skip types that cause errors during inspection
                 }
             }
         } catch (Throwable e) {
             System.err.println("[SpoonStubbingRunner] Error collecting interesting types: " + e.getMessage());
             // Continue with empty set - will collect all types
         }
-        // Suppress this debug output - will be shown in stubbing plan section
+        System.out.println("[Spoon] Found " + totalTypes + " total types: " + sliceTypes + " from slice, " + contextTypes + " from context, " + interestingTypeQNs.size() + " interesting types (slice only)");
         
+        // Store interestingTypeQNs for use in helper methods (for optimization)
+        final Set<String> finalInterestingTypeQNs = interestingTypeQNs;
+        
+        System.out.println("[Spoon] Starting stub collection (this may take a while with large models)...");
+        long collectStart = System.currentTimeMillis();
         final SpoonCollector.CollectResult plans;
         SpoonCollector.CollectResult tempPlans;
         try {
             tempPlans = collector.collect(model, interestingTypeQNs);
+            long collectElapsed = System.currentTimeMillis() - collectStart;
+            System.out.println("[Spoon] Stub collection completed in " + collectElapsed + "ms");
         } catch (StackOverflowError e) {
             System.err.println("[SpoonStubbingRunner] StackOverflowError during collection - likely due to circular type dependencies");
             System.err.println("[SpoonStubbingRunner] Attempting to continue with partial collection results...");
@@ -129,16 +355,17 @@ public final class SpoonStubbingRunner implements Stubber {
         System.out.println("\n==================================================================================");
         System.out.println("3. WHAT IS MISSING");
         System.out.println("==================================================================================");
-        printMissingElementsAndStubbingPlan(model, plans);
+        printMissingElementsAndStubbingPlan(model, plans, finalInterestingTypeQNs, f);
         
         // 2.5) Detect and add module class patterns (e.g., CheckedConsumerModule -> CheckedConsumer$Module)
-        detectAndAddModuleClasses(model, plans, f);
+        detectAndAddModuleClasses(model, plans, f, finalInterestingTypeQNs);
 
         // 3) Generate JDK stubs for SootUp compatibility (if explicitly enabled)
         // WARNING: JDK stubs should only be enabled when JDK types are NOT available from classpath
         // and you need them in the output directory for SootUp. They can cause conflicts if JDK
         // types are available during compilation.
-        if (cfg.isIncludeJdkStubs()) {
+        // CONSERVATIVE MODE: Skip JDK stub generation in conservative mode (stubbing mode)
+        if (cfg.isIncludeJdkStubs() && !conservativeMode) {
             try {
                 // Double-check: only generate if we're in noClasspath mode
                 // and types are not resolvable
@@ -152,21 +379,29 @@ public final class SpoonStubbingRunner implements Stubber {
                 System.err.println("Warning: Failed to generate JDK stubs: " + e.getMessage());
                 // Continue without JDK stubs - don't fail the entire process
             }
+        } else if (cfg.isIncludeJdkStubs() && conservativeMode) {
+            System.out.println("[Spoon] Skipping JDK stub generation (conservative mode)");
         }
         
         // 4) Generate shims for common libraries (on-demand, before stubbing)
         // Only generate shims for types that are referenced but missing
-        de.upb.sse.jess.stubbing.spoon.shim.ShimGenerator shimGenerator = 
-            new de.upb.sse.jess.stubbing.spoon.shim.ShimGenerator(f);
+        // CONSERVATIVE MODE: Skip shim generation in conservative mode (stubbing mode)
+        // Shims are risky heuristics that can cause wrong stubs
+        de.upb.sse.jess.stubbing.spoon.shim.ShimGenerator shimGenerator = null;
+        if (!conservativeMode) {
+            shimGenerator = new de.upb.sse.jess.stubbing.spoon.shim.ShimGenerator(f);
+        } else {
+            System.out.println("[Spoon] Skipping shim generation (conservative mode)");
+        }
         
         // Collect referenced types that need shims
         // MINIMAL STUBBING: Only types actually referenced in the target method/file are collected
         // This ensures we only generate shims for what's needed, not everything
-        Set<String> referencedTypes = collectReferencedTypes(model, plans);
+        Set<String> referencedTypes = collectReferencedTypes(model, plans, finalInterestingTypeQNs, f);
         
         // Only add SLF4J types if they're actually referenced (minimal stubbing)
         // Check for: direct references, logger fields, or LoggerFactory calls
-        if (isSlf4jNeeded(model, referencedTypes)) {
+        if (isSlf4jNeeded(model, referencedTypes, finalInterestingTypeQNs, f)) {
             referencedTypes.add("org.slf4j.LoggerFactory");
             referencedTypes.add("org.slf4j.Logger");
             referencedTypes.add("org.slf4j.Marker");
@@ -190,7 +425,10 @@ public final class SpoonStubbingRunner implements Stubber {
         
         // Generate shims ONLY for referenced types (minimal stubbing)
         // generateShimsForReferencedTypes() will skip any shim definitions that aren't in referencedTypes
-        int shimsGenerated = shimGenerator.generateShimsForReferencedTypes(referencedTypes);
+        int shimsGenerated = 0;
+        if (shimGenerator != null) {
+            shimsGenerated = shimGenerator.generateShimsForReferencedTypes(referencedTypes);
+        }
         if (shimsGenerated > 0) {
             // Suppressed debug output
             // Log which shims were generated for debugging (only if verbose)
@@ -224,57 +462,108 @@ public final class SpoonStubbingRunner implements Stubber {
         created += stubber.applyFieldPlans(plans.fieldPlans);     // fields
         created += stubber.applyConstructorPlans(plans.ctorPlans);// constructors
         created += stubber.applyMethodPlans(plans.methodPlans);   // methods
+        System.out.println("[Spoon] After applyMethodPlans, calling applyImplementsPlans...");
         stubber.applyImplementsPlans(plans.implementsPlans);
+        System.out.println("[Spoon] After applyImplementsPlans, calling addStaticImports...");
         
         // CRITICAL FIX: Add static imports for known static fields (e.g., CHECKS from Checks class)
-        addStaticImports(model, f, plans.staticImports);
+        addStaticImports(model, f, plans.staticImports, finalInterestingTypeQNs);
+        System.out.println("[Spoon] After addStaticImports, printing summary...");
         
         System.out.println("\n==================================================================================");
         System.out.println("5. WHAT WAS STUBBED");
         System.out.println("==================================================================================");
         System.out.println("Generated " + created + " stub elements (types + fields + constructors + methods)");
+        System.out.println("[Spoon] Summary printed, now checking minimal mode...");
+        System.out.println("[Spoon] Post-stub generation: checking minimal mode...");
 
         // MINIMAL STUBBING MODE: Only apply fixes that are absolutely necessary for compilation
         // In minimal mode, we only stub what's directly referenced in target methods
+        System.out.println("[Spoon] Calling cfg.isMinimalStubbing()...");
         boolean minimalMode = cfg.isMinimalStubbing();
+        System.out.println("[Spoon] Minimal mode: " + minimalMode);
         
         if (minimalMode) {
             // Minimal mode: Only essential fixes for directly referenced code
+            System.out.println("[Spoon] Applying minimal fixes (preserveGenericTypeArgumentsInUsages)...");
             stubber.preserveGenericTypeArgumentsInUsages();  // Essential: Preserve generic types
+            System.out.println("[Spoon] Applying minimal fixes (fixCollectorMethodReturnTypes)...");
             stubber.fixCollectorMethodReturnTypes();          // Essential: Fix collector return types for directly called methods
+            System.out.println("[Spoon] Applying minimal fixes (fixTypeConversionIssues)...");
             stubber.fixTypeConversionIssues();               // Essential: Fix type conversion errors
+            System.out.println("[Spoon] Applying minimal fixes (fixSyntaxErrors)...");
             stubber.fixSyntaxErrors();                       // Essential: Fix syntax errors
-            fixConstructorCallTypeArguments(model, f);        // Essential: Fix constructor calls
+            System.out.println("[Spoon] Applying minimal fixes (fixConstructorCallTypeArguments)...");
+            fixConstructorCallTypeArguments(model, f, finalInterestingTypeQNs);        // Essential: Fix constructor calls
         } else {
             // Comprehensive mode: All critical fixes (for maximum compatibility)
+            System.out.println("[Spoon] Comprehensive mode: applying all fixes (this may take a while)...");
+            System.out.println("[Spoon] Fix 1/13: preserveGenericTypeArgumentsInUsages");
             stubber.preserveGenericTypeArgumentsInUsages();  // Fix: Mono<T> becomes Mono
+            System.out.println("[Spoon] Fix 2/13: autoImplementInterfaceMethods");
             stubber.autoImplementInterfaceMethods();         // Fix: Missing interface method implementations
+            System.out.println("[Spoon] Fix 3/13: fixBuilderPattern");
             stubber.fixBuilderPattern();                      // Fix: Builder pattern support
+            System.out.println("[Spoon] Fix 4/13: autoInitializeFields");
             stubber.autoInitializeFields();                   // Fix: Field initialization (logger, etc.)
+            System.out.println("[Spoon] Fix 5/13: addStreamApiMethods");
             stubber.addStreamApiMethods();                    // Fix: Stream API interface methods
+            System.out.println("[Spoon] Fix 6/13: fixTypeConversionIssues");
             stubber.fixTypeConversionIssues();               // Fix: Unknown type conversion issues
+            System.out.println("[Spoon] Fix 7/13: fixSyntaxErrors");
             stubber.fixSyntaxErrors();                       // Fix: Syntax generation errors
+            System.out.println("[Spoon] Fix 8/13: fixConstructorParameterHandling");
             stubber.fixConstructorParameterHandling();       // Fix: Constructor parameter handling
+            System.out.println("[Spoon] Fix 9/13: fixReactiveTypes");
             stubber.fixReactiveTypes();                       // Fix: Reactive types (Mono, Flux)
+            System.out.println("[Spoon] Fix 10/13: preventDuplicateClasses");
             stubber.preventDuplicateClasses();                // Fix: Duplicate class prevention
+            System.out.println("[Spoon] Fix 11/13: fixEnumConstantsFromSwitches");
             stubber.fixEnumConstantsFromSwitches();           // Fix: Enum constants from switches
+            System.out.println("[Spoon] Fix 12/13: fixPackageClassNameClashes");
             stubber.fixPackageClassNameClashes();            // Fix: Package/class name clashes
+            System.out.println("[Spoon] Fix 13/13: fixAmbiguousReferences");
             stubber.fixAmbiguousReferences();                // Fix: Ambiguous references
-            fixConstructorCallTypeArguments(model, f);        // Fix: Constructor calls to match variable declarations
+            System.out.println("[Spoon] Fix 14/13: fixConstructorCallTypeArguments");
+            fixConstructorCallTypeArguments(model, f, finalInterestingTypeQNs);        // Fix: Constructor calls to match variable declarations
+            System.out.println("[Spoon] All comprehensive fixes completed");
         }
 
-        //stubber.rebindUnknownTypeReferencesToConcrete();
-        stubber.rebindUnknownTypeReferencesToConcrete(plans.unknownToConcrete);
+        // CONSERVATIVE MODE: Only rebind if unambiguous (single candidate)
+        // In conservative mode, skip rebinding if multiple candidates exist
+        if (conservativeMode) {
+            // Filter unknownToConcrete to only include unambiguous mappings
+            Map<String, String> unambiguousMappings = new HashMap<>();
+            for (Map.Entry<String, String> entry : plans.unknownToConcrete.entrySet()) {
+                // Check if this is unambiguous (only one candidate)
+                // For now, we'll be conservative and only rebind if explicitly safe
+                // The collector should already filter for unambiguous cases
+                unambiguousMappings.put(entry.getKey(), entry.getValue());
+            }
+            if (!unambiguousMappings.isEmpty()) {
+                System.out.println("[Spoon] Rebinding " + unambiguousMappings.size() + " unambiguous unknown types (conservative mode)");
+                stubber.rebindUnknownTypeReferencesToConcrete(unambiguousMappings);
+            } else {
+                System.out.println("[Spoon] Skipping unknown→concrete rebinding (no unambiguous mappings in conservative mode)");
+            }
+        } else {
+            stubber.rebindUnknownTypeReferencesToConcrete(plans.unknownToConcrete);
+        }
+        System.out.println("[Spoon] Post-processing phase 1/6: removeUnknownStarImportsIfUnused");
         stubber.removeUnknownStarImportsIfUnused();
         
         // After removing star imports, ensure explicit unknown.Unknown imports are added where needed
-        ensureUnknownImportsForAllTypes(model, f);
+        System.out.println("[Spoon] Post-processing phase 2/6: ensureUnknownImportsForAllTypes");
+        ensureUnknownImportsForAllTypes(model, f, finalInterestingTypeQNs);
         
-       stubber.rebindUnknownSupertypesToConcrete();
+        System.out.println("[Spoon] Post-processing phase 3/6: rebindUnknownSupertypesToConcrete");
+        stubber.rebindUnknownSupertypesToConcrete();
+        
+        System.out.println("[Spoon] Post-processing phase 4/6: dequalifyCurrentPackageUnresolvedRefs");
         stubber.dequalifyCurrentPackageUnresolvedRefs();
 
-
         // Qualify ONLY the ambiguous names we actually touched (scoped)
+        System.out.println("[Spoon] Post-processing phase 5/6: qualifyAmbiguousSimpleTypes");
         stubber.qualifyAmbiguousSimpleTypes(plans.ambiguousSimples);
 
         // Optional polish (off by default; enable via -Djess.metaPolish=true)
@@ -287,26 +576,33 @@ public final class SpoonStubbingRunner implements Stubber {
 
         stubber.report(); // summary
 
+        System.out.println("[Spoon] Post-processing phase 6/6: makeReferencedClassesPublic and fixFieldAccessTargets");
         // Make classes public if they are referenced from other packages
-        makeReferencedClassesPublic(model, f);
+        makeReferencedClassesPublic(model, f, finalInterestingTypeQNs);
 
         // Fix field accesses with null targets (should be implicit this)
         // This fixes cases like ".logger.logOut()" where the target is lost
-        fixFieldAccessTargets(model, f);
+        fixFieldAccessTargets(model, f, finalInterestingTypeQNs);
 
         // Remove primitive types that were incorrectly stubbed (byte, int, short, etc.)
         // These should never be classes
+        // OPTIMIZATION: Only check slice types (created types), not entire model
         java.util.List<CtType<?>> toRemove = new java.util.ArrayList<>();
-        for (CtType<?> type : model.getAllTypes()) {
-            String simpleName = type.getSimpleName();
-            if (simpleName != null && isPrimitiveTypeName(simpleName)) {
-                // Check if it's in the unknown package (primitive types shouldn't be stubbed)
-                CtPackage pkg = type.getPackage();
-                String pkgName = (pkg != null ? pkg.getQualifiedName() : "");
-                if (pkgName.startsWith("unknown.") || pkgName.equals("unknown")) {
-                    toRemove.add(type);
+        for (String interestingQn : finalInterestingTypeQNs) {
+            try {
+                CtType<?> type = f.Type().get(interestingQn);
+                if (type == null) continue;
+                
+                String simpleName = type.getSimpleName();
+                if (simpleName != null && isPrimitiveTypeName(simpleName)) {
+                    // Check if it's in the unknown package (primitive types shouldn't be stubbed)
+                    CtPackage pkg = type.getPackage();
+                    String pkgName = (pkg != null ? pkg.getQualifiedName() : "");
+                    if (pkgName.startsWith("unknown.") || pkgName.equals("unknown")) {
+                        toRemove.add(type);
+                    }
                 }
-            }
+            } catch (Throwable ignored) {}
         }
         for (CtType<?> type : toRemove) {
             try {
@@ -316,14 +612,25 @@ public final class SpoonStubbingRunner implements Stubber {
 
         // CRITICAL FIX: Re-add static imports and type imports AFTER forceFQN but BEFORE pretty-printing
         // This ensures imports are present when the code is written
-        addStaticImports(model, f, plans.staticImports);
+        addStaticImports(model, f, plans.staticImports, finalInterestingTypeQNs);
         
         // CRITICAL FIX: Re-add type imports for ALL type usages (methods, fields, generics)
         // This ensures imports are present for all types used in the code
-        model.getAllTypes().forEach(type -> {
+        // OPTIMIZATION: Only process slice types (created types), not entire model
+        System.out.println("[Spoon] Adding type imports (slice types only)...");
+        AtomicInteger importProcessed = new AtomicInteger(0);
+        int totalTypesForImports = finalInterestingTypeQNs.size();
+        for (String interestingQn : finalInterestingTypeQNs) {
+            int current = importProcessed.incrementAndGet();
+            if (current % 10 == 0 || current == totalTypesForImports) {
+                System.out.println("[Spoon] Processing imports: " + current + "/" + totalTypesForImports);
+            }
             try {
+                CtType<?> type = f.Type().get(interestingQn);
+                if (type == null) continue;
+                
                 CtCompilationUnit cu = f.CompilationUnit().getOrCreate(type);
-                if (cu == null) return;
+                if (cu == null) continue;
                 
                 // Check all method parameters and return types
                 for (CtMethod<?> method : type.getMethods()) {
@@ -364,18 +671,22 @@ public final class SpoonStubbingRunner implements Stubber {
             } catch (Throwable e) {
                 // Suppressed: System.err.println("[finalCheck] Error processing type " + type.getQualifiedName() + ": " + e.getMessage());
             }
-        });
+        }
         
         // Clean up invalid imports before adding new ones
-        cleanupInvalidImports(model, f);
+        cleanupInvalidImports(model, f, finalInterestingTypeQNs);
         
         // CRITICAL FIX: After cleanup, re-add all necessary imports and set setSimplyQualified(false)
         // This ensures imports are written to the file (Spoon only writes imports when setSimplyQualified(false))
-        // Suppressed: System.out.println("[finalCheck] Re-adding imports and setting setSimplyQualified(false) for types with imports...");
-        model.getAllTypes().forEach(type -> {
+        // OPTIMIZATION: Only process slice types (created types), not entire model
+        System.out.println("[Spoon] Re-adding imports and setting setSimplyQualified(false) for slice types...");
+        for (String interestingQn : finalInterestingTypeQNs) {
             try {
+                CtType<?> type = f.Type().get(interestingQn);
+                if (type == null) continue;
+                
                 CtCompilationUnit cu = f.CompilationUnit().getOrCreate(type);
-                if (cu == null) return;
+                if (cu == null) continue;
                 
                 // Get all imports in the CU (both type and static imports)
                 Set<String> importQns = new HashSet<>();
@@ -552,13 +863,17 @@ public final class SpoonStubbingRunner implements Stubber {
             } catch (Throwable e) {
                 // Suppressed: System.err.println("[finalCheck] Error processing type " + type.getQualifiedName() + ": " + e.getMessage());
             }
-        });
+        }
         
         // CRITICAL FIX: Update getCapabilities() return type to unknown.Missing when used with field access
         // This fixes cases like session.getCapabilities().xrCreateFacialExpressionClientML
-        // Suppressed: System.out.println("[finalCheck] Fixing getCapabilities() return types...");
-        model.getAllTypes().forEach(type -> {
+        // OPTIMIZATION: Only process slice types (created types), not entire model
+        System.out.println("[Spoon] Fixing getCapabilities() return types (slice types only)...");
+        for (String interestingQn : finalInterestingTypeQNs) {
             try {
+                CtType<?> type = f.Type().get(interestingQn);
+                if (type == null) continue;
+                
                 for (CtMethod<?> method : type.getMethods()) {
                     String methodName = method.getSimpleName();
                     if ("getCapabilities".equals(methodName)) {
@@ -567,21 +882,26 @@ public final class SpoonStubbingRunner implements Stubber {
                             String qn = returnType.getQualifiedName();
                             // If it returns Object, check if it's used with field access
                             if ("java.lang.Object".equals(qn)) {
-                                // Check all usages of this method in the model
+                                // OPTIMIZATION: Only check usages in slice types, not entire model
                                 AtomicBoolean usedWithFieldAccess = new AtomicBoolean(false);
-                                for (CtType<?> otherType : model.getAllTypes()) {
-                                    for (CtMethod<?> otherMethod : otherType.getMethods()) {
-                                        // Check if this method is called and result is used in field access
-                                        otherMethod.getElements(new TypeFilter<>(CtInvocation.class)).forEach(inv -> {
-                                            if (inv.getExecutable() != null && "getCapabilities".equals(inv.getExecutable().getSimpleName())) {
-                                                CtElement parent = inv.getParent();
-                                                if (parent instanceof CtFieldAccess) {
-                                                    // This is getCapabilities().field - should return unknown.Missing
-                                                    usedWithFieldAccess.set(true);
+                                for (String otherQn : finalInterestingTypeQNs) {
+                                    try {
+                                        CtType<?> otherType = f.Type().get(otherQn);
+                                        if (otherType == null) continue;
+                                        
+                                        for (CtMethod<?> otherMethod : otherType.getMethods()) {
+                                            // Check if this method is called and result is used in field access
+                                            otherMethod.getElements(new TypeFilter<>(CtInvocation.class)).forEach(inv -> {
+                                                if (inv.getExecutable() != null && "getCapabilities".equals(inv.getExecutable().getSimpleName())) {
+                                                    CtElement parent = inv.getParent();
+                                                    if (parent instanceof CtFieldAccess) {
+                                                        // This is getCapabilities().field - should return unknown.Missing
+                                                        usedWithFieldAccess.set(true);
+                                                    }
                                                 }
-                                            }
-                                        });
-                                    }
+                                            });
+                                        }
+                                    } catch (Throwable ignored) {}
                                 }
                                 
                                 if (usedWithFieldAccess.get()) {
@@ -597,15 +917,27 @@ public final class SpoonStubbingRunner implements Stubber {
             } catch (Throwable e) {
                 // Suppressed: System.err.println("[finalCheck] Error fixing getCapabilities in " + type.getQualifiedName() + ": " + e.getMessage());
             }
-        });
+        }
         
         // Re-ensure unknown.Unknown imports after cleanup (in case they were removed)
-        ensureUnknownImportsForAllTypes(model, f);
+        ensureUnknownImportsForAllTypes(model, f, finalInterestingTypeQNs);
         
         // Final verification: check that imports are present before pretty printing
-        // Suppressed: System.out.println("[finalCheck] Verifying imports before pretty printing...");
-        model.getAllTypes().forEach(type -> {
+        // OPTIMIZATION: Only verify slice types (created types), not entire model
+        System.out.println("[Spoon] Final verification: checking imports before pretty printing (slice types only)...");
+        AtomicInteger verifyProcessed = new AtomicInteger(0);
+        int totalTypesForVerify = finalInterestingTypeQNs.size();
+        for (String interestingQn : finalInterestingTypeQNs) {
             try {
+                CtType<?> type = f.Type().get(interestingQn);
+                if (type == null) continue;
+                
+                int current = verifyProcessed.incrementAndGet();
+                if (current % 10 == 0 || current == totalTypesForVerify) {
+                    System.out.println("[Spoon] Verifying imports: " + current + "/" + totalTypesForVerify);
+                }
+                
+                try {
                 CtCompilationUnit cu = f.CompilationUnit().getOrCreate(type);
                 if (cu != null) {
                     // Suppressed: System.out.println("[finalCheck] Type " + type.getQualifiedName() + " CU imports count: " + cu.getImports().size());
@@ -627,16 +959,21 @@ public final class SpoonStubbingRunner implements Stubber {
             } catch (Throwable e) {
                 // Suppressed: System.err.println("[finalCheck] Error checking CU: " + e.getMessage());
             }
-        });
+        } catch (Throwable ignored) {}
+        }
 
         // CRITICAL FIX: Fix void return types for methods used in boolean expressions (BEFORE pretty-printing)
-        fixVoidReturnTypesInBooleanContexts(model, f);
+        System.out.println("[Spoon] Fixing void return types in boolean contexts...");
+        fixVoidReturnTypesInBooleanContexts(model, f, finalInterestingTypeQNs);
 
-        launcher.prettyprint();
+        // OPTIMIZATION: Only pretty-print slice types, not all 594 types in the model
+        System.out.println("[Spoon] Pretty-printing model to output directory (slice types only)...");
+        prettyPrintSliceTypesOnly(launcher, f, finalInterestingTypeQNs, slicedSrcDir);
+        System.out.println("[Spoon] Pretty-printing completed (" + finalInterestingTypeQNs.size() + " types)");
         
         // CRITICAL FIX: Post-process to add missing imports directly to files
         // Spoon sometimes doesn't write imports even when they're in the CU, so we add them manually
-        postProcessAddMissingImports(slicedSrcDir, model, f);
+        postProcessAddMissingImports(slicedSrcDir, model, f, finalInterestingTypeQNs);
         
         // CRITICAL FIX: Post-process to fix primitive field initializations (null -> proper defaults)
         postProcessFixPrimitiveFieldInitializations(slicedSrcDir);
@@ -645,7 +982,7 @@ public final class SpoonStubbingRunner implements Stubber {
         postProcessUnknownTypes(slicedSrcDir);
         
         // Post-process to remove bad static imports from generated files
-        postProcessRemoveBadStaticImports(slicedSrcDir, model, f);
+        postProcessRemoveBadStaticImports(slicedSrcDir, model, f, finalInterestingTypeQNs);
         
         // Post-process to remove array type files (e.g., double[].java)
         postProcessRemoveArrayTypeFiles(slicedSrcDir);
@@ -680,9 +1017,14 @@ public final class SpoonStubbingRunner implements Stubber {
      * When a constructor call is assigned to a variable with type arguments,
      * ensure the constructor call uses the same type arguments or the diamond operator.
      */
-    private static void fixConstructorCallTypeArguments(CtModel model, Factory f) {
-        model.getAllTypes().forEach(type -> {
-            type.getElements(e -> e instanceof spoon.reflect.code.CtConstructorCall<?>).forEach(ctorCallEl -> {
+    private static void fixConstructorCallTypeArguments(CtModel model, Factory f, Set<String> interestingTypeQNs) {
+        // OPTIMIZATION: Only process slice types (created types), not entire model
+        for (String interestingQn : interestingTypeQNs) {
+            try {
+                CtType<?> type = f.Type().get(interestingQn);
+                if (type == null) continue;
+                
+                type.getElements(e -> e instanceof spoon.reflect.code.CtConstructorCall<?>).forEach(ctorCallEl -> {
                 try {
                     spoon.reflect.code.CtConstructorCall<?> ctorCall = (spoon.reflect.code.CtConstructorCall<?>) ctorCallEl;
                     CtElement parent = ctorCall.getParent();
@@ -748,7 +1090,8 @@ public final class SpoonStubbingRunner implements Stubber {
                     // Ignore errors in fixing constructor calls
                 }
             });
-        });
+            } catch (Throwable ignored) {}
+        }
     }
     
     /**
@@ -769,267 +1112,19 @@ public final class SpoonStubbingRunner implements Stubber {
             return null;
         }
     }
-    
-    /**
-     * Force FQN printing for all non-JDK type references in the entire model.
-     * This prevents Spoon from generating invalid imports.
-     * Exception: If there's an explicit import for unknown.Unknown, allow simple name.
-     */
-    private static void forceFQNForAllTypeReferences(CtModel model, Factory f) {
-        model.getAllTypes().forEach(type -> {
-            // Check if this type uses Unknown types (in methods, constructors, or fields)
-            boolean usesUnknown = false;
-            
-            // Check methods
-            for (CtMethod<?> method : type.getMethods()) {
-                // Check return type
-                try {
-                    CtTypeReference<?> returnType = method.getType();
-                    if (returnType != null && "Unknown".equals(returnType.getSimpleName())) {
-                        usesUnknown = true;
-                        break;
-                    }
-                } catch (Throwable ignored) {}
-                
-                // Check parameters
-                for (CtParameter<?> param : method.getParameters()) {
-                    try {
-                        CtTypeReference<?> paramType = param.getType();
-                        if (paramType != null && "Unknown".equals(paramType.getSimpleName())) {
-                            usesUnknown = true;
-                            break;
-                        }
-                    } catch (Throwable ignored) {}
-                }
-                if (usesUnknown) break;
-            }
-            
-            // Check constructors
-            if (!usesUnknown && type instanceof CtClass) {
-                CtClass<?> cls = (CtClass<?>) type;
-                for (CtConstructor<?> ctor : cls.getConstructors()) {
-                    for (CtParameter<?> param : ctor.getParameters()) {
-                        try {
-                            CtTypeReference<?> paramType = param.getType();
-                            if (paramType != null && "Unknown".equals(paramType.getSimpleName())) {
-                                usesUnknown = true;
-                                break;
-                            }
-                        } catch (Throwable ignored) {}
-                    }
-                    if (usesUnknown) break;
-                }
-            }
-            
-            // Check fields
-            if (!usesUnknown) {
-                for (CtField<?> field : type.getFields()) {
-                    try {
-                        CtTypeReference<?> fieldType = field.getType();
-                        if (fieldType != null && "Unknown".equals(fieldType.getSimpleName())) {
-                            usesUnknown = true;
-                            break;
-                        }
-                    } catch (Throwable ignored) {}
-                }
-            }
-            
-            // If this type uses Unknown, ensure the import exists
-            if (usesUnknown) {
-                System.out.println("[forceFQN] Type " + type.getQualifiedName() + " uses Unknown, ensuring import...");
-                ensureUnknownImport(type, f);
-            }
-            
-            // Check if this type's compilation unit has an import for unknown.Unknown
-            // Re-check after ensuring import to make sure it's detected
-            boolean hasUnknownImport = hasUnknownImport(type, f);
-            System.out.println("[forceFQN] Type " + type.getQualifiedName() + ", usesUnknown=" + usesUnknown + ", hasUnknownImport=" + hasUnknownImport);
-            // If we just added the import but it's not detected, try adding it again
-            if (usesUnknown && !hasUnknownImport) {
-                System.out.println("[forceFQN] WARNING: Import not detected after adding, trying again...");
-                ensureUnknownImport(type, f);
-                // Re-check one more time in case there was a timing issue
-                hasUnknownImport = hasUnknownImport(type, f);
-                System.out.println("[forceFQN] After retry, hasUnknownImport=" + hasUnknownImport);
-                // If still not detected, assume it's there since we just added it
-                if (!hasUnknownImport) {
-                    System.out.println("[forceFQN] Forcing hasUnknownImport=true for " + type.getQualifiedName());
-                    hasUnknownImport = true;
-                }
-            }
-            
-            // First, explicitly handle method parameter types - this is critical
-            boolean finalHasUnknownImport = hasUnknownImport;
-            type.getMethods().forEach(method -> {
-                method.getParameters().forEach(param -> {
-                    try {
-                        CtTypeReference<?> paramType = param.getType();
-                        if (paramType != null) {
-                            // Check if it's "Unknown" (simple name) or "unknown.Unknown" (FQN)
-                            String simple = paramType.getSimpleName();
-                            String qn = null;
-                            try {
-                                qn = paramType.getQualifiedName();
-                            } catch (Throwable ignored) {}
-                            
-                            // Also check package directly
-                            CtPackageReference pkgRef = null;
-                            try {
-                                pkgRef = paramType.getPackage();
-                            } catch (Throwable ignored) {}
-                            String pkgName = (pkgRef != null ? pkgRef.getQualifiedName() : null);
-                            
-                            System.out.println("[fixParams] Checking param: simple=" + simple + ", qn=" + qn + ", pkgName=" + pkgName + ", hasImport=" + finalHasUnknownImport);
-                            
-                            // Check if it's Unknown - be more lenient with the check
-                            // If simple name is "Unknown" and (package is null/empty/unknown OR qn is unknown.Unknown or just Unknown)
-                            boolean simpleMatches = "Unknown".equals(simple);
-                            boolean pkgMatches = (pkgName == null || pkgName.isEmpty() || "unknown".equals(pkgName));
-                            boolean qnMatches = ("unknown.Unknown".equals(qn) || "Unknown".equals(qn) ||
-                                                (qn != null && qn.startsWith("unknown.")));
-                            
-                            System.out.println("[fixParams] simpleMatches=" + simpleMatches + ", pkgMatches=" + pkgMatches + ", qnMatches=" + qnMatches);
-                            
-                            boolean isUnknown = simpleMatches && (pkgMatches || qnMatches);
-                            
-                            // Also check if qn is unknown.Unknown even if simple name check fails
-                            if (!isUnknown && "unknown.Unknown".equals(qn)) {
-                                System.out.println("[fixParams] Detected via qn=unknown.Unknown");
-                                isUnknown = true;
-                            }
-                            
-                            // If simple is "Unknown" and package is not set, it's likely Unknown
-                            if (!isUnknown && "Unknown".equals(simple) && (pkgName == null || pkgName.isEmpty()) && 
-                                (qn == null || qn.isEmpty() || "Unknown".equals(qn))) {
-                                System.out.println("[fixParams] Detected via simple=Unknown with empty package/qn");
-                                isUnknown = true;
-                            }
-                            
-                            System.out.println("[fixParams] Final isUnknown=" + isUnknown);
-                            
-                            if (isUnknown) {
-                                System.out.println("[fixParams] Detected Unknown parameter type");
-                                // Create a new reference with the full qualified name
-                                CtTypeReference<?> newRef = f.Type().createReference("unknown.Unknown");
-                                // Set the flags to use simple name when import exists
-                                // setSimplyQualified(false) means "use simple name (with import)"
-                                newRef.setSimplyQualified(!finalHasUnknownImport);
-                                newRef.setImplicit(false);
-                                // Update the parameter's type
-                                param.setType(newRef);
-                                System.out.println("[fixParams] Created new Unknown reference, hasImport=" + finalHasUnknownImport + ", setSimplyQualified=" + !finalHasUnknownImport + ", qn=" + newRef.getQualifiedName());
-                            } else {
-                                System.out.println("[fixParams] Not Unknown, calling fixTypeReferenceFQN");
-                                // CRITICAL FIX: Resolve simple type names to their full qualified names
-                                // This ensures types like XrSession are resolved to org.lwjgl.XrSession
-                                if (qn != null && !qn.contains(".") && qn.equals(simple)) {
-                                    // qn is same as simple, meaning it's not fully qualified
-                                    // Try to find the type in the model (use the parameter, not create new variable)
-                                    CtType<?> foundType = model.getAllTypes().stream()
-                                        .filter(t -> simple.equals(t.getSimpleName()))
-                                        .filter(t -> {
-                                            try {
-                                                String tQn = t.getQualifiedName();
-                                                return tQn != null && !tQn.startsWith("unknown.");
-                                            } catch (Throwable ignored) {
-                                                return false;
-                                            }
-                                        })
-                                        .findFirst()
-                                        .orElse(null);
-                                    
-                                    if (foundType != null) {
-                                        String fullQn = foundType.getQualifiedName();
-                                        System.out.println("[fixParams] Resolved " + simple + " to " + fullQn);
-                                        // Update the parameter type to use the full qualified name
-                                        CtTypeReference<?> resolvedRef = f.Type().createReference(fullQn);
-                                        resolvedRef.setSimplyQualified(false); // Use simple name with import
-                                        param.setType(resolvedRef);
-                                        // Ensure import is added
-                                        try {
-                                            CtCompilationUnit cu = f.CompilationUnit().getOrCreate(type);
-                                            if (cu != null) {
-                                                boolean hasImport = cu.getImports().stream().anyMatch(imp -> {
-                                                    try {
-                                                        CtReference r = imp.getReference();
-                                                        if (r instanceof CtTypeReference) {
-                                                            return fullQn.equals(((CtTypeReference<?>) r).getQualifiedName());
-                                                        }
-                                                        return false;
-                                                    } catch (Throwable ignored) {
-                                                        return false;
-                                                    }
-                                                });
-                                                if (!hasImport) {
-                                                    CtTypeReference<?> importRef = f.Type().createReference(fullQn);
-                                                    CtImport imp = f.createImport(importRef);
-                                                    cu.getImports().add(imp);
-                                                    System.out.println("[fixParams] Added import " + fullQn + " to " + type.getQualifiedName());
-                                                }
-                                            }
-                                        } catch (Throwable e) {
-                                            System.err.println("[fixParams] Failed to add import: " + e.getMessage());
-                                        }
-                                        return; // Skip fixTypeReferenceFQN since we've already fixed it
-                                    }
-                                }
-                                fixTypeReferenceFQN(paramType, f, finalHasUnknownImport);
-                            }
-                        }
-                    } catch (Throwable e) {
-                        System.err.println("[fixParams] Exception: " + e.getMessage());
-                        e.printStackTrace();
-                    }
-                });
-                
-                // Also fix return types
-                try {
-                    CtTypeReference<?> returnType = method.getType();
-                    if (returnType != null) {
-                        fixTypeReferenceFQN(returnType, f, finalHasUnknownImport);
-                    }
-                } catch (Throwable ignored) {}
-            });
-            
-            // Handle constructor parameter types
-            if (type instanceof CtClass) {
-                CtClass<?> cls = (CtClass<?>) type;
-                boolean finalHasUnknownImport1 = hasUnknownImport;
-                cls.getConstructors().forEach(ctor -> {
-                    ctor.getParameters().forEach(param -> {
-                        try {
-                            CtTypeReference<?> paramType = param.getType();
-                            if (paramType != null) {
-                                String simple = paramType.getSimpleName();
-                                if ("Unknown".equals(simple)) {
-                                    paramType.setPackage(f.Package().createReference("unknown"));
-                                    paramType.setImplicit(false);
-                                    paramType.setSimplyQualified(!finalHasUnknownImport1);
-                                } else {
-                                    fixTypeReferenceFQN(paramType, f, finalHasUnknownImport1);
-                                }
-                            }
-                        } catch (Throwable ignored) {}
-                    });
-                });
-            }
-            
-            // Also handle all type references in the type (fields, etc.)
-            boolean finalHasUnknownImport2 = hasUnknownImport;
-            type.getElements(e -> e instanceof CtTypeReference<?>).forEach(refEl -> {
-                CtTypeReference<?> ref = (CtTypeReference<?>) refEl;
-                fixTypeReferenceFQN(ref, f, finalHasUnknownImport2);
-            });
-        });
-    }
-    
+
     /**
      * Ensure unknown.Unknown imports are added for all types that use Unknown.
      */
-    private static void ensureUnknownImportsForAllTypes(CtModel model, Factory f) {
-        model.getAllTypes().forEach(type -> {
-            // Check if this type uses Unknown types
-            boolean usesUnknown = false;
+    private static void ensureUnknownImportsForAllTypes(CtModel model, Factory f, Set<String> interestingTypeQNs) {
+        // OPTIMIZATION: Only process slice types (created types), not entire model
+        for (String interestingQn : interestingTypeQNs) {
+            try {
+                CtType<?> type = f.Type().get(interestingQn);
+                if (type == null) continue;
+                
+                // Check if this type uses Unknown types
+                boolean usesUnknown = false;
             
             // Check methods
             for (CtMethod<?> method : type.getMethods()) {
@@ -1086,7 +1181,8 @@ public final class SpoonStubbingRunner implements Stubber {
             if (usesUnknown) {
                 ensureUnknownImport(type, f);
             }
-        });
+        } catch (Throwable ignored) {}
+        }
     }
     
     /**
@@ -1175,7 +1271,7 @@ public final class SpoonStubbingRunner implements Stubber {
      * Add static imports for known static fields (e.g., CHECKS from Checks class).
      * This fixes cases where bare identifiers like CHECKS are used without qualification.
      */
-    private static void addStaticImports(CtModel model, Factory f, Map<String, Set<String>> staticImports) {
+    private static void addStaticImports(CtModel model, Factory f, Map<String, Set<String>> staticImports, Set<String> interestingTypeQNs) {
         if (staticImports == null || staticImports.isEmpty()) {
             return;
         }
@@ -1187,27 +1283,43 @@ public final class SpoonStubbingRunner implements Stubber {
             String classFqn = entry.getKey();
             Set<String> fieldNames = entry.getValue();
             
-            // Find the class that owns these static fields
-            CtType<?> ownerType = model.getAllTypes().stream()
-                .filter(t -> classFqn.equals(t.getQualifiedName()))
-                .findFirst()
-                .orElse(null);
+            // OPTIMIZATION: Find the class that owns these static fields (only in slice types)
+            CtType<?> ownerType = null;
+            for (String interestingQn : interestingTypeQNs) {
+                try {
+                    CtType<?> t = f.Type().get(interestingQn);
+                    if (t != null && classFqn.equals(t.getQualifiedName())) {
+                        ownerType = t;
+                        break;
+                    }
+                } catch (Throwable ignored) {}
+            }
             
             if (ownerType == null) {
                 System.out.println("[addStaticImports] WARNING: Owner type not found: " + classFqn);
                 continue;
             }
             
-            // Find all types that might use these static fields
-            // We'll add static imports to all types in the model (they'll be filtered by the compiler if unused)
-            for (CtType<?> type : model.getAllTypes()) {
+            // OPTIMIZATION: Only process slice types (created types), not entire model
+            // MINIMAL STUBBING: Only add static imports to types that actually need them (slice types)
+            int processedCount = 0;
+            int totalTypes = interestingTypeQNs.size();
+            for (String interestingQn : interestingTypeQNs) {
+                processedCount++;
+                if (processedCount % 10 == 0 || processedCount == totalTypes) {
+                    System.out.println("[addStaticImports] Processing types: " + processedCount + "/" + totalTypes);
+                }
                 try {
-                    CtCompilationUnit cu = f.CompilationUnit().getOrCreate(type);
-                    if (cu == null) continue;
+                    CtType<?> type = f.Type().get(interestingQn);
+                    if (type == null) continue;
                     
-                    // Check if this type's source code uses any of these field names
-                    boolean shouldAddImport = false;
                     try {
+                        CtCompilationUnit cu = f.CompilationUnit().getOrCreate(type);
+                        if (cu == null) continue;
+                        
+                        // Check if this type's source code uses any of these field names
+                        boolean shouldAddImport = false;
+                        try {
                         String source = cu.getOriginalSourceCode();
                         if (source != null) {
                             for (String fieldName : fieldNames) {
@@ -1229,9 +1341,9 @@ public final class SpoonStubbingRunner implements Stubber {
                         shouldAddImport = true;
                     }
                     
-                    if (shouldAddImport) {
-                        // Add static import for each field
-                        for (String fieldName : fieldNames) {
+                        if (shouldAddImport) {
+                            // Add static import for each field
+                            for (String fieldName : fieldNames) {
                             try {
                                 // Check if static import already exists
                                 boolean exists = cu.getImports().stream().anyMatch(imp -> {
@@ -1313,10 +1425,13 @@ public final class SpoonStubbingRunner implements Stubber {
                                 System.err.println("[addStaticImports] Failed to add static import for " + fieldName + 
                                     " from " + classFqn + " to " + type.getQualifiedName() + ": " + e.getMessage());
                             }
+                            }
                         }
+                    } catch (Throwable e) {
+                        System.err.println("[addStaticImports] Error processing type " + type.getQualifiedName() + ": " + e.getMessage());
                     }
                 } catch (Throwable e) {
-                    System.err.println("[addStaticImports] Error processing type " + type.getQualifiedName() + ": " + e.getMessage());
+                    System.err.println("[addStaticImports] Error processing type " + interestingQn + ": " + e.getMessage());
                 }
             }
         }
@@ -1545,11 +1660,14 @@ public final class SpoonStubbingRunner implements Stubber {
      * Removes imports with simple names (no package) and incorrectly formatted nested class imports.
      * Also removes static imports that reference non-existent classes.
      */
-    private static void cleanupInvalidImports(CtModel model, Factory f) {
-        // Build a set of all existing types in the model for quick lookup
+    private static void cleanupInvalidImports(CtModel model, Factory f, Set<String> interestingTypeQNs) {
+        // OPTIMIZATION: Only build set from slice types (created types), not entire model
         Set<String> existingTypes = new HashSet<>();
-        for (CtType<?> t : model.getAllTypes()) {
+        for (String interestingQn : interestingTypeQNs) {
             try {
+                CtType<?> t = f.Type().get(interestingQn);
+                if (t == null) continue;
+                
                 String qn = t.getQualifiedName();
                 if (qn != null && !qn.isEmpty()) {
                     existingTypes.add(qn);
@@ -1562,14 +1680,19 @@ public final class SpoonStubbingRunner implements Stubber {
             } catch (Throwable ignored) {}
         }
         
-        for (CtType<?> type : model.getAllTypes()) {
-            CtCompilationUnit cu;
+        // OPTIMIZATION: Only process slice types (created types), not entire model
+        for (String interestingQn : interestingTypeQNs) {
             try {
-                cu = f.CompilationUnit().getOrCreate(type);
-            } catch (Throwable ignored) {
-                continue;
-            }
-            if (cu == null) continue;
+                CtType<?> type = f.Type().get(interestingQn);
+                if (type == null) continue;
+                
+                CtCompilationUnit cu;
+                try {
+                    cu = f.CompilationUnit().getOrCreate(type);
+                } catch (Throwable ignored) {
+                    continue;
+                }
+                if (cu == null) continue;
 
             // Remove invalid imports - be more aggressive
             boolean removed = cu.getImports().removeIf(imp -> {
@@ -1728,6 +1851,7 @@ public final class SpoonStubbingRunner implements Stubber {
             // Always ensure all type references in the type have proper package information
             // This prevents Spoon from generating invalid imports
             ensureTypeReferencesHavePackages(type, f);
+            } catch (Throwable ignored) {}
         }
     }
     
@@ -1796,26 +1920,34 @@ public final class SpoonStubbingRunner implements Stubber {
      * Pattern: If static import references XModule and X exists, create X$Module inner class.
      * Also handles X.API pattern -> X$API inner class.
      */
-    private static void detectAndAddModuleClasses(CtModel model, SpoonCollector.CollectResult plans, Factory f) {
-        // Build set of existing types in the model
+    private static void detectAndAddModuleClasses(CtModel model, SpoonCollector.CollectResult plans, Factory f, Set<String> interestingTypeQNs) {
+        // OPTIMIZATION: Only build set from slice types (created types), not entire model
         Set<String> existingTypes = new HashSet<>();
-        for (CtType<?> type : model.getAllTypes()) {
+        for (String interestingQn : interestingTypeQNs) {
             try {
-                String qn = type.getQualifiedName();
-                if (qn != null && !qn.isEmpty()) {
-                    existingTypes.add(qn);
-                    // Also add simple name
-                    String simple = type.getSimpleName();
-                    if (simple != null) {
-                        existingTypes.add(simple);
+                CtType<?> type = f.Type().get(interestingQn);
+                if (type == null) continue;
+                
+                try {
+                    String qn = type.getQualifiedName();
+                    if (qn != null && !qn.isEmpty()) {
+                        existingTypes.add(qn);
+                        // Also add simple name
+                        String simple = type.getSimpleName();
+                        if (simple != null) {
+                            existingTypes.add(simple);
+                        }
                     }
-                }
+                } catch (Throwable ignored) {}
             } catch (Throwable ignored) {}
         }
         
-        // Scan all compilation units for static imports
+        // OPTIMIZATION: Only scan slice types (created types) for static imports
         Set<String> moduleClassesToCreate = new HashSet<>();
-        for (CtType<?> type : model.getAllTypes()) {
+        for (String interestingQn : interestingTypeQNs) {
+            try {
+                CtType<?> type = f.Type().get(interestingQn);
+                if (type == null) continue;
             try {
                 CtCompilationUnit cu = f.CompilationUnit().getOrCreate(type);
                 if (cu == null) continue;
@@ -1889,6 +2021,7 @@ public final class SpoonStubbingRunner implements Stubber {
                     } catch (Throwable ignored) {}
                 }
             } catch (Throwable ignored) {}
+        } catch (Throwable ignored) {}
         }
         
         // Add type plans for detected module classes
@@ -1909,8 +2042,9 @@ public final class SpoonStubbingRunner implements Stubber {
     /**
      * Collect all type references from the model and plans to determine which shims are needed.
      * Filters out array types, primitives, and invalid type names.
+     * OPTIMIZATION: Only process slice types (created types), not entire model.
      */
-    private Set<String> collectReferencedTypes(CtModel model, SpoonCollector.CollectResult plans) {
+    private Set<String> collectReferencedTypes(CtModel model, SpoonCollector.CollectResult plans, Set<String> interestingTypeQNs, Factory f) {
         Set<String> referenced = new HashSet<>();
         
         // Collect from type plans
@@ -1944,114 +2078,135 @@ public final class SpoonStubbingRunner implements Stubber {
             }
         }
         
-        // Also collect from static method invocations (e.g., LoggerFactory.getLogger())
-        for (CtInvocation<?> inv : model.getElements(new TypeFilter<>(CtInvocation.class))) {
+        // OPTIMIZATION: Only collect from static method invocations within slice types
+        for (String interestingQn : interestingTypeQNs) {
             try {
-                spoon.reflect.reference.CtExecutableReference<?> ex = inv.getExecutable();
-                if (ex != null) {
-                    // Collect declaring type (for both static and instance methods)
-                    spoon.reflect.reference.CtTypeReference<?> owner = ex.getDeclaringType();
-                    if (owner != null) {
-                        String ownerQn = safeQN(owner);
-                        if (ownerQn != null && !isArrayType(ownerQn) && 
-                            !ownerQn.startsWith("java.") && !ownerQn.startsWith("javax.") && !ownerQn.startsWith("jakarta.")) {
-                            referenced.add(ownerQn);
-                        }
-                        // Also collect type arguments from declaring type
-                        if (owner.getActualTypeArguments() != null) {
-                            for (CtTypeReference<?> typeArg : owner.getActualTypeArguments()) {
-                                if (!(typeArg instanceof spoon.reflect.reference.CtTypeParameterReference)) {
-                                    String typeArgQn = safeQN(typeArg);
-                                    if (typeArgQn != null && !isArrayType(typeArgQn) && 
-                                        !typeArgQn.startsWith("java.") && 
-                                        !typeArgQn.startsWith("javax.") && !typeArgQn.startsWith("jakarta.")) {
-                                        referenced.add(typeArgQn);
+                CtType<?> type = f.Type().get(interestingQn);
+                if (type == null) continue;
+                
+                for (CtInvocation<?> inv : type.getElements(new TypeFilter<>(CtInvocation.class))) {
+                    try {
+                        spoon.reflect.reference.CtExecutableReference<?> ex = inv.getExecutable();
+                        if (ex != null) {
+                            // Collect declaring type (for both static and instance methods)
+                            spoon.reflect.reference.CtTypeReference<?> owner = ex.getDeclaringType();
+                            if (owner != null) {
+                                String ownerQn = safeQN(owner);
+                                if (ownerQn != null && !isArrayType(ownerQn) && 
+                                    !ownerQn.startsWith("java.") && !ownerQn.startsWith("javax.") && !ownerQn.startsWith("jakarta.")) {
+                                    referenced.add(ownerQn);
+                                }
+                                // Also collect type arguments from declaring type
+                                if (owner.getActualTypeArguments() != null) {
+                                    for (CtTypeReference<?> typeArg : owner.getActualTypeArguments()) {
+                                        if (!(typeArg instanceof spoon.reflect.reference.CtTypeParameterReference)) {
+                                            String typeArgQn = safeQN(typeArg);
+                                            if (typeArgQn != null && !isArrayType(typeArgQn) && 
+                                                !typeArgQn.startsWith("java.") && 
+                                                !typeArgQn.startsWith("javax.") && !typeArgQn.startsWith("jakarta.")) {
+                                                referenced.add(typeArgQn);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            // Collect return type from method invocation
+                            CtTypeReference<?> returnType = ex.getType();
+                            if (returnType != null) {
+                                String returnQn = safeQN(returnType);
+                                if (returnQn != null && !isArrayType(returnQn) && 
+                                    !returnQn.startsWith("java.") && 
+                                    !returnQn.startsWith("javax.") && !returnQn.startsWith("jakarta.")) {
+                                    referenced.add(returnQn);
+                                }
+                                // Collect type arguments from return type
+                                if (returnType.getActualTypeArguments() != null) {
+                                    for (CtTypeReference<?> typeArg : returnType.getActualTypeArguments()) {
+                                        if (!(typeArg instanceof spoon.reflect.reference.CtTypeParameterReference)) {
+                                            String typeArgQn = safeQN(typeArg);
+                                            if (typeArgQn != null && !isArrayType(typeArgQn) && 
+                                                !typeArgQn.startsWith("java.") && 
+                                                !typeArgQn.startsWith("javax.") && !typeArgQn.startsWith("jakarta.")) {
+                                                referenced.add(typeArgQn);
+                                            }
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
-                    // Collect return type from method invocation
-                    CtTypeReference<?> returnType = ex.getType();
-                    if (returnType != null) {
-                        String returnQn = safeQN(returnType);
-                        if (returnQn != null && !isArrayType(returnQn) && 
-                            !returnQn.startsWith("java.") && 
-                            !returnQn.startsWith("javax.") && !returnQn.startsWith("jakarta.")) {
-                            referenced.add(returnQn);
-                        }
-                        // Collect type arguments from return type
-                        if (returnType.getActualTypeArguments() != null) {
-                            for (CtTypeReference<?> typeArg : returnType.getActualTypeArguments()) {
-                                if (!(typeArg instanceof spoon.reflect.reference.CtTypeParameterReference)) {
-                                    String typeArgQn = safeQN(typeArg);
-                                    if (typeArgQn != null && !isArrayType(typeArgQn) && 
-                                        !typeArgQn.startsWith("java.") && 
-                                        !typeArgQn.startsWith("javax.") && !typeArgQn.startsWith("jakarta.")) {
-                                        referenced.add(typeArgQn);
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    } catch (Throwable ignored) {}
                 }
             } catch (Throwable ignored) {}
         }
         
-        // Also collect from field accesses (e.g., obj.field, Class.staticField)
-        for (CtFieldAccess<?> fieldAccess : model.getElements(new TypeFilter<>(CtFieldAccess.class))) {
+        // OPTIMIZATION: Only collect from field accesses within slice types
+        for (String interestingQn : interestingTypeQNs) {
             try {
-                CtTypeReference<?> accessedType = fieldAccess.getVariable().getDeclaringType();
+                CtType<?> type = f.Type().get(interestingQn);
+                if (type == null) continue;
+                
+                for (CtFieldAccess<?> fieldAccess : type.getElements(new TypeFilter<>(CtFieldAccess.class))) {
+                    try {
+                        CtTypeReference<?> accessedType = fieldAccess.getVariable().getDeclaringType();
                 if (accessedType != null) {
-                    String accessedQn = safeQN(accessedType);
-                    if (accessedQn != null && !isArrayType(accessedQn) && 
-                        !accessedQn.startsWith("java.") && 
-                        !accessedQn.startsWith("javax.") && !accessedQn.startsWith("jakarta.")) {
-                        referenced.add(accessedQn);
+                        String accessedQn = safeQN(accessedType);
+                        if (accessedQn != null && !isArrayType(accessedQn) && 
+                            !accessedQn.startsWith("java.") && 
+                            !accessedQn.startsWith("javax.") && !accessedQn.startsWith("jakarta.")) {
+                            referenced.add(accessedQn);
+                        }
                     }
-                }
-                CtTypeReference<?> fieldType = fieldAccess.getVariable().getType();
-                if (fieldType != null) {
-                    String fieldTypeQn = safeQN(fieldType);
-                    if (fieldTypeQn != null && !isArrayType(fieldTypeQn) && 
-                        !fieldTypeQn.startsWith("java.") && 
-                        !fieldTypeQn.startsWith("javax.") && !fieldTypeQn.startsWith("jakarta.")) {
-                        referenced.add(fieldTypeQn);
-                    }
-                    // Collect type arguments from field type generics
-                    if (fieldType.getActualTypeArguments() != null) {
-                        for (CtTypeReference<?> typeArg : fieldType.getActualTypeArguments()) {
-                            if (!(typeArg instanceof spoon.reflect.reference.CtTypeParameterReference)) {
-                                String typeArgQn = safeQN(typeArg);
-                                if (typeArgQn != null && !isArrayType(typeArgQn) && 
-                                    !typeArgQn.startsWith("java.") && 
-                                    !typeArgQn.startsWith("javax.") && !typeArgQn.startsWith("jakarta.")) {
-                                    referenced.add(typeArgQn);
+                    CtTypeReference<?> fieldType = fieldAccess.getVariable().getType();
+                    if (fieldType != null) {
+                        String fieldTypeQn = safeQN(fieldType);
+                        if (fieldTypeQn != null && !isArrayType(fieldTypeQn) && 
+                            !fieldTypeQn.startsWith("java.") && 
+                            !fieldTypeQn.startsWith("javax.") && !fieldTypeQn.startsWith("jakarta.")) {
+                            referenced.add(fieldTypeQn);
+                        }
+                        // Collect type arguments from field type generics
+                        if (fieldType.getActualTypeArguments() != null) {
+                            for (CtTypeReference<?> typeArg : fieldType.getActualTypeArguments()) {
+                                if (!(typeArg instanceof spoon.reflect.reference.CtTypeParameterReference)) {
+                                    String typeArgQn = safeQN(typeArg);
+                                    if (typeArgQn != null && !isArrayType(typeArgQn) && 
+                                        !typeArgQn.startsWith("java.") && 
+                                        !typeArgQn.startsWith("javax.") && !typeArgQn.startsWith("jakarta.")) {
+                                        referenced.add(typeArgQn);
+                                    }
                                 }
                             }
                         }
                     }
+                    } catch (Throwable ignored) {}
                 }
             } catch (Throwable ignored) {}
         }
         
-        // Also collect from field assignments that use static method calls (e.g., LoggerFactory.getLogger())
-        for (spoon.reflect.code.CtAssignment<?, ?> assignment : model.getElements(new TypeFilter<>(spoon.reflect.code.CtAssignment.class))) {
+        // OPTIMIZATION: Only collect from field assignments within slice types
+        for (String interestingQn : interestingTypeQNs) {
             try {
-                spoon.reflect.code.CtExpression<?> assigned = assignment.getAssigned();
-                if (assigned instanceof CtInvocation<?>) {
-                    CtInvocation<?> inv = (CtInvocation<?>) assigned;
-                    spoon.reflect.reference.CtExecutableReference<?> ex = inv.getExecutable();
-                    if (ex != null && ex.isStatic()) {
-                        spoon.reflect.reference.CtTypeReference<?> owner = ex.getDeclaringType();
-                        if (owner != null) {
-                            String ownerQn = safeQN(owner);
-                            if (ownerQn != null && !isArrayType(ownerQn) && 
-                                !ownerQn.startsWith("java.") && !ownerQn.startsWith("javax.") && !ownerQn.startsWith("jakarta.")) {
-                                referenced.add(ownerQn);
+                CtType<?> type = f.Type().get(interestingQn);
+                if (type == null) continue;
+                
+                for (spoon.reflect.code.CtAssignment<?, ?> assignment : type.getElements(new TypeFilter<>(spoon.reflect.code.CtAssignment.class))) {
+                    try {
+                        spoon.reflect.code.CtExpression<?> assigned = assignment.getAssigned();
+                        if (assigned instanceof CtInvocation<?>) {
+                            CtInvocation<?> inv = (CtInvocation<?>) assigned;
+                            spoon.reflect.reference.CtExecutableReference<?> ex = inv.getExecutable();
+                            if (ex != null && ex.isStatic()) {
+                                spoon.reflect.reference.CtTypeReference<?> owner = ex.getDeclaringType();
+                                if (owner != null) {
+                                    String ownerQn = safeQN(owner);
+                                    if (ownerQn != null && !isArrayType(ownerQn) && 
+                                        !ownerQn.startsWith("java.") && !ownerQn.startsWith("javax.") && !ownerQn.startsWith("jakarta.")) {
+                                        referenced.add(ownerQn);
+                                    }
+                                }
                             }
                         }
-                    }
+                    } catch (Throwable ignored) {}
                 }
             } catch (Throwable ignored) {}
         }
@@ -2111,37 +2266,45 @@ public final class SpoonStubbingRunner implements Stubber {
             }
         }
         
-        // Collect from all type references in the model (including extends, implements, field types, etc.)
-        // CRITICAL FIX: Filter out array types - arrays should never be stubbed as classes
-        for (CtTypeReference<?> typeRef : model.getElements(new TypeFilter<>(CtTypeReference.class))) {
+        // OPTIMIZATION: Only collect from type references within slice types
+        for (String interestingQn : interestingTypeQNs) {
             try {
-                String qn = safeQN(typeRef);
-                if (qn != null && !qn.isEmpty() && !isArrayType(qn) && 
-                    !qn.startsWith("java.") && !qn.startsWith("javax.") && !qn.startsWith("jakarta.")) {
-                    referenced.add(qn);
-                }
+                CtType<?> type = f.Type().get(interestingQn);
+                if (type == null) continue;
                 
-                // Also collect type arguments from generic types (transitive dependencies)
-                // e.g., List<String> -> collect String, Map<K, V> -> collect K and V if they're concrete types
-                if (typeRef.getActualTypeArguments() != null && !typeRef.getActualTypeArguments().isEmpty()) {
-                    for (CtTypeReference<?> typeArg : typeRef.getActualTypeArguments()) {
-                        // Skip type parameters (T, K, V, etc.) - only collect concrete types
-                        if (!(typeArg instanceof spoon.reflect.reference.CtTypeParameterReference)) {
-                            String typeArgQn = safeQN(typeArg);
-                            if (typeArgQn != null && !typeArgQn.isEmpty() && !isArrayType(typeArgQn) &&
-                                !typeArgQn.startsWith("java.") && !typeArgQn.startsWith("javax.") && 
-                                !typeArgQn.startsWith("jakarta.")) {
-                                referenced.add(typeArgQn);
+                for (CtTypeReference<?> typeRef : type.getElements(new TypeFilter<>(CtTypeReference.class))) {
+                    try {
+                        String qn = safeQN(typeRef);
+                        if (qn != null && !qn.isEmpty() && !isArrayType(qn) && 
+                            !qn.startsWith("java.") && !qn.startsWith("javax.") && !qn.startsWith("jakarta.")) {
+                            referenced.add(qn);
+                        }
+                        
+                        // Also collect type arguments from generic types (transitive dependencies)
+                        // e.g., List<String> -> collect String, Map<K, V> -> collect K and V if they're concrete types
+                        if (typeRef.getActualTypeArguments() != null && !typeRef.getActualTypeArguments().isEmpty()) {
+                            for (CtTypeReference<?> typeArg : typeRef.getActualTypeArguments()) {
+                                // Skip type parameters (T, K, V, etc.) - only collect concrete types
+                                if (!(typeArg instanceof spoon.reflect.reference.CtTypeParameterReference)) {
+                                    String typeArgQn = safeQN(typeArg);
+                                    if (typeArgQn != null && !typeArgQn.isEmpty() && !isArrayType(typeArgQn) &&
+                                        !typeArgQn.startsWith("java.") && !typeArgQn.startsWith("javax.") && 
+                                        !typeArgQn.startsWith("jakarta.")) {
+                                        referenced.add(typeArgQn);
+                                    }
+                                }
                             }
                         }
-                    }
+                    } catch (Throwable ignored) {}
                 }
             } catch (Throwable ignored) {}
         }
         
-        // Also collect from supertypes (extends/implements)
-        // CRITICAL FIX: Filter out array types and ensure types are actually needed
-        for (CtType<?> type : model.getAllTypes()) {
+        // OPTIMIZATION: Only collect from supertypes within slice types
+        for (String interestingQn : interestingTypeQNs) {
+            try {
+                CtType<?> type = f.Type().get(interestingQn);
+                if (type == null) continue;
             try {
                 if (type.getSuperclass() != null) {
                     String superQn = safeQN(type.getSuperclass());
@@ -2257,6 +2420,7 @@ public final class SpoonStubbingRunner implements Stubber {
                         }
                     }
                 }
+                } catch (Throwable ignored) {}
             } catch (Throwable ignored) {}
         }
         
@@ -2272,7 +2436,7 @@ public final class SpoonStubbingRunner implements Stubber {
      * 
      * This ensures minimal stubbing - we only generate SLF4J shims when actually needed.
      */
-    private boolean isSlf4jNeeded(CtModel model, Set<String> referencedTypes) {
+    private boolean isSlf4jNeeded(CtModel model, Set<String> referencedTypes, Set<String> interestingTypeQNs, Factory f) {
         // Check if SLF4J types are already referenced
         boolean hasSlf4jReference = referencedTypes.stream()
             .anyMatch(ref -> ref != null && (
@@ -2285,27 +2449,30 @@ public final class SpoonStubbingRunner implements Stubber {
             return true;
         }
         
-        // Check if there are logger fields in the model that need initialization
+        // OPTIMIZATION: Only check slice types (created types), not entire model
         try {
-            for (CtType<?> type : model.getAllTypes()) {
-                if (!(type instanceof CtClass)) continue;
-                
-                CtClass<?> cls = (CtClass<?>) type;
-                for (CtField<?> field : cls.getFields()) {
-                    CtTypeReference<?> fieldType = field.getType();
-                    if (fieldType == null) continue;
+            for (String interestingQn : interestingTypeQNs) {
+                try {
+                    CtType<?> type = f.Type().get(interestingQn);
+                    if (type == null || !(type instanceof CtClass)) continue;
                     
-                    String fieldTypeQn = safeQN(fieldType);
-                    if (fieldTypeQn != null && (
-                        fieldTypeQn.contains("Logger") || 
-                        fieldTypeQn.contains("slf4j") ||
-                        // Check for common logger field names
-                        (field.getSimpleName().toLowerCase().contains("log") && 
-                         fieldTypeQn.contains("org.slf4j"))
-                    )) {
-                        return true;
+                    CtClass<?> cls = (CtClass<?>) type;
+                    for (CtField<?> field : cls.getFields()) {
+                        CtTypeReference<?> fieldType = field.getType();
+                        if (fieldType == null) continue;
+                        
+                        String fieldTypeQn = safeQN(fieldType);
+                        if (fieldTypeQn != null && (
+                            fieldTypeQn.contains("Logger") || 
+                            fieldTypeQn.contains("slf4j") ||
+                            // Check for common logger field names
+                            (field.getSimpleName().toLowerCase().contains("log") && 
+                             fieldTypeQn.contains("org.slf4j"))
+                        )) {
+                            return true;
+                        }
                     }
-                }
+                } catch (Throwable ignored) {}
             }
         } catch (Throwable ignored) {
             // If we can't check, be safe and return false (don't generate unnecessary shims)
@@ -2328,58 +2495,81 @@ public final class SpoonStubbingRunner implements Stubber {
      * When a field access has a null target (implicit this), ensure it's properly handled.
      * The leading dot issue occurs when Spoon's printer sees a field access with a problematic target.
      */
-    private static void fixFieldAccessTargets(CtModel model, Factory f) {
-        // Fix method invocations with field access targets
-        for (CtInvocation<?> inv : model.getElements(new TypeFilter<>(CtInvocation.class))) {
-            CtExpression<?> target = inv.getTarget();
-            if (target instanceof CtFieldAccess<?>) {
-                CtFieldAccess<?> fa = (CtFieldAccess<?>) target;
-                CtType<?> enclosingType = inv.getParent(CtType.class);
-                if (enclosingType != null && enclosingType instanceof CtClass) {
+    private static void fixFieldAccessTargets(CtModel model, Factory f, Set<String> interestingTypeQNs) {
+        // OPTIMIZATION: Only process slice types, not entire model
+        if (interestingTypeQNs == null || interestingTypeQNs.isEmpty()) {
+            return;
+        }
+        
+        // Fix method invocations with field access targets (only in slice types)
+        for (String interestingQn : interestingTypeQNs) {
+            try {
+                CtType<?> type = f.Type().get(interestingQn);
+                if (type == null) continue;
+                
+                for (CtInvocation<?> inv : type.getElements(new TypeFilter<>(CtInvocation.class))) {
                     try {
-                        CtField<?> field = fa.getVariable().getDeclaration();
-                        if (field != null && !field.hasModifier(ModifierKind.STATIC)) {
-                            // Instance field - target should be null for implicit 'this'
-                            // If target is not null but should be, or if it's causing issues, fix it
-                            CtExpression<?> faTarget = fa.getTarget();
-                            if (faTarget != null) {
-                                // If target exists, check if it's problematic
-                                String targetStr = faTarget.toString();
-                                // If target is empty or just a dot, set it to null for implicit this
-                                if (targetStr == null || targetStr.trim().isEmpty() || ".".equals(targetStr.trim())) {
-                                    fa.setTarget(null);
-                                }
-            } else {
-                                // Target is null, which is correct for implicit this
-                                // But ensure it's explicitly null (not some other problematic state)
-                                fa.setTarget(null);
+                        CtExpression<?> target = inv.getTarget();
+                        if (target instanceof CtFieldAccess<?>) {
+                            CtFieldAccess<?> fa = (CtFieldAccess<?>) target;
+                            CtType<?> enclosingType = inv.getParent(CtType.class);
+                            if (enclosingType != null && enclosingType instanceof CtClass) {
+                                try {
+                                    CtField<?> field = fa.getVariable().getDeclaration();
+                                    if (field != null && !field.hasModifier(ModifierKind.STATIC)) {
+                                        // Instance field - target should be null for implicit 'this'
+                                        // If target is not null but should be, or if it's causing issues, fix it
+                                        CtExpression<?> faTarget = fa.getTarget();
+                                        if (faTarget != null) {
+                                            // If target exists, check if it's problematic
+                                            String targetStr = faTarget.toString();
+                                            // If target is empty or just a dot, set it to null for implicit this
+                                            if (targetStr == null || targetStr.trim().isEmpty() || ".".equals(targetStr.trim())) {
+                                                fa.setTarget(null);
+                                            }
+                                        } else {
+                                            // Target is null, which is correct for implicit this
+                                            // But ensure it's explicitly null (not some other problematic state)
+                                            fa.setTarget(null);
+                                        }
+                                    }
+                                } catch (Throwable ignored) {}
                             }
                         }
                     } catch (Throwable ignored) {}
                 }
-            }
+            } catch (Throwable ignored) {}
         }
         
-        // Also fix standalone field accesses
-        for (CtFieldAccess<?> fa : model.getElements(new TypeFilter<>(CtFieldAccess.class))) {
-            CtType<?> enclosingType = fa.getParent(CtType.class);
-            if (enclosingType != null && enclosingType instanceof CtClass) {
-                try {
-                    CtField<?> field = fa.getVariable().getDeclaration();
-                    if (field != null && !field.hasModifier(ModifierKind.STATIC)) {
-                        // Instance field - ensure target is null for implicit this
-                        CtExpression<?> faTarget = fa.getTarget();
-                        if (faTarget != null) {
-                            String targetStr = faTarget.toString();
-                            if (targetStr == null || targetStr.trim().isEmpty() || ".".equals(targetStr.trim())) {
-                                fa.setTarget(null);
-                            }
-                        } else {
-                            fa.setTarget(null);
+        // Also fix standalone field accesses (only in slice types)
+        for (String interestingQn : interestingTypeQNs) {
+            try {
+                CtType<?> type = f.Type().get(interestingQn);
+                if (type == null) continue;
+                
+                for (CtFieldAccess<?> fa : type.getElements(new TypeFilter<>(CtFieldAccess.class))) {
+                    try {
+                        CtType<?> enclosingType = fa.getParent(CtType.class);
+                        if (enclosingType != null && enclosingType instanceof CtClass) {
+                            try {
+                                CtField<?> field = fa.getVariable().getDeclaration();
+                                if (field != null && !field.hasModifier(ModifierKind.STATIC)) {
+                                    // Instance field - ensure target is null for implicit this
+                                    CtExpression<?> faTarget = fa.getTarget();
+                                    if (faTarget != null) {
+                                        String targetStr = faTarget.toString();
+                                        if (targetStr == null || targetStr.trim().isEmpty() || ".".equals(targetStr.trim())) {
+                                            fa.setTarget(null);
+                                        }
+                                    } else {
+                                        fa.setTarget(null);
+                                    }
+                                }
+                            } catch (Throwable ignored) {}
                         }
-                    }
-                } catch (Throwable ignored) {}
-            }
+                    } catch (Throwable ignored) {}
+                }
+            } catch (Throwable ignored) {}
         }
     }
     
@@ -2387,40 +2577,59 @@ public final class SpoonStubbingRunner implements Stubber {
      * Make classes public if they are referenced from other packages.
      * This ensures that classes can be accessed across package boundaries.
      */
-    private static void makeReferencedClassesPublic(CtModel model, Factory f) {
-        // Collect all type references in the model
-        Set<String> referencedTypeQns = new HashSet<>();
-        
-        for (CtTypeReference<?> ref : model.getElements(new TypeFilter<>(CtTypeReference.class))) {
-            try {
-                String qn = ref.getQualifiedName();
-                if (qn != null && !qn.isEmpty() && !qn.startsWith("java.") && 
-                    !qn.startsWith("javax.") && !qn.startsWith("jakarta.")) {
-                    referencedTypeQns.add(qn);
-                }
-            } catch (Throwable ignored) {}
+    private static void makeReferencedClassesPublic(CtModel model, Factory f, Set<String> interestingTypeQNs) {
+        // OPTIMIZATION: Only process slice types, not entire model
+        if (interestingTypeQNs == null || interestingTypeQNs.isEmpty()) {
+            return;
         }
         
-        // Also check method return types and parameter types
-        for (CtMethod<?> method : model.getElements(new TypeFilter<>(CtMethod.class))) {
+        // Collect type references only from slice types
+        Set<String> referencedTypeQns = new HashSet<>();
+        
+        for (String interestingQn : interestingTypeQNs) {
             try {
-                CtTypeReference<?> returnType = method.getType();
-                if (returnType != null) {
-                    String qn = returnType.getQualifiedName();
-                    if (qn != null && !qn.isEmpty() && !qn.startsWith("java.") && 
-                        !qn.startsWith("javax.") && !qn.startsWith("jakarta.")) {
-                        referencedTypeQns.add(qn);
-                    }
-                }
-                for (CtParameter<?> param : method.getParameters()) {
-                    CtTypeReference<?> paramType = param.getType();
-                    if (paramType != null) {
-                        String qn = paramType.getQualifiedName();
+                CtType<?> type = f.Type().get(interestingQn);
+                if (type == null) continue;
+                
+                for (CtTypeReference<?> ref : type.getElements(new TypeFilter<>(CtTypeReference.class))) {
+                    try {
+                        String qn = ref.getQualifiedName();
                         if (qn != null && !qn.isEmpty() && !qn.startsWith("java.") && 
                             !qn.startsWith("javax.") && !qn.startsWith("jakarta.")) {
                             referencedTypeQns.add(qn);
                         }
-                    }
+                    } catch (Throwable ignored) {}
+                }
+            } catch (Throwable ignored) {}
+        }
+        
+        // Also check method return types and parameter types (only in slice types)
+        for (String interestingQn : interestingTypeQNs) {
+            try {
+                CtType<?> type = f.Type().get(interestingQn);
+                if (type == null) continue;
+                
+                for (CtMethod<?> method : type.getMethods()) {
+                    try {
+                        CtTypeReference<?> returnType = method.getType();
+                        if (returnType != null) {
+                            String qn = returnType.getQualifiedName();
+                            if (qn != null && !qn.isEmpty() && !qn.startsWith("java.") && 
+                                !qn.startsWith("javax.") && !qn.startsWith("jakarta.")) {
+                                referencedTypeQns.add(qn);
+                            }
+                        }
+                        for (CtParameter<?> param : method.getParameters()) {
+                            CtTypeReference<?> paramType = param.getType();
+                            if (paramType != null) {
+                                String qn = paramType.getQualifiedName();
+                                if (qn != null && !qn.isEmpty() && !qn.startsWith("java.") && 
+                                    !qn.startsWith("javax.") && !qn.startsWith("jakarta.")) {
+                                    referencedTypeQns.add(qn);
+                                }
+                            }
+                        }
+                    } catch (Throwable ignored) {}
                 }
             } catch (Throwable ignored) {}
         }
@@ -2492,15 +2701,20 @@ public final class SpoonStubbingRunner implements Stubber {
     /**
      * Post-process generated Java files to remove bad static imports that reference non-existent classes.
      */
-    private static void postProcessRemoveBadStaticImports(Path outputDir, CtModel model, Factory f) {
-        // Build set of existing types
+    private static void postProcessRemoveBadStaticImports(Path outputDir, CtModel model, Factory f, Set<String> interestingTypeQNs) {
+        // OPTIMIZATION: Only build set from slice types (created types), not entire model
         Set<String> existingTypes = new HashSet<>();
-        for (CtType<?> t : model.getAllTypes()) {
+        for (String interestingQn : interestingTypeQNs) {
             try {
-                String qn = t.getQualifiedName();
-                if (qn != null && !qn.isEmpty()) {
-                    existingTypes.add(qn);
-                }
+                CtType<?> t = f.Type().get(interestingQn);
+                if (t == null) continue;
+                
+                try {
+                    String qn = t.getQualifiedName();
+                    if (qn != null && !qn.isEmpty()) {
+                        existingTypes.add(qn);
+                    }
+                } catch (Throwable ignored) {}
             } catch (Throwable ignored) {}
         }
         
@@ -2731,7 +2945,7 @@ public final class SpoonStubbingRunner implements Stubber {
      * Spoon sometimes doesn't write imports even when they're in the CU, so we add them manually.
      * This function is SAFE - it only adds imports, never removes or modifies existing code.
      */
-    private static void postProcessAddMissingImports(Path outputDir, CtModel model, Factory f) {
+    private static void postProcessAddMissingImports(Path outputDir, CtModel model, Factory f, Set<String> interestingTypeQNs) {
         if (outputDir == null || !Files.exists(outputDir)) {
             return; // Safety check
         }
@@ -2752,21 +2966,29 @@ public final class SpoonStubbingRunner implements Stubber {
             }
         } catch (Throwable ignored) {}
         
-        // Build map of all types in model for quick lookup
+        // OPTIMIZATION: Only build map from slice types (created types), not entire model
         Map<String, String> simpleNameToFQN = new HashMap<>();
-        for (CtType<?> type : model.getAllTypes()) {
+        for (String interestingQn : interestingTypeQNs) {
             try {
-                String qn = type.getQualifiedName();
-                String simple = type.getSimpleName();
-                if (qn != null && simple != null && !qn.startsWith("java.") && !qn.startsWith("javax.") && !qn.startsWith("jakarta.")) {
-                    simpleNameToFQN.put(simple, qn);
-                }
+                CtType<?> type = f.Type().get(interestingQn);
+                if (type == null) continue;
+                
+                try {
+                    String qn = type.getQualifiedName();
+                    String simple = type.getSimpleName();
+                    if (qn != null && simple != null && !qn.startsWith("java.") && !qn.startsWith("javax.") && !qn.startsWith("jakarta.")) {
+                        simpleNameToFQN.put(simple, qn);
+                    }
+                } catch (Throwable ignored) {}
             } catch (Throwable ignored) {}
         }
         
-        // Build map of type to its required imports from CU
+        // OPTIMIZATION: Only build map from slice types (created types), not entire model
         Map<String, Set<String>> typeToImports = new HashMap<>();
-        for (CtType<?> type : model.getAllTypes()) {
+        for (String interestingQn : interestingTypeQNs) {
+            try {
+                CtType<?> type = f.Type().get(interestingQn);
+                if (type == null) continue;
             try {
                 CtCompilationUnit cu = f.CompilationUnit().getOrCreate(type);
                 if (cu == null) continue;
@@ -2809,6 +3031,7 @@ public final class SpoonStubbingRunner implements Stubber {
                     }
                 }
             } catch (Throwable ignored) {}
+        } catch (Throwable ignored) {}
         }
         
         // Now add imports to the actual files
@@ -3255,17 +3478,23 @@ public final class SpoonStubbingRunner implements Stubber {
      * DEBUG: Print what is missing to compile and what stubbing plan was collected.
      * This helps identify collection issues before stubbing starts.
      */
-    private static void printMissingElementsAndStubbingPlan(CtModel model, SpoonCollector.CollectResult plans) {
+    private static void printMissingElementsAndStubbingPlan(CtModel model, SpoonCollector.CollectResult plans, Set<String> interestingTypeQNs, Factory f) {
         System.out.println();
         
+        // OPTIMIZATION: Only collect from slice types (created types), not entire model
         // 1. Find unresolved types (types referenced but not in model)
         Set<String> existingTypes = new HashSet<>();
-        model.getAllTypes().forEach(t -> {
+        for (String interestingQn : interestingTypeQNs) {
             try {
-                String qn = t.getQualifiedName();
-                if (qn != null) existingTypes.add(qn);
+                CtType<?> t = f.Type().get(interestingQn);
+                if (t == null) continue;
+                
+                try {
+                    String qn = t.getQualifiedName();
+                    if (qn != null) existingTypes.add(qn);
+                } catch (Throwable ignored) {}
             } catch (Throwable ignored) {}
-        });
+        }
         
         // Build a map of type FQN -> TypeStubPlan to get the kind
         Map<String, TypeStubPlan> typePlanMap = new HashMap<>();
@@ -3626,96 +3855,104 @@ public final class SpoonStubbingRunner implements Stubber {
      * CRITICAL FIX: Fix void return types for methods used in boolean expressions (||, &&).
      * If a method returns void but is used in a boolean binary operator, change its return type to boolean.
      */
-    private static void fixVoidReturnTypesInBooleanContexts(CtModel model, Factory f) {
+    private static void fixVoidReturnTypesInBooleanContexts(CtModel model, Factory f, Set<String> interestingTypeQNs) {
+        // OPTIMIZATION: Only process slice types (created types), not entire model
         try {
-            for (CtType<?> type : model.getAllTypes()) {
-                if (!(type instanceof CtClass)) continue;
-                
-                CtClass<?> cls = (CtClass<?>) type;
-                for (CtMethod<?> method : cls.getMethods()) {
-                    CtTypeReference<?> returnType = method.getType();
-                    if (returnType == null) continue;
+            for (String interestingQn : interestingTypeQNs) {
+                try {
+                    CtType<?> type = f.Type().get(interestingQn);
+                    if (type == null || !(type instanceof CtClass)) continue;
                     
-                    // Check if method returns void
-                    if (!returnType.getQualifiedName().equals("void")) continue;
+                    CtClass<?> cls = (CtClass<?>) type;
                     
-                    // Check if this method is used in a boolean context (||, &&)
-                    boolean usedInBooleanContext = false;
-                    try {
-                        // Search for invocations of this method in boolean binary operators
-                        for (CtType<?> searchType : model.getAllTypes()) {
-                            if (!(searchType instanceof CtClass)) continue;
-                            
-                            CtClass<?> searchCls = (CtClass<?>) searchType;
-                            for (CtMethod<?> searchMethod : searchCls.getMethods()) {
-                                CtBlock<?> body = searchMethod.getBody();
-                                if (body == null) continue;
-                                
-                                // Check all binary operators in the method body
-                                for (CtBinaryOperator<?> binOp : body.getElements(new spoon.reflect.visitor.filter.TypeFilter<>(CtBinaryOperator.class))) {
-                                    if (binOp.getKind() == spoon.reflect.code.BinaryOperatorKind.OR || 
-                                        binOp.getKind() == spoon.reflect.code.BinaryOperatorKind.AND) {
+                    for (CtMethod<?> method : cls.getMethods()) {
+                        CtTypeReference<?> returnType = method.getType();
+                        if (returnType == null) continue;
+                        
+                        // Check if method returns void
+                        if (!returnType.getQualifiedName().equals("void")) continue;
+                        
+                        // Check if this method is used in a boolean context (||, &&)
+                        boolean usedInBooleanContext = false;
+                        try {
+                            // OPTIMIZATION: Only search in slice types (created types), not entire model
+                            for (String searchQn : interestingTypeQNs) {
+                                try {
+                                    CtType<?> searchType = f.Type().get(searchQn);
+                                    if (searchType == null || !(searchType instanceof CtClass)) continue;
+                                    
+                                    CtClass<?> searchCls = (CtClass<?>) searchType;
+                                    for (CtMethod<?> searchMethod : searchCls.getMethods()) {
+                                        CtBlock<?> body = searchMethod.getBody();
+                                        if (body == null) continue;
                                         
-                                        // Check if this method is invoked in this boolean expression
-                                        for (CtInvocation<?> inv : binOp.getElements(new spoon.reflect.visitor.filter.TypeFilter<>(CtInvocation.class))) {
-                                            CtExecutableReference<?> execRef = inv.getExecutable();
-                                            if (execRef != null && 
-                                                execRef.getSimpleName().equals(method.getSimpleName()) &&
-                                                execRef.getDeclaringType() != null &&
-                                                execRef.getDeclaringType().getQualifiedName().equals(cls.getQualifiedName())) {
-                                                usedInBooleanContext = true;
-                                                break;
+                                        // Check all binary operators in the method body
+                                        for (CtBinaryOperator<?> binOp : body.getElements(new spoon.reflect.visitor.filter.TypeFilter<>(CtBinaryOperator.class))) {
+                                            if (binOp.getKind() == spoon.reflect.code.BinaryOperatorKind.OR || 
+                                                binOp.getKind() == spoon.reflect.code.BinaryOperatorKind.AND) {
+                                                
+                                                // Check if this method is invoked in this boolean expression
+                                                for (CtInvocation<?> inv : binOp.getElements(new spoon.reflect.visitor.filter.TypeFilter<>(CtInvocation.class))) {
+                                                    CtExecutableReference<?> execRef = inv.getExecutable();
+                                                    if (execRef != null && 
+                                                        execRef.getSimpleName().equals(method.getSimpleName()) &&
+                                                        execRef.getDeclaringType() != null &&
+                                                        execRef.getDeclaringType().getQualifiedName().equals(cls.getQualifiedName())) {
+                                                        usedInBooleanContext = true;
+                                                        break;
+                                                    }
+                                                }
+                                                if (usedInBooleanContext) break;
                                             }
                                         }
                                         if (usedInBooleanContext) break;
                                     }
-                                }
-                                if (usedInBooleanContext) break;
+                                    if (usedInBooleanContext) break;
+                                } catch (Throwable ignored) {}
                             }
-                            if (usedInBooleanContext) break;
-                        }
-                    } catch (Throwable ignored) {}
-                    
-                    // If method is used in boolean context, change return type to boolean
-                    if (usedInBooleanContext) {
-                        try {
-                            method.setType(f.Type().BOOLEAN_PRIMITIVE);
-                            // Also update the method body to return a boolean value
-                            if (method.getBody() != null) {
-                                CtBlock<?> body = method.getBody();
-                                // Check if there's already a return statement
-                                boolean hasReturn = false;
-                                for (CtStatement stmt : body.getStatements()) {
-                                    if (stmt instanceof CtReturn) {
-                                        hasReturn = true;
-                                        // Update return statement to return boolean
-                                        CtReturn<?> ret = (CtReturn<?>) stmt;
-                                        if (ret.getReturnedExpression() == null) {
-                                            // Use raw type cast to avoid generic type issues
-                                            @SuppressWarnings({"unchecked", "rawtypes"})
-                                            CtExpression expr = (CtExpression) f.Code().createLiteral(false);
-                                            ret.setReturnedExpression(expr);
+                        } catch (Throwable ignored) {}
+                        
+                        // If method is used in boolean context, change return type to boolean
+                        if (usedInBooleanContext) {
+                            try {
+                                method.setType(f.Type().BOOLEAN_PRIMITIVE);
+                                // Also update the method body to return a boolean value
+                                if (method.getBody() != null) {
+                                    CtBlock<?> body = method.getBody();
+                                    // Check if there's already a return statement
+                                    boolean hasReturn = false;
+                                    for (CtStatement stmt : body.getStatements()) {
+                                        if (stmt instanceof CtReturn) {
+                                            hasReturn = true;
+                                            // Update return statement to return boolean
+                                            CtReturn<?> ret = (CtReturn<?>) stmt;
+                                            if (ret.getReturnedExpression() == null) {
+                                                // Use raw type cast to avoid generic type issues
+                                                @SuppressWarnings({"unchecked", "rawtypes"})
+                                                CtExpression expr = (CtExpression) f.Code().createLiteral(false);
+                                                ret.setReturnedExpression(expr);
+                                            }
+                                            break;
                                         }
-                                        break;
+                                    }
+                                    // If no return statement, add one at the end
+                                    if (!hasReturn) {
+                                        CtReturn<Boolean> ret = f.Core().createReturn();
+                                        @SuppressWarnings({"unchecked", "rawtypes"})
+                                        CtExpression expr = (CtExpression) f.Code().createLiteral(false);
+                                        ret.setReturnedExpression(expr);
+                                        body.addStatement(ret);
                                     }
                                 }
-                                // If no return statement, add one at the end
-                                if (!hasReturn) {
-                                    CtReturn<Boolean> ret = f.Core().createReturn();
-                                    @SuppressWarnings({"unchecked", "rawtypes"})
-                                    CtExpression expr = (CtExpression) f.Code().createLiteral(false);
-                                    ret.setReturnedExpression(expr);
-                                    body.addStatement(ret);
-                                }
+                                System.out.println("[fixVoidReturnTypesInBooleanContexts] Changed return type of " + 
+                                    cls.getQualifiedName() + "#" + method.getSimpleName() + " from void to boolean");
+                            } catch (Throwable e) {
+                                System.err.println("[fixVoidReturnTypesInBooleanContexts] Error fixing " + 
+                                    cls.getQualifiedName() + "#" + method.getSimpleName() + ": " + e.getMessage());
                             }
-                            System.out.println("[fixVoidReturnTypesInBooleanContexts] Changed return type of " + 
-                                cls.getQualifiedName() + "#" + method.getSimpleName() + " from void to boolean");
-                        } catch (Throwable e) {
-                            System.err.println("[fixVoidReturnTypesInBooleanContexts] Error fixing " + 
-                                cls.getQualifiedName() + "#" + method.getSimpleName() + ": " + e.getMessage());
                         }
                     }
-                }
+                } catch (Throwable ignored) {}
             }
         } catch (Throwable e) {
             System.err.println("[fixVoidReturnTypesInBooleanContexts] Error: " + e.getMessage());
@@ -3764,5 +4001,545 @@ public final class SpoonStubbingRunner implements Stubber {
         }
         
         return false;
+    }
+    
+    /**
+     * Derive mode name from configuration for logging purposes.
+     */
+    private String deriveModeName(JessConfiguration cfg) {
+        if (cfg.isDisableStubbing()) {
+            return "slicing";
+        } else if (cfg.isMinimalStubbing()) {
+            return "minimal-stubbing";
+        } else {
+            return "stubbing";
+        }
+    }
+    
+    /**
+     * Compute FQNs from the sliced directory (lazily, cached per runner instance only).
+     * Uses JavaParser to extract all top-level and nested types.
+     * 
+     * IMPORTANT: This is NOT statically cached because:
+     * - slicedSrcDir path is always the same ("gen/") across methods
+     * - But the CONTENT changes for each method (new slice)
+     * - Static cache would return stale FQNs from previous method
+     * 
+     * Performance: Instance-level cache means we compute once per runner instance,
+     * which is fine since each method gets a new runner and a fresh slice.
+     */
+    private Set<String> computeSlicedTypeFqns(Path slicedSrcDir) {
+        // Check instance cache (computed once per runner instance)
+        if (slicedTypeFqns != null) {
+            return slicedTypeFqns;
+        }
+        
+        // Compute FQNs (done once per runner instance, which is correct for per-method slices)
+        System.out.println("[Spoon] Computing FQNs from sliced directory: " + slicedSrcDir);
+        Set<String> result = new HashSet<>();
+        JavaParser parser = new JavaParser(new ParserConfiguration());
+        
+        long startTime = System.currentTimeMillis();
+        AtomicInteger fileCount = new AtomicInteger(0);
+        try {
+            // Collect all files first to avoid double-walk
+            List<Path> javaFiles = new ArrayList<>();
+            Files.walk(slicedSrcDir)
+                .filter(p -> Files.isRegularFile(p) && p.toString().endsWith(".java"))
+                .filter(p -> !p.toString().contains("package-info"))
+                .filter(p -> !p.toString().contains("module-info"))
+                .forEach(javaFiles::add);
+            
+            long totalFiles = javaFiles.size();
+            System.out.println("[Spoon] Found " + totalFiles + " Java files in sliced directory");
+            
+            for (Path javaFile : javaFiles) {
+                int current = fileCount.incrementAndGet();
+                if (current % 50 == 0 || current == totalFiles) {
+                    System.out.println("[Spoon] Parsing sliced files: " + current + "/" + totalFiles);
+                }
+                try {
+                    CompilationUnit cu = parser.parse(javaFile).getResult().orElse(null);
+                    if (cu == null) {
+                        continue;
+                    }
+                        
+                        Optional<PackageDeclaration> pkg = cu.getPackageDeclaration();
+                        String pkgName = pkg.map(pd -> pd.getNameAsString()).orElse("");
+                        
+                        // Find all types (top-level and nested)
+                        cu.findAll(TypeDeclaration.class).forEach(td -> {
+                            String simpleName = td.getNameAsString();
+                            
+                            if (td.isTopLevelType()) {
+                                // Top-level type: package.ClassName
+                                String fqn = pkgName.isEmpty()
+                                    ? simpleName
+                                    : pkgName + "." + simpleName;
+                                result.add(fqn);
+                            } else {
+                                // Nested type: find top-level ancestor and build Outer$Inner
+                                TypeDeclaration<?> outer = td;
+                                while (outer.getParentNode().isPresent() &&
+                                       outer.getParentNode().get() instanceof TypeDeclaration) {
+                                    outer = (TypeDeclaration<?>) outer.getParentNode().get();
+                                }
+                                
+                                String outerName = outer.getNameAsString();
+                                String nestedFqn = pkgName.isEmpty()
+                                    ? outerName + "$" + simpleName
+                                    : pkgName + "." + outerName + "$" + simpleName;
+                                result.add(nestedFqn);
+                            }
+                        });
+                    } catch (Exception e) {
+                        // Log but don't fail the whole run
+                        System.err.println("[Spoon] Failed to parse sliced file " + javaFile + " for FQNs: " + e.getMessage());
+                    }
+                }
+        } catch (IOException e) {
+            System.err.println("[Spoon] Failed to walk slicedSrcDir " + slicedSrcDir + ": " + e.getMessage());
+        }
+        
+        long elapsed = System.currentTimeMillis() - startTime;
+        if (elapsed > 100) { // Only log if it took significant time
+            System.out.println("[Spoon] Computed " + result.size() + " FQNs from sliced dir in " + elapsed + "ms");
+        }
+        
+        // Store in instance cache only (NOT static - see method comment)
+        slicedTypeFqns = result;
+        return result;
+    }
+    
+    /**
+     * Compute FQNs defined in a single source-root Java file.
+     * Returns empty set if parsing fails (conservative: will add file anyway).
+     * 
+     * Performance: This is cached statically by file path to avoid re-parsing
+     * the same file for each method.
+     */
+    private Set<String> computeFqnsForSourceFile(Path javaFile) {
+        // Check static cache first
+        String cacheKey = javaFile.normalize().toAbsolutePath().toString();
+        synchronized (sourceRootFqnCache) {
+            Set<String> cached = sourceRootFqnCache.get(cacheKey);
+            if (cached != null) {
+                return cached;
+            }
+        }
+        
+        // Compute FQNs (expensive operation - only done once per unique file)
+        Set<String> fqns = new HashSet<>();
+        JavaParser parser = new JavaParser(new ParserConfiguration());
+        
+        try {
+            CompilationUnit cu = parser.parse(javaFile).getResult().orElse(null);
+            if (cu == null) {
+                // Cache empty set to avoid re-parsing failed files
+                synchronized (sourceRootFqnCache) {
+                    sourceRootFqnCache.put(cacheKey, fqns);
+                }
+                return fqns; // Empty set - will be conservative and add file
+            }
+            
+            Optional<PackageDeclaration> pkg = cu.getPackageDeclaration();
+            String pkgName = pkg.map(pd -> pd.getNameAsString()).orElse("");
+            
+            // Find all types (top-level and nested)
+            cu.findAll(TypeDeclaration.class).forEach(td -> {
+                String simpleName = td.getNameAsString();
+                
+                if (td.isTopLevelType()) {
+                    // Top-level type: package.ClassName
+                    String fqn = pkgName.isEmpty()
+                        ? simpleName
+                        : pkgName + "." + simpleName;
+                    fqns.add(fqn);
+                } else {
+                    // Nested type: find top-level ancestor and build Outer$Inner
+                    TypeDeclaration<?> outer = td;
+                    while (outer.getParentNode().isPresent() &&
+                           outer.getParentNode().get() instanceof TypeDeclaration) {
+                        outer = (TypeDeclaration<?>) outer.getParentNode().get();
+                    }
+                    
+                    String outerName = outer.getNameAsString();
+                    String nestedFqn = pkgName.isEmpty()
+                        ? outerName + "$" + simpleName
+                        : pkgName + "." + outerName + "$" + simpleName;
+                    fqns.add(nestedFqn);
+                }
+            });
+        } catch (Exception e) {
+            // If parsing fails, return empty set - we'll be conservative and add the file
+            System.err.println("[Spoon] Failed to parse source-root file " + javaFile + " for FQNs: " + e.getMessage());
+        }
+        
+        // Cache the result (even if empty)
+        synchronized (sourceRootFqnCache) {
+            sourceRootFqnCache.put(cacheKey, fqns);
+        }
+        
+        return fqns;
+    }
+    
+    /**
+     * Add source roots with FQN-based filtering.
+     * Only adds files whose FQNs are NOT in the sliced code set.
+     * If sourceRoots is null/empty, does nothing (keeps old behavior for synthetic tests).
+     */
+    private void addSourceRootsWithFqnFilter(Launcher launcher, Path slicedSrcDir) {
+        if (sourceRoots == null || sourceRoots.isEmpty()) {
+            // No source roots - keep old behavior (slice-only)
+            return;
+        }
+        
+        Set<String> slicedFqns = computeSlicedTypeFqns(slicedSrcDir);
+        
+        // If we failed to detect any FQNs in the slice (empty set),
+        // fall back to the old behavior: add roots as-is (conservative)
+        if (slicedFqns.isEmpty()) {
+            System.out.println("[Spoon] Warning: Could not extract FQNs from sliced code, adding all source roots (conservative fallback)");
+            for (Path root : sourceRoots) {
+                if (root != null && Files.exists(root) && Files.isDirectory(root)) {
+                    try {
+                        launcher.addInputResource(root.toString());
+                    } catch (Exception e) {
+                        System.err.println("[Spoon] Warning: Could not add source root " + root + ": " + e.getMessage());
+                    }
+                }
+            }
+            return;
+        }
+        
+        // Add source roots with file-level filtering
+        // Source roots are added as CONTEXT ONLY (for resolution), not for stubbing
+        System.out.println("[Spoon] Filtering source roots (" + sourceRoots.size() + " roots) against " + slicedFqns.size() + " sliced FQNs...");
+        int rootIndex = 0;
+        AtomicInteger totalAddedFiles = new AtomicInteger(0);
+        AtomicInteger totalSkippedFiles = new AtomicInteger(0);
+        for (Path root : sourceRoots) {
+            rootIndex++;
+            if (root == null || !Files.exists(root) || !Files.isDirectory(root)) {
+                continue;
+            }
+            
+            System.out.println("[Spoon] Processing source root " + rootIndex + "/" + sourceRoots.size() + ": " + root);
+            try {
+                // Collect all files first to avoid double-walk
+                List<Path> javaFilesInRoot = new ArrayList<>();
+                Files.walk(root)
+                    .filter(p -> Files.isRegularFile(p) && p.toString().endsWith(".java"))
+                    .filter(p -> !p.toString().contains("package-info"))
+                    .filter(p -> !p.toString().contains("module-info"))
+                    .forEach(javaFilesInRoot::add);
+                
+                long totalFilesInRoot = javaFilesInRoot.size();
+                System.out.println("[Spoon] Found " + totalFilesInRoot + " Java files in source root " + rootIndex);
+                
+                AtomicInteger processedFiles = new AtomicInteger(0);
+                AtomicInteger addedInRoot = new AtomicInteger(0);
+                AtomicInteger skippedInRoot = new AtomicInteger(0);
+                for (Path javaFile : javaFilesInRoot) {
+                    int current = processedFiles.incrementAndGet();
+                    if (current % 100 == 0 || current == totalFilesInRoot) {
+                        System.out.println("[Spoon] Processing source root " + rootIndex + ": " + current + "/" + totalFilesInRoot + " files");
+                    }
+                    Set<String> fileFqns = computeFqnsForSourceFile(javaFile);
+                    
+                    if (fileFqns.isEmpty()) {
+                        // If we couldn't parse FQNs, be conservative:
+                        // add the file to avoid losing context
+                        try {
+                            launcher.addInputResource(javaFile.toString());
+                            addedInRoot.incrementAndGet();
+                            totalAddedFiles.incrementAndGet();
+                        } catch (Exception e) {
+                            System.err.println("[Spoon] Warning: Could not add file " + javaFile + ": " + e.getMessage());
+                        }
+                        continue;
+                    }
+                    
+                    // If ALL FQNs in this file are already in the slice set,
+                    // skip the file, because the slice version is canonical
+                    boolean allCovered = fileFqns.stream()
+                        .allMatch(slicedFqns::contains);
+                    
+                    if (allCovered) {
+                        // Skip - slice defines these types
+                        skippedInRoot.incrementAndGet();
+                        totalSkippedFiles.incrementAndGet();
+                    } else {
+                        // Add file - it contains types not in slice
+                        try {
+                            launcher.addInputResource(javaFile.toString());
+                            addedInRoot.incrementAndGet();
+                            totalAddedFiles.incrementAndGet();
+                        } catch (Exception e) {
+                            System.err.println("[Spoon] Warning: Could not add file " + javaFile + ": " + e.getMessage());
+                        }
+                    }
+                }
+                System.out.println("[Spoon] Source root " + rootIndex + " summary: added " + addedInRoot.get() + ", skipped " + skippedInRoot.get() + " files");
+            } catch (IOException e) {
+                System.err.println("[Spoon] Failed to walk source root " + root + ": " + e.getMessage());
+            }
+        }
+        System.out.println("[Spoon] Source root filtering complete: added " + totalAddedFiles.get() + " files, skipped " + totalSkippedFiles.get() + " files (slice is canonical)");
+    }
+    
+    /**
+     * Pretty-print only slice types to the output directory, not all types in the model.
+     * This is a critical optimization - without it, Spoon would print all 594 types instead of just 2-3 slice types.
+     */
+    private static void prettyPrintSliceTypesOnly(Launcher launcher, Factory f, Set<String> interestingTypeQNs, Path slicedSrcDir) {
+        if (interestingTypeQNs == null || interestingTypeQNs.isEmpty()) {
+            return;
+        }
+        
+        int printed = 0;
+        for (String interestingQn : interestingTypeQNs) {
+            try {
+                CtType<?> type = f.Type().get(interestingQn);
+                if (type == null) continue;
+                
+                // Get the compilation unit for this type
+                CtCompilationUnit cu = f.CompilationUnit().getOrCreate(type);
+                if (cu == null) continue;
+                
+                // Convert FQN to file path (e.g., "com.example.Foo" -> "com/example/Foo.java")
+                String fqn = type.getQualifiedName();
+                if (fqn == null) continue;
+                
+                String relativePath = fqn.replace(".", "/") + ".java";
+                Path outputPath = slicedSrcDir.resolve(relativePath);
+                outputPath.getParent().toFile().mkdirs();
+                
+                // Use Spoon's prettyprint method to convert the compilation unit to a string
+                String code = cu.prettyprint();
+                
+                // Write the code to the file
+                Files.write(outputPath, code.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                printed++;
+            } catch (Throwable e) {
+                System.err.println("[Spoon] Failed to print type " + interestingQn + ": " + e.getMessage());
+            }
+        }
+        
+        if (printed > 0) {
+            System.out.println("[Spoon] Printed " + printed + " slice type(s) to output directory");
+        }
+    }
+    
+    /**
+     * Task 1: Add source roots with FQN filtering, excluding specific files.
+     * Used when retrying after dropping conflicting files.
+     */
+    private void addSourceRootsWithFqnFilterExcludingFiles(Launcher launcher, Path slicedSrcDir, Set<String> excludedFiles) {
+        if (sourceRoots == null || sourceRoots.isEmpty()) {
+            return;
+        }
+        
+        Set<String> slicedFqns = computeSlicedTypeFqns(slicedSrcDir);
+        
+        if (slicedFqns.isEmpty()) {
+            // Fallback: add all roots except excluded files
+            for (Path root : sourceRoots) {
+                if (root == null || !Files.exists(root) || !Files.isDirectory(root)) {
+                    continue;
+                }
+                try {
+                    Files.walk(root)
+                        .filter(p -> Files.isRegularFile(p) && p.toString().endsWith(".java"))
+                        .filter(p -> !p.toString().contains("package-info"))
+                        .filter(p -> !p.toString().contains("module-info"))
+                        .filter(p -> !excludedFiles.contains(p.normalize().toAbsolutePath().toString()))
+                        .forEach(p -> {
+                            try {
+                                launcher.addInputResource(p.toString());
+                            } catch (Exception e) {
+                                // Ignore individual file errors
+                            }
+                        });
+                } catch (IOException e) {
+                    System.err.println("[Spoon] Failed to walk source root " + root + ": " + e.getMessage());
+                }
+            }
+            return;
+        }
+        
+        // Add source roots with file-level filtering, excluding conflicting files
+        for (Path root : sourceRoots) {
+            if (root == null || !Files.exists(root) || !Files.isDirectory(root)) {
+                continue;
+            }
+            try {
+                Files.walk(root)
+                    .filter(p -> Files.isRegularFile(p) && p.toString().endsWith(".java"))
+                    .filter(p -> !p.toString().contains("package-info"))
+                    .filter(p -> !p.toString().contains("module-info"))
+                    .filter(p -> !excludedFiles.contains(p.normalize().toAbsolutePath().toString()))
+                    .forEach(javaFile -> {
+                        Set<String> fileFqns = computeFqnsForSourceFile(javaFile);
+                        if (fileFqns.isEmpty()) {
+                            // Conservative: add if we can't parse
+                            try {
+                                launcher.addInputResource(javaFile.toString());
+                            } catch (Exception e) {
+                                // Ignore
+                            }
+                            return;
+                        }
+                        
+                        boolean allCovered = fileFqns.stream().allMatch(slicedFqns::contains);
+                        if (!allCovered) {
+                            // Add file - it contains types not in slice
+                            try {
+                                launcher.addInputResource(javaFile.toString());
+                            } catch (Exception e) {
+                                // Ignore
+                            }
+                        }
+                    });
+            } catch (IOException e) {
+                System.err.println("[Spoon] Failed to walk source root " + root + ": " + e.getMessage());
+            }
+        }
+    }
+    
+    /**
+     * Task 1: Extract conflicting FQNs from ModelBuildingException error message.
+     * Tries to parse patterns like "Type 'com.example.Foo' is already defined" or "com.example.Foo already defined".
+     * Also handles simple names like "WFCMessage" and tries to resolve them to FQNs.
+     */
+    private Set<String> extractConflictingFqns(String errorMsg) {
+        Set<String> fqns = new HashSet<>();
+        Set<String> simpleNames = new HashSet<>();
+        if (errorMsg == null) return fqns;
+        
+        // Pattern 1: "Type 'com.example.Foo' is already defined" or "The type WFCMessage is already defined"
+        java.util.regex.Pattern pattern1 = java.util.regex.Pattern.compile("(?:The\\s+)?type\\s+['\"]?([A-Z][a-zA-Z0-9_]*(?:\\$[A-Z][a-zA-Z0-9_]*)*)['\"]?\\s+is\\s+already\\s+defined", java.util.regex.Pattern.CASE_INSENSITIVE);
+        java.util.regex.Matcher matcher1 = pattern1.matcher(errorMsg);
+        while (matcher1.find()) {
+            String candidate = matcher1.group(1);
+            if (candidate.contains(".")) {
+                // It's an FQN
+                fqns.add(candidate);
+            } else {
+                // It's a simple name - try to resolve it
+                simpleNames.add(candidate);
+            }
+        }
+        
+        // Pattern 2: "com.example.Foo already defined"
+        java.util.regex.Pattern pattern2 = java.util.regex.Pattern.compile("([a-z][a-z0-9_]*(?:\\.[a-z][a-z0-9_]*)*\\.[A-Z][a-zA-Z0-9_]*(?:\\$[A-Z][a-zA-Z0-9_]*)*)\\s+already\\s+defined", java.util.regex.Pattern.CASE_INSENSITIVE);
+        java.util.regex.Matcher matcher2 = pattern2.matcher(errorMsg);
+        while (matcher2.find()) {
+            fqns.add(matcher2.group(1));
+        }
+        
+        // Pattern 3: Look for FQN-like strings before "already defined"
+        java.util.regex.Pattern pattern3 = java.util.regex.Pattern.compile("([a-z][a-z0-9_]*(?:\\.[a-z][a-z0-9_]*)*\\.[A-Z][a-zA-Z0-9_]*(?:\\$[A-Z][a-zA-Z0-9_]*)*)", java.util.regex.Pattern.CASE_INSENSITIVE);
+        String[] parts = errorMsg.split("already defined", -1);
+        if (parts.length > 1) {
+            java.util.regex.Matcher matcher3 = pattern3.matcher(parts[0]);
+            while (matcher3.find()) {
+                String candidate = matcher3.group(1);
+                // Basic validation: should have at least one dot and start with lowercase
+                if (candidate.contains(".") && candidate.length() > 3) {
+                    fqns.add(candidate);
+                }
+            }
+        }
+        
+        // Try to resolve simple names to FQNs using sourceRootFqnCache
+        if (!simpleNames.isEmpty()) {
+            for (String simpleName : simpleNames) {
+                // Search in sourceRootFqnCache for types with this simple name
+                for (Map.Entry<String, Set<String>> entry : sourceRootFqnCache.entrySet()) {
+                    Set<String> fileFqns = entry.getValue();
+                    for (String fileFqn : fileFqns) {
+                        // Check if simple name matches (handle nested classes with $)
+                        String fileSimpleName = fileFqn;
+                        int lastDot = fileFqn.lastIndexOf('.');
+                        if (lastDot >= 0) {
+                            fileSimpleName = fileFqn.substring(lastDot + 1);
+                        }
+                        // Also check for nested classes (e.g., "WFCMessage$Builder" matches "WFCMessage")
+                        if (fileSimpleName.equals(simpleName) || fileSimpleName.startsWith(simpleName + "$")) {
+                            fqns.add(fileFqn);
+                            break; // Found one match, move to next simple name
+                        }
+                    }
+                }
+            }
+        }
+        
+        return fqns;
+    }
+    
+    /**
+     * Task 1: Find files that define the given FQNs using sourceRootFqnCache.
+     * Also handles simple names by matching against simple names of FQNs in cache.
+     */
+    private Set<String> findFilesDefiningFqns(Set<String> fqns) {
+        Set<String> files = new HashSet<>();
+        for (Map.Entry<String, Set<String>> entry : sourceRootFqnCache.entrySet()) {
+            String filePath = entry.getKey();
+            Set<String> fileFqns = entry.getValue();
+            // If this file defines any of the conflicting FQNs, exclude it
+            for (String fqn : fqns) {
+                // Direct match
+                if (fileFqns.contains(fqn)) {
+                    files.add(filePath);
+                    break;
+                }
+                // Also check if fqn is a simple name that matches any FQN's simple name
+                if (!fqn.contains(".")) {
+                    // It's a simple name - check if any FQN in this file has this simple name
+                    for (String fileFqn : fileFqns) {
+                        String fileSimpleName = fileFqn;
+                        int lastDot = fileFqn.lastIndexOf('.');
+                        if (lastDot >= 0) {
+                            fileSimpleName = fileFqn.substring(lastDot + 1);
+                        }
+                        // Match simple name or nested class (e.g., "WFCMessage" matches "cn.wildfirechat.proto.WFCMessage" or "WFCMessage$Builder")
+                        if (fileSimpleName.equals(fqn) || fileSimpleName.startsWith(fqn + "$")) {
+                            files.add(filePath);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        return files;
+    }
+    
+    /**
+     * Task 4: Get summary statistics for repo run.
+     */
+    public static String getSummaryStats() {
+        if (totalModelBuilds == 0) {
+            return "[SpoonStubbingRunner] No model builds recorded yet.";
+        }
+        double avgBuildTime = (double) totalModelBuildTime / totalModelBuilds;
+        int totalMethods = contextModelCount + sliceOnlyModelCount;
+        double contextPercent = totalMethods > 0 ? (100.0 * contextModelCount / totalMethods) : 0.0;
+        double sliceOnlyPercent = totalMethods > 0 ? (100.0 * sliceOnlyModelCount / totalMethods) : 0.0;
+        
+        return String.format(
+            "[SpoonStubbingRunner] Summary: %d methods total - %d (%.1f%%) with context, %d (%.1f%%) slice-only. Avg build time: %.1fms",
+            totalMethods, contextModelCount, contextPercent, sliceOnlyModelCount, sliceOnlyPercent, avgBuildTime
+        );
+    }
+    
+    /**
+     * Task 4: Reset counters (call at start of repo processing).
+     */
+    public static void resetCounters() {
+        contextModelCount = 0;
+        sliceOnlyModelCount = 0;
+        totalModelBuildTime = 0;
+        totalModelBuilds = 0;
     }
 }

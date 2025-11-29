@@ -94,6 +94,9 @@ public class Jess {
         combinedTypeSolver = new CombinedTypeSolver();
         combinedTypeSolver.add(reflectiveSolver);
 
+        // Collect source roots for both JavaParser and Spoon
+        List<Path> collectedSourceRoots = new ArrayList<>();
+        
         for (String packageRoot : packageRoots) {
             try {
                 Path rootPath = Paths.get(packageRoot);
@@ -106,6 +109,9 @@ public class Jess {
                 JavaParserTypeSolver javaSolver = new JavaParserTypeSolver(rootPath);
                 combinedTypeSolver.add(javaSolver);
                 this.packageRoots.add(packageRoot);
+                
+                // Store the Path for Spoon stubber
+                collectedSourceRoots.add(rootPath);
             } catch (IllegalStateException e) {
                 // JavaParserTypeSolver throws IllegalStateException if path is invalid
                 System.err.println("Warning: Skipping invalid source root: " + packageRoot + " - " + e.getMessage());
@@ -116,6 +122,9 @@ public class Jess {
                 continue;
             }
         }
+        
+        // Store source roots in config for Spoon stubber
+        config.setSourceRoots(collectedSourceRoots);
 
         for (String jar : jars) {
             try {

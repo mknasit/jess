@@ -2,6 +2,10 @@ package de.upb.sse.jess.configuration;
 
 import lombok.*;
 
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+
 @Getter
 @Setter
 @ToString
@@ -21,6 +25,12 @@ public class JessConfiguration {
     private StubberKind stubberKind = StubberKind.SPOON;
 
     private String targetVersion = null;
+    
+    // Source roots for Spoon stubber (same as used for JavaParser's combinedTypeSolver)
+    private List<Path> sourceRoots = new ArrayList<>();
+    
+    // Conservative mode for Spoon: fewer stubs but safer (default true for RQ2 stubbing)
+    private boolean spoonConservativeMode = true;
 
     public JessConfiguration(boolean exitOnCompilationFail, boolean exitOnParsingFail, boolean looseSignatureMatching, boolean keepAsteriskImports, boolean failOnAmbiguity, boolean disableStubbing,String targetVersion) {
         this.exitOnCompilationFail = exitOnCompilationFail;

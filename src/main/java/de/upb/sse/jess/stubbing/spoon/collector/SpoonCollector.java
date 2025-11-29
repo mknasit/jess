@@ -174,6 +174,8 @@ public final class SpoonCollector {
 
     private final Factory f;
     private final JessConfiguration cfg;
+    private final boolean conservativeMode;
+    private final boolean noClasspath;
 
     // Centralized unknown type FQN constant. (Do not rename or remove.)
     private static final String UNKNOWN_TYPE_FQN = UnknownType.CLASS;
@@ -185,9 +187,11 @@ public final class SpoonCollector {
     /**
      * Constructs a SpoonCollector bound to a Spoon Factory and the Jess configuration.
      */
-    public SpoonCollector(Factory f, JessConfiguration cfg) {
+    public SpoonCollector(Factory f, JessConfiguration cfg, boolean conservativeMode, boolean noClasspath) {
         this.f = f;
         this.cfg = cfg;
+        this.conservativeMode = conservativeMode;
+        this.noClasspath = noClasspath;
     }
 
     /* ======================================================================
@@ -211,18 +215,36 @@ public final class SpoonCollector {
 
         // CRITICAL FIX: Wrap each collection phase in try-catch to handle StackOverflowError
         // This allows us to continue with other phases even if one fails
+        System.out.println("[Spoon] Collection phase 1/15: ensureRepeatablesForDuplicateUses");
         safeCollect(() -> ensureRepeatablesForDuplicateUses(model), "ensureRepeatablesForDuplicateUses");
+        System.out.println("[Spoon] Collection phase 2/15: rebindUnknownHomonyms");
         safeCollect(() -> rebindUnknownHomonyms(model, result), "rebindUnknownHomonyms");
         
         // --- order matters only for readability; each pass is independent ---
+        System.out.println("[Spoon] Collection phase 3/15: collectTryWithResources");
         safeCollect(() -> collectTryWithResources(model, result), "collectTryWithResources");
+        System.out.println("[Spoon] Collection phase 4/15: collectUnresolvedFields");
         safeCollect(() -> collectUnresolvedFields(model, result), "collectUnresolvedFields");
+        System.out.println("[Spoon] Collection phase 5/15: collectUnresolvedCtorCalls");
         safeCollect(() -> collectUnresolvedCtorCalls(model, result), "collectUnresolvedCtorCalls");
+        System.out.println("[Spoon] Collection phase 6/15: collectForEachLoops");
         safeCollect(() -> collectForEachLoops(model, result), "collectForEachLoops");
+        
+        // CONSERVATIVE MODE: Skip risky heuristics when conservative mode + noClasspath
+        // These are fragile when we don't have full classpath information
+        if (!(conservativeMode && noClasspath)) {
+            System.out.println("[Spoon] Collection phase 7/15: collectStreamApiMethods");
         safeCollect(() -> collectStreamApiMethods(model, result), "collectStreamApiMethods");
+            System.out.println("[Spoon] Collection phase 8/15: collectMethodReferences");
         safeCollect(() -> collectMethodReferences(model, result), "collectMethodReferences");
-        safeCollect(() -> collectUnresolvedMethodCalls(model, result), "collectUnresolvedMethodCalls");
+            System.out.println("[Spoon] Collection phase 9/15: collectLambdas");
         safeCollect(() -> collectLambdas(model, result), "collectLambdas");
+        } else {
+            System.out.println("[Spoon] Skipping stream API, method references, and lambdas collection (conservative mode + noClasspath)");
+        }
+        
+        System.out.println("[Spoon] Collection phase 10/15: collectUnresolvedMethodCalls (this may be slow with large models)");
+        safeCollect(() -> collectUnresolvedMethodCalls(model, result), "collectUnresolvedMethodCalls");
         safeCollect(() -> collectUnresolvedAnnotations(model, result), "collectUnresolvedAnnotations");
 
         safeCollect(() -> collectExceptionTypes(model, result), "collectExceptionTypes");
@@ -261,8 +283,15 @@ public final class SpoonCollector {
 
         // Ensure owners exist for any planned members / references discovered above.
         // CRITICAL FIX: Use addTypePlanIfNonJdk to prevent duplicates
+        // Task 3: ownersNeedingTypes already filters by owners from plans, which should be in neededOwners
+        // But we add an extra check to be safe
         safeCollect(() -> {
             for (TypeStubPlan plan : ownersNeedingTypes(result)) {
+                // Task 3: Only add type plans for slice types (owners in neededOwners)
+                if (!result.neededOwners.isEmpty() && !result.neededOwners.contains(plan.qualifiedName)) {
+                    // This is a context-only type, don't create stub owner
+                    continue;
+                }
                 addTypePlanIfNonJdk(result, plan.qualifiedName, plan.kind);
             }
         }, "ownersNeedingTypes");
@@ -327,12 +356,22 @@ public final class SpoonCollector {
     /**
      * Collect field stubs from unresolved field accesses (including static and instance cases).
      * CRITICAL FIX: Only collect for interesting owners (demand-driven collection).
+     * PERFORMANCE: Only search within slice types, not entire model.
      */
     private void collectUnresolvedFields(CtModel model, CollectResult out) {
-        List<CtFieldAccess<?>> unresolved = model.getElements((CtFieldAccess<?> fa) -> {
+        // PERFORMANCE: Only search within slice types (not all 591 context files)
+        Set<CtType<?>> sliceTypes = getSliceTypes(out);
+        
+        // Collect field accesses only from slice types (much faster than scanning entire model)
+        List<CtFieldAccess<?>> unresolved = new ArrayList<>();
+        for (CtType<?> sliceType : sliceTypes) {
+            try {
+                unresolved.addAll(sliceType.getElements((CtFieldAccess<?> fa) -> {
             var ref = fa.getVariable();
             return ref == null || ref.getDeclaration() == null;
-        });
+                }));
+            } catch (Throwable ignored) {}
+        }
 
         for (CtFieldAccess<?> fa : unresolved) {
             // CRITICAL FIX: Skip ignored packages
@@ -819,11 +858,19 @@ public final class SpoonCollector {
      * ====================================================================== */
 
     private void collectUnresolvedCtorCalls(CtModel model, CollectResult out) {
-        // unresolved constructor calls
-        var unresolved = model.getElements((CtConstructorCall<?> cc) -> {
+        // PERFORMANCE: Only search within slice types (not all 591 context files)
+        Set<CtType<?>> sliceTypes = getSliceTypes(out);
+        
+        // Collect constructor calls only from slice types (much faster than scanning entire model)
+        List<CtConstructorCall<?>> unresolved = new ArrayList<>();
+        for (CtType<?> sliceType : sliceTypes) {
+            try {
+                unresolved.addAll(sliceType.getElements((CtConstructorCall<?> cc) -> {
             var ex = cc.getExecutable();
             return ex == null || ex.getDeclaration() == null;
-        });
+                }));
+            } catch (Throwable ignored) {}
+        }
 
         for (CtConstructorCall<?> cc : unresolved) {
             CtTypeReference<?> rawOwner = cc.getType();
@@ -995,12 +1042,27 @@ public final class SpoonCollector {
         };
         // ------------------------------------------------------------------------
 
-        List<CtInvocation<?>> unresolved = model.getElements((CtInvocation<?> inv) -> {
+        // PERFORMANCE: Only search within slice types (not all 591 context files)
+        Set<CtType<?>> sliceTypes = getSliceTypes(out);
+        
+        // Collect invocations only from slice types (much faster than scanning entire model)
+        List<CtInvocation<?>> unresolved = new ArrayList<>();
+        for (CtType<?> sliceType : sliceTypes) {
+            try {
+                unresolved.addAll(sliceType.getElements((CtInvocation<?> inv) -> {
             CtExecutableReference<?> ex = inv.getExecutable();
             return ex == null || ex.getDeclaration() == null;
-        });
+                }));
+            } catch (Throwable ignored) {}
+        }
 
+        System.out.println("[Spoon] Found " + unresolved.size() + " unresolved method calls in slice");
+        int invCount = 0;
         for (CtInvocation<?> inv : unresolved) {
+            invCount++;
+            if (invCount % 50 == 0 || invCount == unresolved.size()) {
+                System.out.println("[Spoon] Processing method calls: " + invCount + "/" + unresolved.size());
+            }
             CtExecutableReference<?> ex = inv.getExecutable();
             String name = (ex != null ? ex.getSimpleName() : null);
             // decide staticness & varargs early
@@ -1222,20 +1284,26 @@ public final class SpoonCollector {
 
             if (mirror && mirrorOwnerRef != null) {
                 String simple = owner != null ? owner.getSimpleName() : null;
-                boolean realExists =
-                        (simple != null) && (
-                                inv.getFactory().getModel().getAllTypes().stream().anyMatch(t ->
-                                        simple.equals(t.getSimpleName())
-                                                && t.getPackage() != null
-                                                && !"unknown".equals(t.getPackage().getQualifiedName()))
-                                        ||
-                                        out.typePlans.stream().anyMatch(tp -> {
+                // PERFORMANCE: Only check slice types + type plans, not entire model (594 types)
+                boolean realExists = false;
+                if (simple != null) {
+                    // Check type plans first (cheaper)
+                    realExists = out.typePlans.stream().anyMatch(tp -> {
                                             int i = tp.qualifiedName.lastIndexOf('.');
                                             String pkg = i >= 0 ? tp.qualifiedName.substring(0, i) : "";
                                             String s   = i >= 0 ? tp.qualifiedName.substring(i+1) : tp.qualifiedName;
                                             return simple.equals(s) && !"unknown".equals(pkg);
-                                        })
-                        );
+                    });
+                    
+                    // Only check model if type plans didn't match (and only check slice types)
+                    // Reuse sliceTypes already computed at method start
+                    if (!realExists) {
+                        realExists = sliceTypes.stream().anyMatch(t ->
+                                simple.equals(t.getSimpleName())
+                                        && t.getPackage() != null
+                                        && !"unknown".equals(t.getPackage().getQualifiedName()));
+                    }
+                }
                 if (realExists) {
                     mirror = false;
                     mirrorOwnerRef = null;
@@ -2268,8 +2336,15 @@ public final class SpoonCollector {
 
     // SpoonCollector.java
     private void collectUnresolvedAnnotations(CtModel model, CollectResult out) {
-        // Walk all annotation occurrences in the slice
-        for (CtAnnotation<?> ann : model.getElements((CtAnnotation<?> a) -> true)) {
+        // PERFORMANCE: Walk only annotation occurrences in slice types, not entire model
+        Set<CtType<?>> sliceTypes = getSliceTypes(out);
+        List<CtAnnotation<?>> annotations = new ArrayList<>();
+        for (CtType<?> sliceType : sliceTypes) {
+            try {
+                annotations.addAll(sliceType.getElements((CtAnnotation<?> a) -> true));
+            } catch (Throwable ignored) {}
+        }
+        for (CtAnnotation<?> ann : annotations) {
             CtTypeReference<?> t = ann.getAnnotationType();
             if (t == null) continue;
             // already resolved? skip
@@ -2315,7 +2390,15 @@ public final class SpoonCollector {
     }
 
     private void collectAnnotationTypeUsages(CtModel model, CollectResult out) {
-        for (CtAnnotation<?> a : model.getElements((CtAnnotation<?> x) -> true)) {
+        // PERFORMANCE: Only process annotations from slice types
+        Set<CtType<?>> sliceTypes = getSliceTypes(out);
+        List<CtAnnotation<?>> annotations = new ArrayList<>();
+        for (CtType<?> sliceType : sliceTypes) {
+            try {
+                annotations.addAll(sliceType.getElements((CtAnnotation<?> x) -> true));
+            } catch (Throwable ignored) {}
+        }
+        for (CtAnnotation<?> a : annotations) {
             CtTypeReference<?> at = a.getAnnotationType();
             if (at == null) continue;
 
@@ -2360,8 +2443,15 @@ public final class SpoonCollector {
      * Collect exception types from throws, catch, and throw sites.
      */
     private void collectExceptionTypes(CtModel model, CollectResult out) {
+        // PERFORMANCE: Only process methods from slice types
+        Set<CtType<?>> sliceTypes = getSliceTypes(out);
+        List<CtMethod<?>> methods = new ArrayList<>();
+        for (CtType<?> sliceType : sliceTypes) {
+            try {
+                methods.addAll(sliceType.getMethods());
+            } catch (Throwable ignored) {}
+        }
         // methods: throws
-        List<CtMethod<?>> methods = model.getElements((CtMethod<?> mm) -> true);
         for (CtMethod<?> m : methods) {
             for (CtTypeReference<?> t : m.getThrownTypes()) {
                 if (t == null) continue;
@@ -2386,8 +2476,16 @@ public final class SpoonCollector {
             }
         }
 
+        // PERFORMANCE: Only process constructors from slice types
         // ctors: throws
-        List<CtConstructor<?>> ctors = model.getElements((CtConstructor<?> cc) -> true);
+        List<CtConstructor<?>> ctors = new ArrayList<>();
+        for (CtType<?> sliceType : sliceTypes) {
+            try {
+                if (sliceType instanceof CtClass) {
+                    ctors.addAll(((CtClass<?>) sliceType).getConstructors());
+                }
+            } catch (Throwable ignored) {}
+        }
         for (CtConstructor<?> c : ctors) {
             for (CtTypeReference<?> t : c.getThrownTypes()) {
                 if (t == null) continue;
@@ -2412,8 +2510,14 @@ public final class SpoonCollector {
             }
         }
 
+        // PERFORMANCE: Only process catch blocks from slice types
         // catch (single & multi)
-        List<CtCatch> catches = model.getElements((CtCatch k) -> true);
+        List<CtCatch> catches = new ArrayList<>();
+        for (CtType<?> sliceType : sliceTypes) {
+            try {
+                catches.addAll(sliceType.getElements((CtCatch k) -> true));
+            } catch (Throwable ignored) {}
+        }
         for (CtCatch cat : catches) {
             var par = cat.getParameter();
             if (par == null) continue;
@@ -2448,8 +2552,14 @@ public final class SpoonCollector {
             }
         }
 
+        // PERFORMANCE: Only process throw statements from slice types
         // throw statements
-        List<CtThrow> throwsList = model.getElements((CtThrow th) -> true);
+        List<CtThrow> throwsList = new ArrayList<>();
+        for (CtType<?> sliceType : sliceTypes) {
+            try {
+                throwsList.addAll(sliceType.getElements((CtThrow th) -> true));
+            } catch (Throwable ignored) {}
+        }
         for (CtThrow thr : throwsList) {
             CtExpression<?> ex = thr.getThrownExpression();
             if (ex instanceof CtConstructorCall) {
@@ -2496,16 +2606,14 @@ public final class SpoonCollector {
      * Walk declared types in variables/fields/params/throws and plan any unresolved references.
      */
     private void collectUnresolvedDeclaredTypes(CtModel model, CollectResult out) {
-        for (CtField<?> fd : model.getElements((CtField<?> f) -> true)) {
+        // PERFORMANCE: Only process elements from slice types
+        Set<CtType<?>> sliceTypes = getSliceTypes(out);
+        for (CtType<?> sliceType : sliceTypes) {
+            try {
+                for (CtField<?> fd : sliceType.getFields()) {
             collectTypeRefDeep(fd, fd.getType(), out);
         }
-        for (CtLocalVariable<?> lv : model.getElements((CtLocalVariable<?> v) -> true)) {
-            collectTypeRefDeep(lv, lv.getType(), out);
-        }
-        for (CtParameter<?> p : model.getElements((CtParameter<?> pp) -> true)) {
-            collectTypeRefDeep(p, p.getType(), out);
-        }
-        for (CtMethod<?> m : model.getElements((CtMethod<?> mm) -> true)) {
+                for (CtMethod<?> m : sliceType.getMethods()) {
             // CRITICAL FIX: Collect method return types (was missing!)
             try {
                 CtTypeReference<?> returnType = m.getType();
@@ -2513,14 +2621,22 @@ public final class SpoonCollector {
                     collectTypeRefDeep(m, returnType, out);
                 }
             } catch (Throwable ignored) {}
-            for (CtTypeReference<? extends Throwable> thr : m.getThrownTypes()) {
-                collectTypeRefDeep(m, thr, out);
+                    for (CtParameter<?> p : m.getParameters()) {
+                        collectTypeRefDeep(p, p.getType(), out);
             }
         }
-        for (CtConstructor<?> c : model.getElements((CtConstructor<?> cc) -> true)) {
+                if (sliceType instanceof CtClass) {
+                    for (CtConstructor<?> c : ((CtClass<?>) sliceType).getConstructors()) {
             for (CtTypeReference<? extends Throwable> thr : c.getThrownTypes()) {
                 collectTypeRefDeep(c, thr, out);
             }
+                    }
+                }
+                // Local variables from method bodies
+                for (CtLocalVariable<?> lv : sliceType.getElements((CtLocalVariable<?> v) -> true)) {
+                    collectTypeRefDeep(lv, lv.getType(), out);
+                }
+            } catch (Throwable ignored) {}
         }
     }
 
@@ -3088,7 +3204,8 @@ public final class SpoonCollector {
         final Pattern SINGLE_IMPORT =
                 Pattern.compile("\\bimport\\s+([a-zA-Z_][\\w\\.]*)\\s*;");
 
-        model.getAllTypes().forEach(t -> {
+        // PERFORMANCE: Only process slice types, not entire model
+        getSliceTypesList(out).forEach(t -> {
             SourcePosition pos = t.getPosition();
             // Use the factory method to get compilation unit instead of deprecated SourcePosition method
             spoon.reflect.declaration.CtCompilationUnit cu = null;
@@ -3153,8 +3270,12 @@ public final class SpoonCollector {
      * CRITICAL FIX: Collect overload gaps - only for interesting owners (demand-driven).
      */
     private void collectOverloadGaps(CtModel model, CollectResult out) {
-        // Suppressed debug output
-        List<CtInvocation<?>> invocations = model.getElements((CtInvocation<?> inv) -> {
+        // PERFORMANCE: Only search within slice types, not entire model
+        Set<CtType<?>> sliceTypes = getSliceTypes(out);
+        List<CtInvocation<?>> invocations = new ArrayList<>();
+        for (CtType<?> sliceType : sliceTypes) {
+            try {
+                invocations.addAll(sliceType.getElements((CtInvocation<?> inv) -> {
             // CRITICAL FIX: Filter by interesting owners
             try {
                 CtExpression<?> target = inv.getTarget();
@@ -3200,7 +3321,9 @@ public final class SpoonCollector {
             if (sameName.isEmpty()) return false;
 
             return !hasApplicableOverload(sameName, inv.getArguments());
-        });
+                }));
+            } catch (Throwable ignored) {}
+        }
 
         for (CtInvocation<?> inv : invocations) {
             CtTypeReference<?> rawOwner = resolveOwnerTypeFromInvocation(inv);
@@ -3626,8 +3749,16 @@ public final class SpoonCollector {
      * Collect supertypes (superclass and superinterfaces) and their generic arguments.
      */
     private void collectSupertypes(CtModel model, CollectResult out) {
+        // PERFORMANCE: Only process classes from slice types
+        Set<CtType<?>> sliceTypes = getSliceTypes(out);
+        List<CtClass<?>> classes = new ArrayList<>();
+        for (CtType<?> sliceType : sliceTypes) {
+            if (sliceType instanceof CtClass) {
+                classes.add((CtClass<?>) sliceType);
+            }
+        }
         // classes: superclass + superinterfaces
-        for (CtClass<?> c : model.getElements((CtClass<?> cc) -> true)) {
+        for (CtClass<?> c : classes) {
             CtTypeReference<?> sup = null;
             try {
                 sup = c.getSuperclass();
@@ -3713,8 +3844,15 @@ public final class SpoonCollector {
             }
         }
 
+        // PERFORMANCE: Only process interfaces from slice types
         // interfaces: superinterfaces
-        for (CtInterface<?> i : model.getElements((CtInterface<?> ii) -> true)) {
+        List<CtInterface<?>> interfaces = new ArrayList<>();
+        for (CtType<?> sliceType : sliceTypes) {
+            if (sliceType instanceof CtInterface) {
+                interfaces.add((CtInterface<?>) sliceType);
+            }
+        }
+        for (CtInterface<?> i : interfaces) {
             for (CtTypeReference<?> si : safe(i.getSuperInterfaces())) {
                 if (si == null) continue;
                 CtTypeReference<?> owner = chooseOwnerPackage(si, i);
@@ -3724,8 +3862,9 @@ public final class SpoonCollector {
             }
         }
 
+        // PERFORMANCE: Only process generic type arguments from slice types
         // Generic type arguments inside extends/implements
-        for (CtType<?> t : model.getAllTypes()) {
+        for (CtType<?> t : sliceTypes) {
             CtTypeReference<?> sup = null;
             try {
                 sup = (t instanceof CtClass) ? ((CtClass<?>) t).getSuperclass() : null;
@@ -3775,8 +3914,16 @@ public final class SpoonCollector {
      * Also plan iterator() and Iterable&lt;E&gt; contracts for foreach.
      */
     private void collectFromInstanceofCastsClassLiteralsAndForEach(CtModel model, CollectResult out) {
+        // PERFORMANCE: Only process elements from slice types
+        Set<CtType<?>> sliceTypes = getSliceTypes(out);
+        List<CtBinaryOperator<?>> binaryOps = new ArrayList<>();
+        for (CtType<?> sliceType : sliceTypes) {
+            try {
+                binaryOps.addAll(sliceType.getElements(new TypeFilter<>(CtBinaryOperator.class)));
+            } catch (Throwable ignored) {}
+        }
         // instanceof (right-hand side type)
-        for (CtBinaryOperator<?> bo : model.getElements(new TypeFilter<>(CtBinaryOperator.class))) {
+        for (CtBinaryOperator<?> bo : binaryOps) {
             if (bo.getKind() == BinaryOperatorKind.INSTANCEOF) {
                 if (bo.getRightHandOperand() instanceof CtTypeAccess) {
                     CtTypeReference<?> t = ((CtTypeAccess<?>) bo.getRightHandOperand()).getAccessedType();
@@ -3785,14 +3932,28 @@ public final class SpoonCollector {
             }
         }
 
+        // PERFORMANCE: Only process type accesses from slice types
         // class literals: Foo.class
-        for (CtTypeAccess<?> ta : model.getElements(new TypeFilter<>(CtTypeAccess.class))) {
+        List<CtTypeAccess<?>> typeAccesses = new ArrayList<>();
+        for (CtType<?> sliceType : sliceTypes) {
+            try {
+                typeAccesses.addAll(sliceType.getElements(new TypeFilter<>(CtTypeAccess.class)));
+            } catch (Throwable ignored) {}
+        }
+        for (CtTypeAccess<?> ta : typeAccesses) {
             CtTypeReference<?> t = ta.getAccessedType();
             if (t != null) maybePlanDeclaredType(ta, t, out);
         }
 
+        // PERFORMANCE: Only process forEach loops from slice types
         // foreach contracts
-        for (CtForEach fe : model.getElements(new TypeFilter<>(CtForEach.class))) {
+        List<CtForEach> forEachLoops = new ArrayList<>();
+        for (CtType<?> sliceType : sliceTypes) {
+            try {
+                forEachLoops.addAll(sliceType.getElements(new TypeFilter<>(CtForEach.class)));
+            } catch (Throwable ignored) {}
+        }
+        for (CtForEach fe : forEachLoops) {
             CtExpression<?> expr = fe.getExpression();
             CtTypeReference<?> iterType = (expr != null ? expr.getType() : null);
 
@@ -3821,7 +3982,14 @@ public final class SpoonCollector {
         // casts (reflected to avoid hard dependency)
         try {
             Class<?> CT_TYPE_CAST = Class.forName("spoon.reflect.code.CtTypeCast");
-            for (CtElement el : model.getElements(new TypeFilter<>(CtElement.class))) {
+            // PERFORMANCE: Only process type casts from slice types
+            List<CtElement> elements = new ArrayList<>();
+            for (CtType<?> sliceType : sliceTypes) {
+                try {
+                    elements.addAll(sliceType.getElements(new TypeFilter<>(CtElement.class)));
+                } catch (Throwable ignored) {}
+            }
+            for (CtElement el : elements) {
                 if (CT_TYPE_CAST.isInstance(el)) {
                     CtTypeReference<?> t = null;
                     try {
@@ -4489,6 +4657,7 @@ public final class SpoonCollector {
 
     /** Rebinds any TypeReference equal to unknown.<Simple> to a real <pkg>.<Simple> type if present.
      * Prefers the current CU package, else any non-unknown package.
+     * CONSERVATIVE MODE: Only rebinds if there's exactly one unambiguous candidate.
      */
     private void rebindUnknownHomonyms(CtModel model, CollectResult collectResult) {
         // index: which non-unknown types exist or are planned
@@ -4515,12 +4684,38 @@ public final class SpoonCollector {
                 String simple = ref.getSimpleName();
                 if (simple == null || simple.isEmpty()) continue;
 
+                // CONSERVATIVE MODE: Check for multiple candidates
+                if (conservativeMode) {
+                    // Count how many candidates exist with this simple name
+                    List<String> candidates = new ArrayList<>();
+                    for (String existing : existingOrPlanned) {
+                        if (existing.endsWith("." + simple) || existing.equals(simple)) {
+                            candidates.add(existing);
+                        }
+                    }
+                    
+                    // Only rebind if there's exactly one candidate
+                    if (candidates.size() != 1) {
+                        if (candidates.size() > 1) {
+                            System.out.println("[Spoon] Skipping unknown→concrete rebinding for " + simple + " (multiple candidates: " + candidates + ")");
+                        }
+                        continue; // Skip rebinding - ambiguous or no candidate
+                    }
+                    
+                    // Use the single candidate
+                    String samePkgFqn = candidates.get(0);
+                    CtTypeReference<?> newRef = f.Type().createReference(samePkgFqn);
+                    ref.setPackage(newRef.getPackage());
+                    ref.setSimpleName(newRef.getSimpleName());
+                } else {
+                    // Non-conservative: prefer same-package match
                 String samePkgFqn = (cuPkg.isEmpty() ? simple : cuPkg + "." + simple);
                 if (existingOrPlanned.contains(samePkgFqn)) {
                     // rewrite to same-package type
                     CtTypeReference<?> newRef = f.Type().createReference(samePkgFqn);
                     ref.setPackage(newRef.getPackage());
                     ref.setSimpleName(newRef.getSimpleName());
+                    }
                 }
             }
         }
@@ -4529,7 +4724,7 @@ public final class SpoonCollector {
         collectResult.typePlans.removeIf(tp ->
                 tp.qualifiedName != null
                         && tp.qualifiedName.startsWith("unknown.")
-                        && existingOrPlanned.contains(tp.qualifiedName.substring("unknown.".length())) // crude; keep if you don’t maintain a map
+                        && existingOrPlanned.contains(tp.qualifiedName.substring("unknown.".length())) // crude; keep if you don't maintain a map
         );
     }
 
@@ -4537,7 +4732,15 @@ public final class SpoonCollector {
 
 
     private void collectTryWithResources(CtModel model, CollectResult out) {
-        for (CtTry twr : model.getElements(new TypeFilter<>(CtTry.class))) {
+        // PERFORMANCE: Only process try-with-resources from slice types
+        Set<CtType<?>> sliceTypes = getSliceTypes(out);
+        List<CtTry> tryBlocks = new ArrayList<>();
+        for (CtType<?> sliceType : sliceTypes) {
+            try {
+                tryBlocks.addAll(sliceType.getElements(new TypeFilter<>(CtTry.class)));
+            } catch (Throwable ignored) {}
+        }
+        for (CtTry twr : tryBlocks) {
 
             // 1) Try to call CtTry#getResources() reflectively (if present in this Spoon version)
             List<CtLocalVariable<?>> res = null;
@@ -4750,6 +4953,8 @@ public final class SpoonCollector {
         }
         
         // Filter out known invalid types that shouldn't be stubbed
+        // PackageAnchor is a Spoon artifact for star imports, not a real type that needs stubbing
+        if (simpleName.equals("PackageAnchor")) return; // Skip all PackageAnchor classes (they're just artifacts)
         if ("unknown.PackageAnchor".equals(fqn)) return; // Package anchor is not a real type
         if (fqn.startsWith("unknown.") && simpleName.equals("PackageAnchor")) return;
         
@@ -4797,6 +5002,13 @@ public final class SpoonCollector {
         if (owner == null) return;
         String ownerQn = safeQN(owner);
         if (ownerQn == null) return;
+        
+        // Task 3: Only add plans for slice types (owners in neededOwners)
+        // Context types are for resolution only, not for stubbing
+        if (!out.neededOwners.isEmpty() && !out.neededOwners.contains(ownerQn)) {
+            // This is a context-only type, don't create stub owner
+            return;
+        }
         
         // Check for duplicate constructor plans
         boolean alreadyExists = out.ctorPlans.stream()
@@ -4988,6 +5200,16 @@ public final class SpoonCollector {
      * CRITICAL FIX: Add method plan with deduplication using canonical key.
      */
     private boolean addMethodPlan(CollectResult out, MethodStubPlan plan) {
+        // Task 3: Only add plans for slice types (owners in neededOwners)
+        // Context types are for resolution only, not for stubbing
+        if (plan.ownerType != null) {
+            String ownerQn = safeQN(plan.ownerType);
+            if (ownerQn != null && !out.neededOwners.isEmpty() && !out.neededOwners.contains(ownerQn)) {
+                // This is a context-only type, don't create stub owner
+                return false;
+            }
+        }
+        
         String key = canonicalKey(plan);
         if (out.methodPlanKeys.contains(key)) {
             return false; // Already exists
@@ -5001,6 +5223,16 @@ public final class SpoonCollector {
      * CRITICAL FIX: Add field plan with deduplication using canonical key.
      */
     private boolean addFieldPlan(CollectResult out, FieldStubPlan plan) {
+        // Task 3: Only add plans for slice types (owners in neededOwners)
+        // Context types are for resolution only, not for stubbing
+        if (plan.ownerType != null) {
+            String ownerQn = safeQN(plan.ownerType);
+            if (ownerQn != null && !out.neededOwners.isEmpty() && !out.neededOwners.contains(ownerQn)) {
+                // This is a context-only type, don't create stub owner
+                return false;
+            }
+        }
+        
         String key = canonicalKey(plan);
         if (out.fieldPlanKeys.contains(key)) {
             return false; // Already exists
@@ -5014,6 +5246,16 @@ public final class SpoonCollector {
      * CRITICAL FIX: Add constructor plan with deduplication using canonical key.
      */
     private boolean addConstructorPlan(CollectResult out, ConstructorStubPlan plan) {
+        // Task 3: Only add plans for slice types (owners in neededOwners)
+        // Context types are for resolution only, not for stubbing
+        if (plan.ownerType != null) {
+            String ownerQn = safeQN(plan.ownerType);
+            if (ownerQn != null && !out.neededOwners.isEmpty() && !out.neededOwners.contains(ownerQn)) {
+                // This is a context-only type, don't create stub owner
+                return false;
+            }
+        }
+        
         String key = canonicalKey(plan);
         if (out.ctorPlanKeys.contains(key)) {
             return false; // Already exists
@@ -5024,13 +5266,54 @@ public final class SpoonCollector {
     }
     
     /**
+     * PERFORMANCE: Get slice types once (cached per collection run).
+     * Only searches within slice types, not entire model.
+     */
+    private Set<CtType<?>> getSliceTypes(CollectResult out) {
+        Set<CtType<?>> sliceTypes = new HashSet<>();
+        for (String interestingQn : out.neededOwners) {
+            try {
+                CtType<?> type = f.Type().get(interestingQn);
+                if (type != null) {
+                    sliceTypes.add(type);
+                }
+            } catch (Throwable ignored) {}
+        }
+        return sliceTypes;
+    }
+    
+    /**
+     * PERFORMANCE: Get elements from slice types only, not entire model.
+     * This dramatically speeds up collection by only processing slice code.
+     */
+    private <T extends CtElement> List<T> getSliceElements(CollectResult out, Class<T> elementType, java.util.function.Predicate<T> filter) {
+        Set<CtType<?>> sliceTypes = getSliceTypes(out);
+        List<T> result = new ArrayList<>();
+        for (CtType<?> sliceType : sliceTypes) {
+            try {
+                result.addAll(sliceType.getElements(new TypeFilter<>(elementType)).stream()
+                    .filter(filter)
+                    .collect(java.util.stream.Collectors.toList()));
+            } catch (Throwable ignored) {}
+        }
+        return result;
+    }
+    
+    /**
+     * PERFORMANCE: Get all slice types as a list (for iteration).
+     */
+    private List<CtType<?>> getSliceTypesList(CollectResult out) {
+        return new ArrayList<>(getSliceTypes(out));
+    }
+    
+    /**
      * CRITICAL FIX: Check if owner type should be collected.
-     * We should collect for ALL referenced types (not just interesting ones).
-     * The interesting types set is used to avoid over-collection, but we still need
-     * to collect referenced types that aren't in the slice.
+     * Only collect for types that are in the slice (interestingTypeQNs).
+     * Types from source roots are used for resolution context only, NOT for stubbing.
      * 
      * We should NOT collect for:
      * - Ignored packages (JDK, generated, etc.)
+     * - Types not in the slice (from source roots - context only)
      */
     private boolean isInterestingOwner(CollectResult out, CtTypeReference<?> ownerType) {
         if (ownerType == null) return false;
@@ -5041,13 +5324,13 @@ public final class SpoonCollector {
             // CRITICAL FIX: Skip ignored packages (JDK, generated, etc.)
             if (isIgnoredPackage(ownerQn)) return false;
             
-            // CRITICAL FIX: Track referenced owners for later use
+            // CRITICAL FIX: Track referenced owners for later use (for shims, etc.)
             out.referencedOwners.add(ownerQn);
             
-            // CRITICAL FIX: Collect for ALL non-ignored types
-            // The interesting types set is used to prioritize, not to filter
-            // We need to stub all referenced types, not just those in the slice
-            return true;
+            // CRITICAL FIX: Only collect for types in the slice (interestingTypeQNs)
+            // Types from source roots are context only - we don't stub them
+            // This ensures "minimum stubbing" - only stub what's needed for the slice
+            return out.neededOwners.contains(ownerQn);
         } catch (Throwable e) {
             return false;
         }
@@ -5414,8 +5697,14 @@ public final class SpoonCollector {
 
 
     private void collectMethodReferences(CtModel model, CollectResult out) {
-        List<CtExecutableReferenceExpression<?, ?>> mrefs =
-                model.getElements(new TypeFilter<>(CtExecutableReferenceExpression.class));
+        // PERFORMANCE: Only process method references from slice types
+        Set<CtType<?>> sliceTypes = getSliceTypes(out);
+        List<CtExecutableReferenceExpression<?, ?>> mrefs = new ArrayList<>();
+        for (CtType<?> sliceType : sliceTypes) {
+            try {
+                mrefs.addAll(sliceType.getElements(new TypeFilter<>(CtExecutableReferenceExpression.class)));
+            } catch (Throwable ignored) {}
+        }
 
         for (CtExecutableReferenceExpression<?, ?> mref : mrefs) {
             CtExecutableReference<?> ex = mref.getExecutable();
@@ -5749,8 +6038,12 @@ public final class SpoonCollector {
                         String varName = lv.getSimpleName();
                         System.err.println("[collectMethodReferences] Looking for calls on variable: " + varName);
                         
-                        // Look for method calls on this variable anywhere in the model
-                        List<CtInvocation<?>> callsOnVar = model.getElements((CtInvocation<?> inv) -> {
+                        // PERFORMANCE: Look for method calls on this variable only in slice types
+                        Set<CtType<?>> sliceTypesForVar = getSliceTypes(out);
+                        List<CtInvocation<?>> callsOnVar = new ArrayList<>();
+                        for (CtType<?> sliceType : sliceTypesForVar) {
+                            try {
+                                callsOnVar.addAll(sliceType.getElements((CtInvocation<?> inv) -> {
                             CtExpression<?> targetinv = inv.getTarget();
                             if (targetinv instanceof CtVariableRead<?>) {
                                 CtVariableRead<?> vr = (CtVariableRead<?>) targetinv;
@@ -5774,7 +6067,9 @@ public final class SpoonCollector {
                                 }
                             }
                             return false;
-                        });
+                                }));
+                            } catch (Throwable ignored) {}
+                        }
                         
                         System.err.println("[collectMethodReferences] Found " + callsOnVar.size() + " calls on variable " + varName);
                         
@@ -5890,8 +6185,14 @@ public final class SpoonCollector {
      * Collect lambda expressions and ensure their target types are created as INTERFACES (functional interfaces).
      */
     private void collectLambdas(CtModel model, CollectResult out) {
-        List<CtLambda<?>> lambdas =
-                model.getElements(new TypeFilter<>(CtLambda.class));
+        // PERFORMANCE: Only process lambdas from slice types
+        Set<CtType<?>> sliceTypes = getSliceTypes(out);
+        List<CtLambda<?>> lambdas = new ArrayList<>();
+        for (CtType<?> sliceType : sliceTypes) {
+            try {
+                lambdas.addAll(sliceType.getElements(new TypeFilter<>(CtLambda.class)));
+            } catch (Throwable ignored) {}
+        }
 
         for (CtLambda<?> lambda : lambdas) {
             // Find the variable this lambda is assigned to
@@ -6506,7 +6807,15 @@ public final class SpoonCollector {
         java.util.Set<String> completableFutureMethods = java.util.Set.of("thenApply", "thenAccept", "thenRun", 
                 "thenCompose", "thenCombine", "handle", "whenComplete");
         
-        for (CtInvocation<?> inv : model.getElements(new TypeFilter<>(CtInvocation.class))) {
+        // PERFORMANCE: Only process invocations from slice types
+        Set<CtType<?>> sliceTypes = getSliceTypes(out);
+        List<CtInvocation<?>> invocations = new ArrayList<>();
+        for (CtType<?> sliceType : sliceTypes) {
+            try {
+                invocations.addAll(sliceType.getElements(new TypeFilter<>(CtInvocation.class)));
+            } catch (Throwable ignored) {}
+        }
+        for (CtInvocation<?> inv : invocations) {
             CtExecutableReference<?> ex = inv.getExecutable();
             if (ex == null) continue;
             
@@ -7399,7 +7708,15 @@ public final class SpoonCollector {
     }
 
     private void collectForEachLoops(CtModel model, CollectResult out) {
-        for (CtForEach fe : model.getElements(new TypeFilter<>(CtForEach.class))) {
+        // PERFORMANCE: Only process forEach loops from slice types
+        Set<CtType<?>> sliceTypes = getSliceTypes(out);
+        List<CtForEach> forEachLoops = new ArrayList<>();
+        for (CtType<?> sliceType : sliceTypes) {
+            try {
+                forEachLoops.addAll(sliceType.getElements(new TypeFilter<>(CtForEach.class)));
+            } catch (Throwable ignored) {}
+        }
+        for (CtForEach fe : forEachLoops) {
             try {
                 // Skip arrays – they’re already iterable without interface
                 CtExpression<?> expr = fe.getExpression();

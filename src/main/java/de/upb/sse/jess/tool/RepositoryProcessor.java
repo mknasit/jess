@@ -165,6 +165,9 @@ public class RepositoryProcessor {
      * @return ProcessingResult containing statistics and results
      */
     public ProcessingResult processRepository() {
+        // Task 4: Reset counters at start of repo processing
+        de.upb.sse.jess.stubbing.SpoonStubbingRunner.resetCounters();
+        
         System.out.println("Starting repository processing...");
         System.out.println("Project Directory: " + projectDir);
         System.out.println("Source Roots: " + sourceRoots);
@@ -228,6 +231,15 @@ public class RepositoryProcessor {
             }
         }
 
+        // Task 4: Print summary statistics for repo run
+        System.out.println();
+        System.out.println("==================================================================================");
+        System.out.println("REPOSITORY PROCESSING SUMMARY");
+        System.out.println("==================================================================================");
+        System.out.println(de.upb.sse.jess.stubbing.SpoonStubbingRunner.getSummaryStats());
+        System.out.println("==================================================================================");
+        System.out.println();
+        
         // Generate summary
         return generateResult();
     }
