@@ -177,6 +177,9 @@ public final class SpoonCollector {
     private final boolean conservativeMode;
     private final boolean noClasspath;
 
+    // Store interestingTypeQNs (slice types from gen/) for optimization
+    private Set<String> interestingTypeQNs = null;
+
     // Centralized unknown type FQN constant. (Do not rename or remove.)
     private static final String UNKNOWN_TYPE_FQN = UnknownType.CLASS;
 
@@ -208,6 +211,9 @@ public final class SpoonCollector {
      */
     public CollectResult collect(CtModel model, Set<String> interestingTypeQNs) {
         CollectResult result = new CollectResult();
+        
+        // OPTIMIZATION: Store interestingTypeQNs for use in getAllTypes() optimizations
+        this.interestingTypeQNs = interestingTypeQNs;
 
         // CRITICAL FIX: Store interesting types for filtering
         result.neededOwners.addAll(interestingTypeQNs);
@@ -216,7 +222,7 @@ public final class SpoonCollector {
         // CRITICAL FIX: Wrap each collection phase in try-catch to handle StackOverflowError
         // This allows us to continue with other phases even if one fails
         System.out.println("[Spoon] Collection phase 1/15: ensureRepeatablesForDuplicateUses");
-        safeCollect(() -> ensureRepeatablesForDuplicateUses(model), "ensureRepeatablesForDuplicateUses");
+        safeCollect(() -> ensureRepeatablesForDuplicateUses(model, result), "ensureRepeatablesForDuplicateUses");
         System.out.println("[Spoon] Collection phase 2/15: rebindUnknownHomonyms");
         safeCollect(() -> rebindUnknownHomonyms(model, result), "rebindUnknownHomonyms");
         
@@ -492,13 +498,32 @@ public final class SpoonCollector {
                         potentialClassName = fieldName.substring(0, 1) + fieldName.substring(1).toLowerCase();
                     }
                     
-                    // Search model for a class with this name
+                    // OPTIMIZATION: Search slice types first (gen/ folder only), then fall back to full model if needed
                     final String finalPotentialClassName = potentialClassName;
-                    CtType<?> matchingClass = model.getAllTypes().stream()
+                    CtType<?> matchingClass = null;
+                    // First check slice types (much faster)
+                    if (interestingTypeQNs != null && !interestingTypeQNs.isEmpty()) {
+                        for (String interestingQn : interestingTypeQNs) {
+                            try {
+                                CtType<?> t = f.Type().get(interestingQn);
+                                if (t != null && finalPotentialClassName.equals(t.getSimpleName()) && t instanceof CtClass) {
+                                    matchingClass = t;
+                                    break;
+                                }
+                            } catch (Throwable ignored) {}
+                        }
+                    }
+                    // If not found in slice, check full model (may be in context types)
+                    if (matchingClass == null) {
+                        try {
+                            Collection<CtType<?>> allTypes = safeGetAllTypes(model);
+                            matchingClass = allTypes.stream()
                         .filter(t -> finalPotentialClassName.equals(t.getSimpleName()))
                         .filter(t -> t instanceof CtClass)
                         .findFirst()
                         .orElse(null);
+                        } catch (Throwable ignored) {}
+                    }
                     
                     if (matchingClass != null) {
                         String classFqn = matchingClass.getQualifiedName();
@@ -600,12 +625,33 @@ public final class SpoonCollector {
         if (simple == null || simple.isEmpty()) return false;
         final CtModel model = f.getModel();
 
-        // 1) type exists in the model (non-unknown)
-        boolean existsInModel = model.getAllTypes().stream().anyMatch(t ->
+        // OPTIMIZATION: Check slice types first (gen/ folder only), then fall back to full model
+        // 1) type exists in slice types (non-unknown)
+        boolean existsInSlice = false;
+        if (interestingTypeQNs != null && !interestingTypeQNs.isEmpty()) {
+            for (String interestingQn : interestingTypeQNs) {
+                try {
+                    CtType<?> t = f.Type().get(interestingQn);
+                    if (t != null && simple.equals(t.getSimpleName()) && t.getPackage() != null
+                            && !"unknown".equals(t.getPackage().getQualifiedName())) {
+                        existsInSlice = true;
+                        break;
+                    }
+                } catch (Throwable ignored) {}
+            }
+        }
+        if (existsInSlice) return true;
+        
+        // Fallback: check full model (for context types)
+        boolean existsInModel = false;
+        try {
+            Collection<CtType<?>> allTypes = safeGetAllTypes(model);
+            existsInModel = allTypes.stream().anyMatch(t ->
                 simple.equals(t.getSimpleName())
                         && t.getPackage() != null
                         && !"unknown".equals(t.getPackage().getQualifiedName())
         );
+        } catch (Throwable ignored) {}
         if (existsInModel) return true;
 
         // 2) type with same simple name exists in the current CU's package
@@ -613,12 +659,32 @@ public final class SpoonCollector {
             CtType<?> host = ctx.getParent(CtType.class);
             if (host != null && host.getPackage() != null) {
                 String curPkg = host.getPackage().getQualifiedName();
-                boolean inPkg = model.getAllTypes().stream().anyMatch(t ->
+                // Check slice types first
+                boolean inPkgSlice = false;
+                if (interestingTypeQNs != null && !interestingTypeQNs.isEmpty()) {
+                    for (String interestingQn : interestingTypeQNs) {
+                        try {
+                            CtType<?> t = f.Type().get(interestingQn);
+                            if (t != null && simple.equals(t.getSimpleName()) && t.getPackage() != null
+                                    && curPkg.equals(t.getPackage().getQualifiedName())) {
+                                inPkgSlice = true;
+                                break;
+                            }
+                        } catch (Throwable ignored) {}
+                    }
+                }
+                if (inPkgSlice) return true;
+                
+                // Fallback: check full model
+                try {
+                    Collection<CtType<?>> allTypes = safeGetAllTypes(model);
+                    boolean inPkg = allTypes.stream().anyMatch(t ->
                         simple.equals(t.getSimpleName())
                                 && t.getPackage() != null
                                 && curPkg.equals(t.getPackage().getQualifiedName())
                 );
                 if (inPkg) return true;
+                } catch (Throwable ignored) {}
             }
         } catch (Throwable ignored) {}
 
@@ -1344,9 +1410,18 @@ public final class SpoonCollector {
                             ownerType = f.Type().get(ownerQn);
                         } catch (Throwable ignored) {
                         }
+                        // OPTIMIZATION: Check slice types first, then fall back to full model
+                        if (ownerType == null && interestingTypeQNs != null && ownerQn != null) {
+                            if (interestingTypeQNs.contains(ownerQn)) {
+                                try {
+                                    ownerType = f.Type().get(ownerQn);
+                                } catch (Throwable ignored) {}
+                            }
+                        }
                         if (ownerType == null) {
                             try {
-                                ownerType = model.getAllTypes().stream()
+                                Collection<CtType<?>> allTypes = safeGetAllTypes(model);
+                                ownerType = allTypes.stream()
                                     .filter(t -> ownerQn.equals(safeQN(t.getReference())))
                                     .findFirst()
                                     .orElse(null);
@@ -1484,10 +1559,19 @@ public final class SpoonCollector {
                                 ownerType = f.Type().get(ownerQn);
                             } catch (Throwable ignored) {
                             }
-                            // Try 2: Search in model directly (for source code types)
+                            // OPTIMIZATION: Check slice types first, then fall back to full model
+                            if (ownerType == null && interestingTypeQNs != null && ownerQn != null) {
+                                if (interestingTypeQNs.contains(ownerQn)) {
+                                    try {
+                                        ownerType = f.Type().get(ownerQn);
+                                    } catch (Throwable ignored) {}
+                                }
+                            }
+                            // Try 2: Search in model directly (for source code types) - only if not found in slice
                             if (ownerType == null) {
                                 try {
-                                    ownerType = model.getAllTypes().stream()
+                                    Collection<CtType<?>> allTypes = safeGetAllTypes(model);
+                                    ownerType = allTypes.stream()
                                         .filter(t -> {
                                             String tQn = safeQN(t.getReference());
                                             return ownerQn.equals(tQn);
@@ -1603,9 +1687,18 @@ public final class SpoonCollector {
                             ownerType = f.Type().get(ownerQn);
                         } catch (Throwable ignored) {
                         }
+                        // OPTIMIZATION: Check slice types first, then fall back to full model
+                        if (ownerType == null && interestingTypeQNs != null && ownerQn != null) {
+                            if (interestingTypeQNs.contains(ownerQn)) {
+                                try {
+                                    ownerType = f.Type().get(ownerQn);
+                                } catch (Throwable ignored) {}
+                            }
+                        }
                         if (ownerType == null) {
                             try {
-                                ownerType = model.getAllTypes().stream()
+                                Collection<CtType<?>> allTypes = safeGetAllTypes(model);
+                                ownerType = allTypes.stream()
                                     .filter(t -> ownerQn.equals(safeQN(t.getReference())))
                                     .findFirst()
                                     .orElse(null);
@@ -2964,7 +3057,9 @@ public final class SpoonCollector {
     private void seedOnDemandImportAnchors(CtModel model, CollectResult out) {
         final Pattern STAR_IMPORT = Pattern.compile("\\bimport\\s+([a-zA-Z_][\\w\\.]*)\\.\\*\\s*;");
 
-        model.getAllTypes().forEach(t -> {
+        // OPTIMIZATION: Only process slice types (gen/ folder), not entire model
+        Set<CtType<?>> sliceTypes = getSliceTypes(out);
+        sliceTypes.forEach(t -> {
             var pos = t.getPosition();
             var cu = (pos != null) ? pos.getCompilationUnit() : null;
             if (cu == null) return;
@@ -4662,7 +4757,9 @@ public final class SpoonCollector {
     private void rebindUnknownHomonyms(CtModel model, CollectResult collectResult) {
         // index: which non-unknown types exist or are planned
         Set<String> existingOrPlanned = new HashSet<>();
-        model.getAllTypes().forEach(t -> {
+        // OPTIMIZATION: Only process slice types (gen/ folder), not entire model
+        Set<CtType<?>> sliceTypes = getSliceTypes(collectResult);
+        sliceTypes.forEach(t -> {
             String qn = safeQN(t.getReference());
             if (qn != null && !qn.startsWith("unknown.")) existingOrPlanned.add(qn);
         });
@@ -4672,7 +4769,7 @@ public final class SpoonCollector {
                 existingOrPlanned.add(tp.qualifiedName);
         }
 
-        for (CtType<?> t : model.getAllTypes()) {
+        for (CtType<?> t : sliceTypes) {
             CtCompilationUnit cu = f.CompilationUnit().getOrCreate(t);
             String cuPkg = (cu != null && cu.getDeclaredPackage() != null ? cu.getDeclaredPackage().getQualifiedName() : "");
             if (cuPkg == null) cuPkg = "";
@@ -4896,8 +4993,10 @@ public final class SpoonCollector {
 
 
 
-    private void ensureRepeatablesForDuplicateUses(CtModel model) {
-        for (CtType<?> t : model.getAllTypes()) {
+    private void ensureRepeatablesForDuplicateUses(CtModel model, CollectResult out) {
+        // OPTIMIZATION: Only process slice types (gen/ folder), not entire model
+        Set<CtType<?>> sliceTypes = getSliceTypes(out);
+        for (CtType<?> t : sliceTypes) {
             // scan type
             List<CtAnnotation<?>> anns = t.getAnnotations();
             ensureRepeatableIfDuplicate(anns);
@@ -5345,8 +5444,10 @@ public final class SpoonCollector {
         // Find all static imports in the model AND in source code
         Map<String, Set<String>> staticImportsByOwner = new HashMap<>();
         
-        // 1) Check all types in the model for static imports
-        for (CtType<?> type : model.getAllTypes()) {
+        // OPTIMIZATION: Only process slice types (gen/ folder), not entire model
+        // 1) Check all types in the slice for static imports
+        Set<CtType<?>> sliceTypes = getSliceTypes(out);
+        for (CtType<?> type : sliceTypes) {
             try {
                 CtCompilationUnit cu = f.CompilationUnit().getOrCreate(type);
                 if (cu == null) continue;
@@ -5404,9 +5505,10 @@ public final class SpoonCollector {
                 }
             } else {
                 // CRITICAL FIX: Class not in model yet, but check if it's in sliced source
+                // OPTIMIZATION: Only check slice types (gen/ folder), not entire model
                 // For classes like BrokerConstants that are in sliced source, we need to check the source directly
-                // Look for the class in all compilation units
-                for (CtType<?> type : model.getAllTypes()) {
+                // Look for the class in slice compilation units (reuse sliceTypes from above)
+                for (CtType<?> type : sliceTypes) {
                     try {
                         CtCompilationUnit cu = f.CompilationUnit().getOrCreate(type);
                         if (cu == null) continue;
@@ -7414,14 +7516,19 @@ public final class SpoonCollector {
                                 return elementType.getReference();
                             }
                             
-                            // Try to find by simple name in the model (any package)
+                            // OPTIMIZATION: Try to find by simple name in model
+                            // Note: This method doesn't have access to CollectResult, so we can't use slice types
+                            // But we still use safeGetAllTypes to prevent StackOverflowError
                             CtModel model = f.getModel();
                             if (model != null) {
-                                for (CtType<?> type : model.getAllTypes()) {
-                                    if (elementName.equals(type.getSimpleName())) {
-                                        return type.getReference();
+                                try {
+                                    Collection<CtType<?>> allTypes = safeGetAllTypes(model);
+                                    for (CtType<?> type : allTypes) {
+                                        if (elementName.equals(type.getSimpleName())) {
+                                            return type.getReference();
+                                        }
                                     }
-                                }
+                                } catch (Throwable ignored) {}
                             }
                             
                             // Try java.lang. only for common types

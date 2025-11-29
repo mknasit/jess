@@ -32,6 +32,7 @@ import com.github.javaparser.ast.Node;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.*;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -68,7 +69,7 @@ public final class SpoonStubbingRunner implements Stubber {
         this.sourceRoots = cfg.getSourceRoots() != null 
             ? cfg.getSourceRoots() 
             : java.util.Collections.emptyList();
-        this.conservativeMode = cfg.isSpoonConservativeMode();
+        this.conservativeMode = cfg.isMinimalStubbing(); // Use minimalStubbing directly
     }
 
     @Override
@@ -137,15 +138,40 @@ public final class SpoonStubbingRunner implements Stubber {
             System.err.println("[SpoonStubbingRunner] StackOverflowError during model building - likely due to circular type dependencies");
             System.err.println("[SpoonStubbingRunner] Attempting to continue with partial model...");
         } catch (ModelBuildingException e) {
-            // Task 1: Handle "type already defined" errors more intelligently
-            // Extract conflicting FQNs and try to drop only those files instead of all source roots
+            // CRITICAL FIX: Handle "type already defined" errors more intelligently
+            // Strategy: 
+            // 1. First, check if conflicting types are in gen/ (stub files) - delete those and retry with full context
+            // 2. If that fails, drop only conflicting source root files (not all source roots)
+            // 3. Only as last resort, drop all source roots (slice-only)
             String errorMsg = e.getMessage();
             if (errorMsg != null && errorMsg.contains("already defined")) {
                 System.err.println("[SpoonStubbingRunner] ModelBuildingException (unexpected with FQN filtering): " + errorMsg);
                 conflictingFqns = extractConflictingFqns(errorMsg);
                 if (conflictingFqns != null && !conflictingFqns.isEmpty()) {
                     System.err.println("[SpoonStubbingRunner] Extracted " + conflictingFqns.size() + " conflicting FQN(s): " + conflictingFqns);
-                    System.err.println("[SpoonStubbingRunner] Attempting to drop only conflicting files and retry...");
+                    
+                    // CRITICAL FIX: First, try deleting stub files in gen/ that conflict with real repo types
+                    Set<String> stubFilesToDelete = findStubFilesInGenForFqns(slicedSrcDir, conflictingFqns);
+                    if (!stubFilesToDelete.isEmpty()) {
+                        System.err.println("[SpoonStubbingRunner] Found " + stubFilesToDelete.size() + " stub file(s) in gen/ that conflict with real repo types, deleting them...");
+                        for (String stubFile : stubFilesToDelete) {
+                            try {
+                                Path stubPath = Paths.get(stubFile);
+                                if (Files.exists(stubPath)) {
+                                    Files.delete(stubPath);
+                                    System.out.println("[SpoonStubbingRunner] Deleted conflicting stub file: " + stubFile);
+                                }
+                            } catch (IOException ioEx) {
+                                System.err.println("[SpoonStubbingRunner] Failed to delete stub file " + stubFile + ": " + ioEx.getMessage());
+                            }
+                        }
+                        // Retry with full source roots after deleting stub files
+                        System.err.println("[SpoonStubbingRunner] Retrying with full source roots after deleting conflicting stub files...");
+                        retryWithoutSourceRoots = false; // Will retry with full context
+                    } else {
+                        // No stub files to delete - try dropping only conflicting source root files
+                        System.err.println("[SpoonStubbingRunner] No conflicting stub files found in gen/, will try dropping only conflicting source root files...");
+                    }
                 } else {
                     System.err.println("[SpoonStubbingRunner] Could not extract conflicting FQNs from error message.");
                     System.err.println("[SpoonStubbingRunner] This suggests FQN filtering may have missed some duplicates.");
@@ -158,12 +184,53 @@ public final class SpoonStubbingRunner implements Stubber {
             }
         }
         
-        // Task 1: If we got a duplicate type error, try smarter retry strategy
+        // CRITICAL FIX: If we deleted stub files, retry with full source roots
         CtModel finalModel;
         Factory finalFactory;
         boolean usedContext = false;
-        if (conflictingFqns != null && !conflictingFqns.isEmpty()) {
-            // Try to drop only conflicting files and retry
+        if (conflictingFqns != null && !conflictingFqns.isEmpty() && !retryWithoutSourceRoots) {
+            // First try: retry with full source roots (stub files already deleted)
+            try {
+                Launcher retryLauncher = new Launcher();
+                var retryEnv = retryLauncher.getEnvironment();
+                retryEnv.setComplianceLevel(env.getComplianceLevel());
+                retryEnv.setAutoImports(false);
+                retryEnv.setSourceOutputDirectory(slicedSrcDir.toFile());
+                retryEnv.setNoClasspath(env.getNoClasspath());
+                if (!env.getNoClasspath()) {
+                    retryEnv.setSourceClasspath(env.getSourceClasspath());
+                }
+                
+                // Add sliced code (may have fewer files now after deletion)
+                retryLauncher.addInputResource(slicedSrcDir.toString());
+                
+                // Add ALL source roots (full context) - stub files are already deleted
+                addSourceRootsWithFqnFilter(retryLauncher, slicedSrcDir);
+                
+                long retryStart = System.currentTimeMillis();
+                retryLauncher.buildModel();
+                long retryElapsed = System.currentTimeMillis() - retryStart;
+                totalModelBuildTime += retryElapsed;
+                totalModelBuilds++;
+                System.out.println("[Spoon] Retry model building (after deleting stub files) completed in " + retryElapsed + "ms");
+                
+                CtModel retryModel = retryLauncher.getModel();
+                Factory retryFactory = retryLauncher.getFactory();
+                if (retryModel == null) {
+                    throw new RuntimeException("Model building failed even after deleting stub files");
+                }
+                finalModel = retryModel;
+                finalFactory = retryFactory;
+                usedContext = true;
+                System.out.println("[SpoonStubbingRunner] Successfully built model after deleting conflicting stub files (kept full context)");
+            } catch (Exception retryException) {
+                System.err.println("[SpoonStubbingRunner] Retry with deleted stub files also failed: " + retryException.getMessage());
+                // Fall through to try dropping only conflicting source root files
+            }
+        }
+        
+        // Second try: If first retry failed or we didn't delete stub files, try dropping only conflicting source root files
+        if (conflictingFqns != null && !conflictingFqns.isEmpty() && !usedContext) {
             try {
                 Launcher retryLauncher = new Launcher();
                 var retryEnv = retryLauncher.getEnvironment();
@@ -180,7 +247,7 @@ public final class SpoonStubbingRunner implements Stubber {
                 
                 // Add source roots, but exclude files that define conflicting FQNs
                 Set<String> conflictingFiles = findFilesDefiningFqns(conflictingFqns);
-                System.out.println("[SpoonStubbingRunner] Found " + conflictingFiles.size() + " file(s) defining conflicting FQNs, excluding them...");
+                System.out.println("[SpoonStubbingRunner] Found " + conflictingFiles.size() + " source root file(s) defining conflicting FQNs, excluding them...");
                 
                 addSourceRootsWithFqnFilterExcludingFiles(retryLauncher, slicedSrcDir, conflictingFiles);
                 
@@ -189,7 +256,7 @@ public final class SpoonStubbingRunner implements Stubber {
                 long retryElapsed = System.currentTimeMillis() - retryStart;
                 totalModelBuildTime += retryElapsed;
                 totalModelBuilds++;
-                System.out.println("[Spoon] Retry model building completed in " + retryElapsed + "ms");
+                System.out.println("[Spoon] Retry model building (after dropping conflicting source files) completed in " + retryElapsed + "ms");
                 
                 CtModel retryModel = retryLauncher.getModel();
                 Factory retryFactory = retryLauncher.getFactory();
@@ -199,9 +266,9 @@ public final class SpoonStubbingRunner implements Stubber {
                 finalModel = retryModel;
                 finalFactory = retryFactory;
                 usedContext = true;
-                System.out.println("[SpoonStubbingRunner] Successfully built model after dropping conflicting files (kept most context)");
+                System.out.println("[SpoonStubbingRunner] Successfully built model after dropping conflicting source files (kept most context)");
             } catch (Exception retryException) {
-                System.err.println("[SpoonStubbingRunner] Retry with dropped files also failed: " + retryException.getMessage());
+                System.err.println("[SpoonStubbingRunner] Retry with dropped source files also failed: " + retryException.getMessage());
                 System.err.println("[SpoonStubbingRunner] Falling back to slice-only model...");
                 retryWithoutSourceRoots = true;
             }
@@ -289,7 +356,9 @@ public final class SpoonStubbingRunner implements Stubber {
         int sliceTypes = 0;
         int contextTypes = 0;
         try {
-            for (CtType<?> type : model.getAllTypes()) {
+            // OPTIMIZATION: Use safe wrapper to handle StackOverflowError
+            Collection<CtType<?>> allTypes = safeGetAllTypes(model);
+            for (CtType<?> type : allTypes) {
                 totalTypes++;
                 try {
                     String qn = type.getQualifiedName();
@@ -359,6 +428,59 @@ public final class SpoonStubbingRunner implements Stubber {
         
         // 2.5) Detect and add module class patterns (e.g., CheckedConsumerModule -> CheckedConsumer$Module)
         detectAndAddModuleClasses(model, plans, f, finalInterestingTypeQNs);
+        
+        // CRITICAL FIX: Filter out TargetMethod/TargetMethods annotations from type plans
+        // These are generated by TypeExtractor and should not be stubbed by Spoon
+        plans.typePlans.removeIf(tp -> {
+            if (tp.qualifiedName == null) return false;
+            String qn = tp.qualifiedName;
+            // Check if it's a TargetMethod annotation (any package)
+            if (qn.endsWith(".TargetMethod") || qn.endsWith(".TargetMethods") || 
+                qn.equals("TargetMethod") || qn.equals("TargetMethods")) {
+                // Check if it already exists in the model or slice
+                try {
+                    CtType<?> existing = f.Type().get(qn);
+                    if (existing != null) {
+                        System.out.println("[SpoonStubbingRunner] Skipping TargetMethod annotation type plan - already exists: " + qn);
+                        return true; // Remove from plans
+                    }
+                    // Also check by simple name
+                    // OPTIMIZATION: First check slice types (interestingTypeQNs), then fall back to full model if needed
+                    String simpleName = qn.contains(".") ? qn.substring(qn.lastIndexOf('.') + 1) : qn;
+                    boolean found = false;
+                    // First check in slice types (much faster)
+                    for (String interestingQn : finalInterestingTypeQNs) {
+                        try {
+                            CtType<?> type = f.Type().get(interestingQn);
+                            if (type != null && simpleName.equals(type.getSimpleName()) && 
+                                (type instanceof spoon.reflect.declaration.CtAnnotationType)) {
+                                System.out.println("[SpoonStubbingRunner] Skipping TargetMethod annotation type plan - found existing in slice: " + type.getQualifiedName());
+                                found = true;
+                                break;
+                            }
+                        } catch (Throwable ignored) {}
+                    }
+                    // If not found in slice, check full model (may be in context types)
+                    if (!found) {
+                        try {
+                            Collection<CtType<?>> allTypes = safeGetAllTypes(model);
+                            for (CtType<?> type : allTypes) {
+                                if (simpleName.equals(type.getSimpleName()) && 
+                                    (type instanceof spoon.reflect.declaration.CtAnnotationType)) {
+                                    System.out.println("[SpoonStubbingRunner] Skipping TargetMethod annotation type plan - found existing: " + type.getQualifiedName());
+                                    found = true;
+                                    break;
+                                }
+                            }
+                        } catch (Throwable ignored) {}
+                    }
+                    if (found) {
+                        return true; // Remove from plans
+                    }
+                } catch (Throwable ignored) {}
+            }
+            return false; // Keep in plans
+        });
 
         // 3) Generate JDK stubs for SootUp compatibility (if explicitly enabled)
         // WARNING: JDK stubs should only be enabled when JDK types are NOT available from classpath
@@ -966,10 +1088,42 @@ public final class SpoonStubbingRunner implements Stubber {
         System.out.println("[Spoon] Fixing void return types in boolean contexts...");
         fixVoidReturnTypesInBooleanContexts(model, f, finalInterestingTypeQNs);
 
-        // OPTIMIZATION: Only pretty-print slice types, not all 594 types in the model
-        System.out.println("[Spoon] Pretty-printing model to output directory (slice types only)...");
-        prettyPrintSliceTypesOnly(launcher, f, finalInterestingTypeQNs, slicedSrcDir);
-        System.out.println("[Spoon] Pretty-printing completed (" + finalInterestingTypeQNs.size() + " types)");
+        // CRITICAL FIX: Print both slice types AND stub types (external libs, etc.)
+        // Collect all types that were created during stubbing (not just slice types)
+        Set<String> allTypesToPrint = new HashSet<>(finalInterestingTypeQNs);
+        
+        // Add all types from type plans that were created (external libs, etc.)
+        for (TypeStubPlan tp : plans.typePlans) {
+            if (tp.qualifiedName != null && !tp.qualifiedName.isEmpty()) {
+                try {
+                    CtType<?> stubType = f.Type().get(tp.qualifiedName);
+                    if (stubType != null) {
+                        // Check if this type was created (has source position in gen/ or no source position)
+                        SourcePosition pos = stubType.getPosition();
+                        if (pos == null || pos.getFile() == null) {
+                            // No source position - this is a stub type we created, add it
+                            allTypesToPrint.add(tp.qualifiedName);
+                        } else {
+                            // Has source position - check if it's in gen/
+                            java.io.File file = pos.getFile();
+                            Path filePath = file.toPath().normalize().toAbsolutePath();
+                            Path slicedRootPath = slicedSrcDir.normalize().toAbsolutePath();
+                            if (filePath.startsWith(slicedRootPath)) {
+                                // Already in gen/ - will be printed as slice type
+                                allTypesToPrint.add(tp.qualifiedName);
+                            } else {
+                                // In source roots - don't print (it's real repo code)
+                            }
+                        }
+                    }
+                } catch (Throwable ignored) {}
+            }
+        }
+        
+        System.out.println("[Spoon] Pretty-printing model to output directory (" + allTypesToPrint.size() + " types: " + 
+            finalInterestingTypeQNs.size() + " slice types + " + (allTypesToPrint.size() - finalInterestingTypeQNs.size()) + " stub types)...");
+        prettyPrintSliceTypesOnly(launcher, f, allTypesToPrint, slicedSrcDir);
+        System.out.println("[Spoon] Pretty-printing completed (" + allTypesToPrint.size() + " types)");
         
         // CRITICAL FIX: Post-process to add missing imports directly to files
         // Spoon sometimes doesn't write imports even when they're in the CU, so we add them manually
@@ -3003,22 +3157,56 @@ public final class SpoonStubbingRunner implements Stubber {
                         if (r instanceof CtTypeReference) {
                             String qn = ((CtTypeReference<?>) r).getQualifiedName();
                             if (qn != null && !qn.startsWith("java.") && !qn.startsWith("javax.") && !qn.startsWith("jakarta.")) {
+                                // CRITICAL FIX: Never generate imports like "import okhttp3;" or "import java.lang.*;"
+                                // Check if qn is just a package (no class name) - this would generate invalid imports
+                                int lastDot = qn.lastIndexOf('.');
+                                if (lastDot < 0 || lastDot == qn.length() - 1) {
+                                    // No package or ends with dot - skip this import
+                                    return; // Use return instead of continue in lambda
+                                }
+                                
+                                // CRITICAL FIX: Never generate "import java.lang.*;" or "import static java.lang.*;"
+                                // java.lang is automatically imported, and these cause compilation errors
+                                if (qn.startsWith("java.lang") && (qn.equals("java.lang") || qn.equals("java.lang.*"))) {
+                                    return; // Skip java.lang imports - use return instead of continue in lambda
+                                }
+                                
+                                // Extract package and class name
+                                String pkg = qn.substring(0, lastDot);
+                                String className = qn.substring(lastDot + 1);
+                                
+                                // CRITICAL FIX: If className is empty or just "*", skip (would generate "import pkg;")
+                                if (className.isEmpty() || className.equals("*")) {
+                                    return; // Use return instead of continue in lambda
+                                }
+                                
                                 if (isStatic) {
                                     // For static imports, try to get the full member path
                                     String importStr = r.toString();
-                                    if (importStr != null && importStr.contains(".")) {
-                                        imports.add("import static " + importStr + ";");
-                                    } else {
+                                    if (importStr != null && importStr.contains(".") && !importStr.endsWith(".*")) {
+                                        // Only add if it's a specific member, not a package
+                                        if (importStr.lastIndexOf('.') > importStr.indexOf('.')) {
+                                            imports.add("import static " + importStr + ";");
+                                        }
+                                    } else if (qn.contains(".") && !qn.endsWith(".*")) {
+                                        // Use wildcard only if we have a valid class
                                         imports.add("import static " + qn + ".*;");
                                     }
                                 } else {
-                                    imports.add("import " + qn + ";");
+                                    // Regular import - ensure it's a valid class import, not just a package
+                                    if (className.length() > 0 && Character.isUpperCase(className.charAt(0))) {
+                                        imports.add("import " + qn + ";");
+                                    }
                                 }
                             }
                         } else if (isStatic) {
                             String importStr = r.toString();
-                            if (importStr != null && importStr.contains(".")) {
-                                imports.add("import static " + importStr + ";");
+                            if (importStr != null && importStr.contains(".") && !importStr.endsWith(".*")) {
+                                // Only add if it's a specific member, not a package
+                                int lastDot = importStr.lastIndexOf('.');
+                                if (lastDot > 0 && lastDot < importStr.length() - 1) {
+                                    imports.add("import static " + importStr + ";");
+                                }
                             }
                         }
                     } catch (Throwable ignored) {}
@@ -4479,6 +4667,48 @@ public final class SpoonStubbingRunner implements Stubber {
     }
     
     /**
+     * CRITICAL FIX: Find stub files in gen/ directory that define the given FQNs.
+     * These are stub files we generated that conflict with real repo types.
+     * We should delete these stub files so real repo types can be used.
+     */
+    private Set<String> findStubFilesInGenForFqns(Path genDir, Set<String> fqns) {
+        Set<String> stubFiles = new HashSet<>();
+        if (genDir == null || !Files.exists(genDir) || fqns == null || fqns.isEmpty()) {
+            return stubFiles;
+        }
+        
+        try {
+            // For each FQN, construct the expected file path in gen/
+            for (String fqn : fqns) {
+                if (fqn == null || fqn.isEmpty()) continue;
+                
+                // Convert FQN to file path: "com.example.Foo" -> "gen/com/example/Foo.java"
+                String relativePath = fqn.replace(".", "/") + ".java";
+                Path expectedFile = genDir.resolve(relativePath);
+                
+                if (Files.exists(expectedFile) && Files.isRegularFile(expectedFile)) {
+                    stubFiles.add(expectedFile.toAbsolutePath().toString());
+                }
+                
+                // Also check for nested classes (e.g., "com.example.Foo$Bar" -> "gen/com/example/Foo.java")
+                // The nested class would be in the same file as the outer class
+                if (fqn.contains("$")) {
+                    String outerFqn = fqn.substring(0, fqn.indexOf('$'));
+                    String outerRelativePath = outerFqn.replace(".", "/") + ".java";
+                    Path outerFile = genDir.resolve(outerRelativePath);
+                    if (Files.exists(outerFile) && Files.isRegularFile(outerFile)) {
+                        stubFiles.add(outerFile.toAbsolutePath().toString());
+                    }
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("[SpoonStubbingRunner] Error finding stub files in gen/: " + e.getMessage());
+        }
+        
+        return stubFiles;
+    }
+    
+    /**
      * Task 1: Find files that define the given FQNs using sourceRootFqnCache.
      * Also handles simple names by matching against simple names of FQNs in cache.
      */
@@ -4541,5 +4771,23 @@ public final class SpoonStubbingRunner implements Stubber {
         sliceOnlyModelCount = 0;
         totalModelBuildTime = 0;
         totalModelBuilds = 0;
+    }
+    
+    /**
+     * CRITICAL FIX: Safely get all types from model.
+     * model.getAllTypes() can trigger StackOverflowError when there are circular dependencies.
+     * This method catches the error and returns an empty collection, allowing processing to continue.
+     */
+    private Collection<CtType<?>> safeGetAllTypes(CtModel model) {
+        try {
+            return model.getAllTypes();
+        } catch (StackOverflowError e) {
+            System.err.println("[SpoonStubbingRunner] StackOverflowError getting all types - likely circular dependencies");
+            System.err.println("[SpoonStubbingRunner] Returning empty collection - some types may be missed");
+            return java.util.Collections.emptyList();
+        } catch (Throwable e) {
+            System.err.println("[SpoonStubbingRunner] Error getting all types: " + e.getMessage());
+            return java.util.Collections.emptyList();
+        }
     }
 }

@@ -18,7 +18,7 @@ public class JessConfiguration {
     private boolean keepAsteriskImports = true;
     private boolean failOnAmbiguity = false;
     private boolean disableStubbing = false;
-    private boolean minimalStubbing = false; // Default to minimal stubbing mode
+    private boolean minimalStubbing = true; // Default to minimal stubbing mode (conservative, fewer stubs but safer)
     private boolean includeJdkStubs = false; // Default to false - JDK types are available from JRE, stubs cause conflicts
     public enum StubberKind { JESS, SPOON }
 
@@ -28,9 +28,6 @@ public class JessConfiguration {
     
     // Source roots for Spoon stubber (same as used for JavaParser's combinedTypeSolver)
     private List<Path> sourceRoots = new ArrayList<>();
-    
-    // Conservative mode for Spoon: fewer stubs but safer (default true for RQ2 stubbing)
-    private boolean spoonConservativeMode = true;
 
     public JessConfiguration(boolean exitOnCompilationFail, boolean exitOnParsingFail, boolean looseSignatureMatching, boolean keepAsteriskImports, boolean failOnAmbiguity, boolean disableStubbing,String targetVersion) {
         this.exitOnCompilationFail = exitOnCompilationFail;

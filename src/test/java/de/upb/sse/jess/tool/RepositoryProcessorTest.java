@@ -69,6 +69,13 @@ public class RepositoryProcessorTest {
     // For auto-detection (same as experiment):
    private static final List<String> SOURCE_ROOTS = null;
     /** Classpath JAR files (empty list if none) */
+    // Server project has 3 JAR files in target directories
+//    private static final List<String> CLASSPATH_JARS = Arrays.asList(
+//            "broker/target/moquette-broker-1.4.0.jar",
+//            "common/target/common-1.4.0.jar",
+//            "sdk/target/sdk-1.4.0.jar"
+//    );
+
     private static final List<String> CLASSPATH_JARS = Arrays.asList();
 
     /** Maximum number of methods to process (-1 for unlimited, or set to 100, 1000, etc.) */
