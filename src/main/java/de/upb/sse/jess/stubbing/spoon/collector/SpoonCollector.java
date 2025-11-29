@@ -14,28 +14,9 @@ import spoon.reflect.reference.CtArrayTypeReference;
 import spoon.reflect.reference.CtExecutableReference;
 import spoon.reflect.reference.CtTypeReference;
 import spoon.reflect.visitor.filter.TypeFilter;
+import spoon.reflect.visitor.Filter;
 
-import java.util.*;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-import java.util.stream.Collectors;
-
-
-import de.upb.sse.jess.configuration.JessConfiguration;
-import de.upb.sse.jess.exceptions.AmbiguityException;
-import de.upb.sse.jess.stubbing.spoon.plan.*;
-import spoon.reflect.CtModel;
-import spoon.reflect.code.*;
-import spoon.reflect.cu.CompilationUnit;
-import spoon.reflect.cu.SourcePosition;
-import spoon.reflect.declaration.*;
-import spoon.reflect.factory.Factory;
-import spoon.reflect.path.CtRole;
-import spoon.reflect.reference.CtArrayTypeReference;
-import spoon.reflect.reference.CtExecutableReference;
-import spoon.reflect.reference.CtTypeReference;
-import spoon.reflect.visitor.filter.TypeFilter;
-
+import java.nio.file.Path;
 import java.util.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -68,6 +49,8 @@ public final class SpoonCollector {
 
     private final Factory f;
     private final JessConfiguration cfg;
+    private final java.nio.file.Path slicedSrcDir;
+    private final Set<String> sliceTypeFqns;
 
     // Centralized unknown type FQN constant. (Do not rename or remove.)
     private static final String UNKNOWN_TYPE_FQN = de.upb.sse.jess.generation.unknown.UnknownType.CLASS;
@@ -78,10 +61,76 @@ public final class SpoonCollector {
 
     /**
      * Constructs a SpoonCollector bound to a Spoon Factory and the Jess configuration.
+     * @param f Factory
+     * @param cfg Configuration
+     * @param slicedSrcDir The sliced source directory (only process types from here)
+     * @param sliceTypeFqns Set of FQNs for types in the slice (for filtering)
      */
-    public SpoonCollector(Factory f, JessConfiguration cfg) {
+    public SpoonCollector(Factory f, JessConfiguration cfg, java.nio.file.Path slicedSrcDir, Set<String> sliceTypeFqns) {
         this.f = f;
         this.cfg = cfg;
+        this.slicedSrcDir = slicedSrcDir;
+        this.sliceTypeFqns = sliceTypeFqns != null ? sliceTypeFqns : new HashSet<>();
+    }
+    
+    /**
+     * Legacy constructor for backward compatibility.
+     */
+    public SpoonCollector(Factory f, JessConfiguration cfg) {
+        this(f, cfg, null, new HashSet<>());
+    }
+    
+    /**
+     * Check if an element is from the slice directory (should be processed).
+     * An element is considered from the slice if:
+     * 1. Its source file is in the slice directory, OR
+     * 2. Its parent type (or any ancestor type) is a slice type
+     */
+    private boolean isFromSlice(CtElement element) {
+        if (slicedSrcDir == null || sliceTypeFqns == null || sliceTypeFqns.isEmpty()) {
+            return true; // If no filtering info, process everything (backward compat)
+        }
+        
+        // First check: is the element's file in the slice directory?
+        try {
+            spoon.reflect.cu.SourcePosition pos = element.getPosition();
+            if (pos != null && pos.getFile() != null) {
+                java.nio.file.Path filePath = pos.getFile().toPath().toAbsolutePath().normalize();
+                java.nio.file.Path sliceRoot = slicedSrcDir.toAbsolutePath().normalize();
+                if (filePath.startsWith(sliceRoot)) {
+                    return true;
+                }
+            }
+        } catch (Throwable ignored) {}
+        
+        // Second check: is the element's parent type (or any ancestor) a slice type?
+        // This catches elements that are referenced from slice types but defined in source roots
+        CtElement current = element;
+        int depth = 0;
+        while (current != null && depth < 10) { // Limit depth to avoid infinite loops
+            CtType<?> parentType = current.getParent(CtType.class);
+            if (parentType != null) {
+                String qn = parentType.getQualifiedName();
+                if (qn != null && sliceTypeFqns.contains(qn)) {
+                    return true;
+                }
+                // Also check if the parent type's file is in slice
+                try {
+                    spoon.reflect.cu.SourcePosition typePos = parentType.getPosition();
+                    if (typePos != null && typePos.getFile() != null) {
+                        java.nio.file.Path typeFilePath = typePos.getFile().toPath().toAbsolutePath().normalize();
+                        java.nio.file.Path sliceRoot = slicedSrcDir.toAbsolutePath().normalize();
+                        if (typeFilePath.startsWith(sliceRoot)) {
+                            return true;
+                        }
+                    }
+                } catch (Throwable ignored) {}
+            }
+            current = current.getParent();
+            depth++;
+        }
+        
+        return false; // Conservative: don't process if we can't determine
     }
 
     /* ======================================================================
@@ -124,7 +173,8 @@ public final class SpoonCollector {
      * Collect field stubs from unresolved field accesses (including static and instance cases).
      */
     private void collectUnresolvedFields(CtModel model, CollectResult out) {
-        List<CtFieldAccess<?>> unresolved = model.getElements((CtFieldAccess<?> fa) -> {
+        // OPTIMIZATION: Get elements only from slice types, not entire model
+        List<CtFieldAccess<?>> unresolved = getElementsFromSliceTypes(model, (CtFieldAccess<?> fa) -> {
             var ref = fa.getVariable();
             return ref == null || ref.getDeclaration() == null;
         });
@@ -347,7 +397,8 @@ public final class SpoonCollector {
 
 
     private void collectUnresolvedCtorCalls(CtModel model, CollectResult out) {
-        var unresolved = model.getElements((CtConstructorCall<?> cc) -> {
+        // OPTIMIZATION: Get elements only from slice types, not entire model
+        var unresolved = getElementsFromSliceTypes(model, (CtConstructorCall<?> cc) -> {
             var ex = cc.getExecutable();
             return ex == null || ex.getDeclaration() == null;
         });
@@ -415,7 +466,8 @@ public final class SpoonCollector {
      * Collect method stubs from unresolved invocations (incl. super calls and visibility).
      */
     private void collectUnresolvedMethodCalls(CtModel model, CollectResult out) {
-        List<CtInvocation<?>> unresolved = model.getElements((CtInvocation<?> inv) -> {
+        // OPTIMIZATION: Get elements only from slice types, not entire model
+        List<CtInvocation<?>> unresolved = getElementsFromSliceTypes(model, (CtInvocation<?> inv) -> {
             var ex = inv.getExecutable();
             return ex == null || ex.getDeclaration() == null;
         });
@@ -659,8 +711,9 @@ public final class SpoonCollector {
 
     // SpoonCollector.java
     private void collectUnresolvedAnnotations(CtModel model, CollectResult out) {
+        // OPTIMIZATION: Get elements only from slice types, not entire model
         // Walk all annotation occurrences in the slice
-        for (CtAnnotation<?> ann : model.getElements((CtAnnotation<?> a) -> true)) {
+        for (CtAnnotation<?> ann : getElementsFromSliceTypes(model, (CtAnnotation<?> a) -> true)) {
             CtTypeReference<?> t = ann.getAnnotationType();
             if (t == null) continue;
             // already resolved? skip
@@ -699,7 +752,8 @@ public final class SpoonCollector {
     }
 
     private void collectAnnotationTypeUsages(CtModel model, CollectResult out) {
-        for (CtAnnotation<?> a : model.getElements((CtAnnotation<?> x) -> true)) {
+        // OPTIMIZATION: Get elements only from slice types, not entire model
+        for (CtAnnotation<?> a : getElementsFromSliceTypes(model, (CtAnnotation<?> x) -> true)) {
             CtTypeReference<?> at = a.getAnnotationType();
             if (at == null) continue;
 
@@ -741,8 +795,9 @@ public final class SpoonCollector {
      * Collect exception types from throws, catch, and throw sites.
      */
     private void collectExceptionTypes(CtModel model, CollectResult out) {
+        // OPTIMIZATION: Get elements only from slice types, not entire model
         // methods: throws
-        List<CtMethod<?>> methods = model.getElements((CtMethod<?> mm) -> true);
+        List<CtMethod<?>> methods = getElementsFromSliceTypes(model, (CtMethod<?> mm) -> true);
         for (CtMethod<?> m : methods) {
             for (CtTypeReference<?> t : m.getThrownTypes()) {
                 if (t == null) continue;
@@ -754,7 +809,7 @@ public final class SpoonCollector {
         }
 
         // ctors: throws
-        List<CtConstructor<?>> ctors = model.getElements((CtConstructor<?> cc) -> true);
+        List<CtConstructor<?>> ctors = getElementsFromSliceTypes(model, (CtConstructor<?> cc) -> true);
         for (CtConstructor<?> c : ctors) {
             for (CtTypeReference<?> t : c.getThrownTypes()) {
                 if (t == null) continue;
@@ -766,7 +821,7 @@ public final class SpoonCollector {
         }
 
         // catch (single & multi)
-        List<CtCatch> catches = model.getElements((CtCatch k) -> true);
+        List<CtCatch> catches = getElementsFromSliceTypes(model, (CtCatch k) -> true);
         for (CtCatch cat : catches) {
             var par = cat.getParameter();
             if (par == null) continue;
@@ -788,7 +843,7 @@ public final class SpoonCollector {
         }
 
         // throw statements
-        List<CtThrow> throwsList = model.getElements((CtThrow th) -> true);
+        List<CtThrow> throwsList = getElementsFromSliceTypes(model, (CtThrow th) -> true);
         for (CtThrow thr : throwsList) {
             CtExpression<?> ex = thr.getThrownExpression();
             if (ex instanceof CtConstructorCall) {
@@ -820,21 +875,22 @@ public final class SpoonCollector {
      * Walk declared types in variables/fields/params/throws and plan any unresolved references.
      */
     private void collectUnresolvedDeclaredTypes(CtModel model, CollectResult out) {
-        for (CtField<?> fd : model.getElements((CtField<?> f) -> true)) {
+        // OPTIMIZATION: Get elements only from slice types, not entire model
+        for (CtField<?> fd : getElementsFromSliceTypes(model, (CtField<?> f) -> true)) {
             collectTypeRefDeep(fd, fd.getType(), out);
         }
-        for (CtLocalVariable<?> lv : model.getElements((CtLocalVariable<?> v) -> true)) {
+        for (CtLocalVariable<?> lv : getElementsFromSliceTypes(model, (CtLocalVariable<?> v) -> true)) {
             collectTypeRefDeep(lv, lv.getType(), out);
         }
-        for (CtParameter<?> p : model.getElements((CtParameter<?> pp) -> true)) {
+        for (CtParameter<?> p : getElementsFromSliceTypes(model, (CtParameter<?> pp) -> true)) {
             collectTypeRefDeep(p, p.getType(), out);
         }
-        for (CtMethod<?> m : model.getElements((CtMethod<?> mm) -> true)) {
+        for (CtMethod<?> m : getElementsFromSliceTypes(model, (CtMethod<?> mm) -> true)) {
             for (CtTypeReference<? extends Throwable> thr : m.getThrownTypes()) {
                 collectTypeRefDeep(m, thr, out);
             }
         }
-        for (CtConstructor<?> c : model.getElements((CtConstructor<?> cc) -> true)) {
+        for (CtConstructor<?> c : getElementsFromSliceTypes(model, (CtConstructor<?> cc) -> true)) {
             for (CtTypeReference<? extends Throwable> thr : c.getThrownTypes()) {
                 collectTypeRefDeep(c, thr, out);
             }
@@ -861,7 +917,19 @@ public final class SpoonCollector {
             if (t.equals(f.Type().VOID_PRIMITIVE)) return;
         } catch (Throwable ignored) { }
 
-        try { if (t.getDeclaration() != null) return; } catch (Throwable ignored) { }
+        // Check if type declaration exists in model (from any source - slice or context)
+        // If it exists in slice, it will be pretty-printed, so we don't need a stub
+        // If it exists only in context, we still need a stub (context types won't be pretty-printed)
+        try { 
+            CtType<?> decl = t.getDeclaration();
+            if (decl != null) {
+                // Type exists in model - check if it's from slice
+                if (isFromSlice(decl)) {
+                    return; // Type is in slice - will be pretty-printed, no stub needed
+                }
+                // Type exists but is from context - we still need a stub (fall through)
+            }
+        } catch (Throwable ignored) { }
 
         String qn = safeQN(t);
         String simple = t.getSimpleName();
@@ -903,12 +971,158 @@ public final class SpoonCollector {
      * ====================================================================== */
 
     /**
+     * Get elements of a specific type only from slice types (for performance).
+     * OPTIMIZATION: Iterate over slice types first, then get elements from each slice type.
+     * This avoids calling model.getElements() on the entire model (594 types), which is very slow.
+     */
+    @SuppressWarnings("unchecked")
+    private <T extends CtElement> List<T> getElementsFromSliceTypes(CtModel model, java.util.function.Predicate<T> predicate) {
+        List<T> result = new ArrayList<>();
+        try {
+            // OPTIMIZATION: Iterate over slice types first, then get elements from each slice type
+            // This avoids traversing all 594 types in the model
+            Collection<CtType<?>> sliceTypes = getSliceTypes(model);
+            for (CtType<?> sliceType : sliceTypes) {
+                try {
+                    // Get elements from this slice type only (recursive search within the type)
+                    Filter<T> typeFilter = new Filter<T>() {
+                        @Override
+                        public boolean matches(T element) {
+                            // Skip module elements
+                            if (element instanceof spoon.reflect.declaration.CtModule) {
+                                return false;
+                            }
+                            // Test the predicate
+                            return predicate.test(element);
+                        }
+                    };
+                    for (T el : sliceType.getElements(typeFilter)) {
+                        result.add(el);
+                    }
+                } catch (Throwable ignored) {
+                    // Skip types we can't process
+                }
+            }
+        } catch (StackOverflowError e) {
+            System.err.println("[SpoonCollector] StackOverflowError getting elements from slice types");
+            // Return empty list on StackOverflowError
+            return Collections.emptyList();
+        } catch (Throwable e) {
+            System.err.println("[SpoonCollector] Error getting elements: " + e.getMessage());
+        }
+        return result;
+    }
+    
+    /**
+     * Get elements of a specific type only from slice types (for performance).
+     * OPTIMIZATION: Iterate over slice types first, then get elements from each slice type.
+     * This avoids calling model.getElements() on the entire model (594 types), which is very slow.
+     */
+    @SuppressWarnings("unchecked")
+    private <T extends CtElement> List<T> getElementsFromSliceTypes(CtModel model, TypeFilter<T> typeFilter) {
+        List<T> result = new ArrayList<>();
+        try {
+            // OPTIMIZATION: Iterate over slice types first, then get elements from each slice type
+            // This avoids traversing all 594 types in the model
+            Collection<CtType<?>> sliceTypes = getSliceTypes(model);
+            for (CtType<?> sliceType : sliceTypes) {
+                try {
+                    // Get elements from this slice type only (recursive search within the type)
+                    // TypeFilter already handles type checking, so we can use it directly
+                    for (T el : sliceType.getElements(typeFilter)) {
+                        result.add(el);
+                    }
+                } catch (Throwable ignored) {
+                    // Skip types we can't process
+                }
+            }
+        } catch (StackOverflowError e) {
+            System.err.println("[SpoonCollector] StackOverflowError getting elements from slice types");
+            // Return empty list on StackOverflowError
+            return Collections.emptyList();
+        } catch (Throwable e) {
+            System.err.println("[SpoonCollector] Error getting elements: " + e.getMessage());
+        }
+        return result;
+    }
+    
+    /**
+     * Get only slice types from the model (for performance - avoid processing all types).
+     * Uses direct FQN lookup when possible to avoid getAllTypes().
+     */
+    private Collection<CtType<?>> getSliceTypes(CtModel model) {
+        List<CtType<?>> sliceTypes = new ArrayList<>();
+        if (slicedSrcDir == null || sliceTypeFqns == null || sliceTypeFqns.isEmpty()) {
+            // No filtering - return all types (backward compat)
+            try {
+                return safeGetAllTypes(model);
+            } catch (Throwable e) {
+                return Collections.emptyList();
+            }
+        }
+        
+        // OPTIMIZATION: Use direct FQN lookup instead of getAllTypes()
+        for (String fqn : sliceTypeFqns) {
+            try {
+                CtType<?> type = f.Type().get(fqn);
+                if (type != null) {
+                    sliceTypes.add(type);
+                }
+            } catch (Throwable ignored) {
+                // Skip types we can't get
+            }
+        }
+        
+        // If we found all types via FQN lookup, return early
+        if (sliceTypes.size() == sliceTypeFqns.size()) {
+            return sliceTypes;
+        }
+        
+        // Fallback: check file paths (only if FQN lookup didn't find all types)
+        Path sliceRoot = slicedSrcDir.toAbsolutePath().normalize();
+        try {
+            Collection<CtType<?>> allTypes = safeGetAllTypes(model);
+            for (CtType<?> type : allTypes) {
+                // Skip if already found via FQN lookup
+                String qn = type.getQualifiedName();
+                if (qn != null && sliceTypeFqns.contains(qn)) {
+                    continue; // Already added
+                }
+                
+                if (isFromSlice(type)) {
+                    sliceTypes.add(type);
+                }
+            }
+        } catch (Throwable e) {
+            System.err.println("[SpoonCollector] Error getting slice types: " + e.getMessage());
+        }
+        
+        return sliceTypes;
+    }
+    
+    /**
+     * Safely get all types from model, handling StackOverflowError.
+     */
+    private Collection<CtType<?>> safeGetAllTypes(CtModel model) {
+        try {
+            return model.getAllTypes();
+        } catch (StackOverflowError e) {
+            System.err.println("[SpoonCollector] StackOverflowError getting all types - likely circular dependencies");
+            System.err.println("[SpoonCollector] Returning empty collection - some slice types may be missing");
+            return Collections.emptyList();
+        } catch (Throwable e) {
+            System.err.println("[SpoonCollector] Error getting all types: " + e.getMessage());
+            return Collections.emptyList();
+        }
+    }
+    
+    /**
      * Seed synthetic anchors for on-demand (star) imports, preserving source order.
      */
     private void seedOnDemandImportAnchors(CtModel model, CollectResult out) {
         final Pattern STAR_IMPORT = Pattern.compile("\\bimport\\s+([a-zA-Z_][\\w\\.]*)\\.\\*\\s*;");
 
-        model.getAllTypes().forEach(t -> {
+        getSliceTypes(model).forEach(t -> {
             var pos = t.getPosition();
             var cu = (pos != null) ? pos.getCompilationUnit() : null;
             if (cu == null) return;
@@ -1060,11 +1274,12 @@ public final class SpoonCollector {
     /**
      * Seed types that appear only as explicit (single-type) imports.
      */
+    @SuppressWarnings("deprecation")
     private void seedExplicitTypeImports(CtModel model, CollectResult out) {
         final java.util.regex.Pattern SINGLE_IMPORT =
                 java.util.regex.Pattern.compile("\\bimport\\s+([a-zA-Z_][\\w\\.]*)\\s*;");
 
-        model.getAllTypes().forEach(t -> {
+        getSliceTypes(model).forEach(t -> {
             SourcePosition pos = t.getPosition();
             CompilationUnit cu = (pos != null ? pos.getCompilationUnit() : null);
             if (cu == null) return;
@@ -1110,7 +1325,8 @@ public final class SpoonCollector {
      * the given argument types. Emit a plan to create a matching overload.
      */
     private void collectOverloadGaps(CtModel model, CollectResult out) {
-        List<CtInvocation<?>> invocations = model.getElements((CtInvocation<?> inv) -> {
+        // OPTIMIZATION: Get elements only from slice types, not entire model
+        List<CtInvocation<?>> invocations = getElementsFromSliceTypes(model, (CtInvocation<?> inv) -> {
             CtExecutableReference<?> ex = inv.getExecutable();
             String name = (ex != null ? ex.getSimpleName() : null);
             if (name == null || "<init>".equals(name)) return false;
@@ -1254,8 +1470,9 @@ public final class SpoonCollector {
      * Collect supertypes (superclass and superinterfaces) and their generic arguments.
      */
     private void collectSupertypes(CtModel model, CollectResult out) {
+        // OPTIMIZATION: Get elements only from slice types, not entire model
         // classes: superclass + superinterfaces
-        for (CtClass<?> c : model.getElements((CtClass<?> cc) -> true)) {
+        for (CtClass<?> c : getElementsFromSliceTypes(model, (CtClass<?> cc) -> true)) {
             CtTypeReference<?> sup = null;
             try { sup = c.getSuperclass(); } catch (Throwable ignored) {}
             if (sup != null) {
@@ -1274,7 +1491,7 @@ public final class SpoonCollector {
         }
 
         // interfaces: superinterfaces
-        for (CtInterface<?> i : model.getElements((CtInterface<?> ii) -> true)) {
+        for (CtInterface<?> i : getElementsFromSliceTypes(model, (CtInterface<?> ii) -> true)) {
             for (CtTypeReference<?> si : safe(i.getSuperInterfaces())) {
                 if (si == null) continue;
                 CtTypeReference<?> owner = chooseOwnerPackage(si, i);
@@ -1285,7 +1502,7 @@ public final class SpoonCollector {
         }
 
         // Generic type arguments inside extends/implements
-        for (CtType<?> t : model.getAllTypes()) {
+        for (CtType<?> t : getSliceTypes(model)) {
             CtTypeReference<?> sup = null;
             try { sup = (t instanceof CtClass) ? ((CtClass<?>) t).getSuperclass() : null; } catch (Throwable ignored) {}
             if (sup != null) {
@@ -1332,8 +1549,9 @@ public final class SpoonCollector {
      * Also plan iterator() and Iterable&lt;E&gt; contracts for foreach.
      */
     private void collectFromInstanceofCastsClassLiteralsAndForEach(CtModel model, CollectResult out) {
+        // OPTIMIZATION: Get elements only from slice types, not entire model
         // instanceof (right-hand side type)
-        for (CtBinaryOperator<?> bo : model.getElements(new TypeFilter<>(CtBinaryOperator.class))) {
+        for (CtBinaryOperator<?> bo : getElementsFromSliceTypes(model, new TypeFilter<>(CtBinaryOperator.class))) {
             if (bo.getKind() == BinaryOperatorKind.INSTANCEOF) {
                 if (bo.getRightHandOperand() instanceof CtTypeAccess) {
                     CtTypeReference<?> t = ((CtTypeAccess<?>) bo.getRightHandOperand()).getAccessedType();
@@ -1343,13 +1561,13 @@ public final class SpoonCollector {
         }
 
         // class literals: Foo.class
-        for (CtTypeAccess<?> ta : model.getElements(new TypeFilter<>(CtTypeAccess.class))) {
+        for (CtTypeAccess<?> ta : getElementsFromSliceTypes(model, new TypeFilter<>(CtTypeAccess.class))) {
             CtTypeReference<?> t = ta.getAccessedType();
             if (t != null) maybePlanDeclaredType(ta, t, out);
         }
 
         // foreach contracts
-        for (CtForEach fe : model.getElements(new TypeFilter<>(CtForEach.class))) {
+        for (CtForEach fe : getElementsFromSliceTypes(model, new TypeFilter<>(CtForEach.class))) {
             CtExpression<?> expr = fe.getExpression();
             CtTypeReference<?> iterType = (expr != null ? expr.getType() : null);
 
@@ -1376,7 +1594,8 @@ public final class SpoonCollector {
         // casts (reflected to avoid hard dependency)
         try {
             Class<?> CT_TYPE_CAST = Class.forName("spoon.reflect.code.CtTypeCast");
-            for (CtElement el : model.getElements(new TypeFilter<>(CtElement.class))) {
+            // OPTIMIZATION: Get elements only from slice types, not entire model
+            for (CtElement el : getElementsFromSliceTypes(model, new TypeFilter<>(CtElement.class))) {
                 if (CT_TYPE_CAST.isInstance(el)) {
                     CtTypeReference<?> t = null;
                     try {

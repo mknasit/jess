@@ -12,6 +12,7 @@ import spoon.reflect.declaration.CtType;
 import spoon.reflect.declaration.CtPackage;
 
 import java.util.*;
+import java.nio.file.Path;
 
 import static com.github.javaparser.utils.CodeGenerationUtils.f;
 
@@ -22,6 +23,8 @@ public final class SpoonStubber {
      * ====================================================================== */
 
     private final Factory f;
+    private final java.nio.file.Path slicedSrcDir;
+    private final Set<String> sliceTypeFqns;
 
     private final Set<String> createdTypes  = new LinkedHashSet<>();
     private final List<String> createdFields = new ArrayList<>();
@@ -33,7 +36,18 @@ public final class SpoonStubber {
      * ====================================================================== */
 
     /** Create a stubber bound to a Spoon Factory. */
-    public SpoonStubber(Factory f) { this.f = f; }
+    public SpoonStubber(Factory f) { 
+        this.f = f;
+        this.slicedSrcDir = null;
+        this.sliceTypeFqns = null;
+    }
+    
+    /** Create a stubber bound to a Spoon Factory with slice filtering. */
+    public SpoonStubber(Factory f, java.nio.file.Path slicedSrcDir, Set<String> sliceTypeFqns) { 
+        this.f = f;
+        this.slicedSrcDir = slicedSrcDir;
+        this.sliceTypeFqns = sliceTypeFqns != null ? sliceTypeFqns : new HashSet<>();
+    }
 
     /* ======================================================================
      *                                TYPES
@@ -50,7 +64,7 @@ public final class SpoonStubber {
         }
         return created;
     }
-
+    
     /**
      * Ensure a type exists for the given plan (class/interface/annotation).
      * Handles generic arity inference and exception/error superclasses.
@@ -92,15 +106,15 @@ public final class SpoonStubber {
                                     am.setType(f.Type().STRING);
                                     at.addMethod(am);
                                 }
-                                break;
+                                                    break;
                             default:
                                 created = f.Class().create((CtClass<?>) parent, simple);
                         }
                         created.addModifier(ModifierKind.PUBLIC);
                         parent = created;
                         createdTypes.add(qn); // record once; harmless if repeated
-                    } else {
-                        parent = existing;
+                        } else {
+                            parent = existing;
                     }
                 }
 
@@ -294,7 +308,7 @@ public final class SpoonStubber {
             }
 
             CtMethod<?> m = f.Method().create(owner, mods, rt, p.name, params, thrown);
-
+            
             boolean ownerIsInterface = owner instanceof CtInterface;
 
             // ------- BODY & interface default handling (Spoon 10) -------
@@ -310,11 +324,11 @@ public final class SpoonStubber {
                     m.removeModifier(ModifierKind.ABSTRACT);
                 } else {
                     // abstract interface method
-                    m.setBody(null);
+                        m.setBody(null);
                     m.addModifier(ModifierKind.PUBLIC);   // optional; interfaces imply public
-                    m.addModifier(ModifierKind.ABSTRACT);
-                }
-            } else {
+                        m.addModifier(ModifierKind.ABSTRACT);
+                        }
+                    } else {
                 // concrete class method
                 CtBlock<?> body = f.Core().createBlock();
                 CtReturn<?> ret = defaultReturn(rt0);
@@ -379,6 +393,11 @@ public final class SpoonStubber {
         for (String s : createdFields)  System.out.println(" +field "  + s);
         for (String s : createdCtors)   System.out.println(" +ctor  "  + s);
         for (String s : createdMethods) System.out.println(" +method " + s);
+    }
+    
+    /** Get the set of created stub type FQNs. */
+    public Set<String> getCreatedTypes() {
+        return new LinkedHashSet<>(createdTypes);
     }
 
     /* ======================================================================
@@ -485,7 +504,7 @@ public final class SpoonStubber {
         }
         return false;
     }
-
+    
     /** Produce a default return statement for the given return type; null for void. */
     private CtReturn<?> defaultReturn(CtTypeReference<?> t) {
         if (t == null || t.equals(f.Type().VOID_PRIMITIVE)) return null;
@@ -522,29 +541,127 @@ public final class SpoonStubber {
      * ====================================================================== */
 
     /**
+     * Get only slice types from the model (for performance - avoid processing all types).
+     * Uses direct FQN lookup when possible to avoid getAllTypes().
+     */
+    private Collection<CtType<?>> getSliceTypes(CtModel model) {
+        List<CtType<?>> sliceTypes = new ArrayList<>();
+        if (slicedSrcDir == null || sliceTypeFqns == null || sliceTypeFqns.isEmpty()) {
+            // No filtering - return all types (backward compat)
+            try {
+                return safeGetAllTypes(model);
+            } catch (Throwable e) {
+                return Collections.emptyList();
+            }
+        }
+        
+        // OPTIMIZATION: Use direct FQN lookup instead of getAllTypes()
+        for (String fqn : sliceTypeFqns) {
+            try {
+                CtType<?> type = f.Type().get(fqn);
+                if (type != null) {
+                    sliceTypes.add(type);
+                }
+            } catch (Throwable ignored) {
+                // Skip types we can't get
+            }
+        }
+        
+        // If we found all types via FQN lookup, return early
+        if (sliceTypes.size() == sliceTypeFqns.size()) {
+            return sliceTypes;
+        }
+        
+        // Fallback: check file paths (only if FQN lookup didn't find all types)
+        Path sliceRoot = slicedSrcDir.toAbsolutePath().normalize();
+        try {
+            Collection<CtType<?>> allTypes = safeGetAllTypes(model);
+            for (CtType<?> type : allTypes) {
+                // Skip if already found via FQN lookup
+                String qn = type.getQualifiedName();
+                if (qn != null && sliceTypeFqns.contains(qn)) {
+                    continue; // Already added
+                }
+                
+                if (isSliceType(type)) {
+                    sliceTypes.add(type);
+                }
+            }
+        } catch (Throwable e) {
+            System.err.println("[SpoonStubber] Error getting slice types: " + e.getMessage());
+        }
+        
+        return sliceTypes;
+    }
+    
+    /**
+     * Safely get all types from model, handling StackOverflowError.
+     */
+    private Collection<CtType<?>> safeGetAllTypes(CtModel model) {
+        try {
+            return model.getAllTypes();
+        } catch (StackOverflowError e) {
+            System.err.println("[SpoonStubber] StackOverflowError getting all types - likely circular dependencies");
+            System.err.println("[SpoonStubber] Returning empty collection - some slice types may be missing");
+            return Collections.emptyList();
+        } catch (Throwable e) {
+            System.err.println("[SpoonStubber] Error getting all types: " + e.getMessage());
+            return Collections.emptyList();
+        }
+    }
+    
+    /**
      * De-qualify unresolved type refs that only appear to be in the current package,
      * unless they already belong to 'unknown.' space.
+     * Only processes slice types.
      */
     public void dequalifyCurrentPackageUnresolvedRefs() {
         CtModel model = f.getModel();
-        model.getAllTypes().forEach(t -> {
-            String pkg = Optional.ofNullable(t.getPackage())
-                    .map(CtPackage::getQualifiedName)
-                    .orElse("");
-            t.getElements(e -> e instanceof CtTypeReference<?>).forEach(refEl -> {
-                CtTypeReference<?> ref = (CtTypeReference<?>) refEl;
-                String qn = null;
+        getSliceTypes(model).forEach(t -> {
+                
+                String pkg = Optional.ofNullable(t.getPackage())
+                        .map(CtPackage::getQualifiedName)
+                        .orElse("");
+                t.getElements(e -> e instanceof CtTypeReference<?>).forEach(refEl -> {
+                    CtTypeReference<?> ref = (CtTypeReference<?>) refEl;
+                    String qn = null;
                 try { qn = ref.getQualifiedName(); } catch (Throwable ignored) {}
-                boolean looksCurrentPkg = qn != null && !qn.isEmpty()
-                        && pkg.length() > 0 && qn.startsWith(pkg + ".");
-                if (looksCurrentPkg && ref.getDeclaration() == null) {
-                    String qn2 = safeQN(ref);
-                    if (qn2.isEmpty() || !qn2.startsWith("unknown.")) {
-                        ref.setPackage(null);
+                    boolean looksCurrentPkg = qn != null && !qn.isEmpty()
+                            && pkg.length() > 0 && qn.startsWith(pkg + ".");
+                    if (looksCurrentPkg && ref.getDeclaration() == null) {
+                        String qn2 = safeQN(ref);
+                        if (qn2.isEmpty() || !qn2.startsWith("unknown.")) {
+                            ref.setPackage(null);
+                        }
                     }
-                }
-            });
+                });
         });
+    }
+    
+    /**
+     * Check if a type is from the slice directory.
+     */
+    private boolean isSliceType(CtType<?> type) {
+        if (slicedSrcDir == null || sliceTypeFqns == null || sliceTypeFqns.isEmpty()) {
+            return true; // If no filtering info, process everything (backward compat)
+        }
+        
+        String qn = type.getQualifiedName();
+        if (qn != null && sliceTypeFqns.contains(qn)) {
+            return true;
+        }
+        
+        // Also check by file path
+        try {
+            spoon.reflect.cu.SourcePosition pos = type.getPosition();
+            if (pos != null && pos.getFile() != null) {
+                java.nio.file.Path filePath = pos.getFile().toPath().toAbsolutePath().normalize();
+                java.nio.file.Path sliceRoot = slicedSrcDir.toAbsolutePath().normalize();
+                return filePath.startsWith(sliceRoot);
+            }
+        } catch (Throwable ignored) {}
+        
+        return false;
     }
 
     /** Safely get a type's qualified name; returns empty string on failure. */
@@ -617,10 +734,10 @@ public final class SpoonStubber {
             return u;
         }
         if (qn.startsWith("unknown.")) {
-            t.setImplicit(false);
+                t.setImplicit(false);
             t.setSimplyQualified(false);   // simple name, rely on the explicit import
         }
-        return t;
+            return t;
     }
 
     /** Adds `import unknown.Unknown;` to the owner's CU once (idempotent). */
@@ -644,10 +761,11 @@ public final class SpoonStubber {
     /**
      * Build a map of simple type name -> set of packages present in the model (non-JDK).
      * Used to detect ambiguous simple names.
+     * Only considers slice types for performance.
      */
     private Map<String, Set<String>> simpleNameToPkgs() {
         Map<String, Set<String>> m = new LinkedHashMap<>();
-        f.getModel().getAllTypes().forEach(t -> {
+        getSliceTypes(f.getModel()).forEach(t -> {
             String pkg = Optional.ofNullable(t.getPackage())
                     .map(CtPackage::getQualifiedName).orElse("");
             String simple = t.getSimpleName();
@@ -664,6 +782,7 @@ public final class SpoonStubber {
     /**
      * Qualify ambiguous simple type refs to a chosen package (prefer 'unknown' if present),
      * and force FQN printing to avoid import conflicts.
+     * Only processes slice types.
      */
     public void qualifyAmbiguousSimpleTypes() {
         Map<String, Set<String>> map = simpleNameToPkgs();
@@ -679,8 +798,9 @@ public final class SpoonStubber {
             chosen.put(e.getKey(), pick);
         }
 
-        // walk all type refs and qualify simple ones that are ambiguous
-        f.getModel().getAllTypes().forEach(owner -> {
+        // walk all type refs and qualify simple ones that are ambiguous (only in slice types)
+        getSliceTypes(f.getModel()).forEach(owner -> {
+            
             owner.getElements(el -> el instanceof CtTypeReference<?>).forEach(refEl -> {
                 CtTypeReference<?> ref = (CtTypeReference<?>) refEl;
                 String simple = ref.getSimpleName();
@@ -709,25 +829,31 @@ public final class SpoonStubber {
 
     /**
      * Inspect model usages of a type FQN to infer maximum number of generic type arguments.
+     * Only scans slice types for performance.
      * @return maximum arity observed (0 if none)
      */
     private int inferGenericArityFromUsages(String fqn) {
         String simple = fqn.substring(fqn.lastIndexOf('.') + 1);
         int max = 0;
-        for (var el : f.getModel().getElements(e -> e instanceof CtTypeReference<?>)) {
-            CtTypeReference<?> ref = (CtTypeReference<?>) el;
-            String qn = safeQN(ref);              // empty if unknown
-            String sn = ref.getSimpleName();      // never null for normal refs
+        
+        // Only scan slice types for performance
+        Collection<CtType<?>> sliceTypes = getSliceTypes(f.getModel());
+        for (CtType<?> sliceType : sliceTypes) {
+            for (var el : sliceType.getElements(e -> e instanceof CtTypeReference<?>)) {
+                CtTypeReference<?> ref = (CtTypeReference<?>) el;
+                String qn = safeQN(ref);              // empty if unknown
+                String sn = ref.getSimpleName();      // never null for normal refs
 
-            boolean sameType =
-                    fqn.equals(qn)                    // exact FQN match
-                            || (qn.isEmpty() && simple.equals(sn)); // unresolved simple-name match
+                boolean sameType =
+                        fqn.equals(qn)                    // exact FQN match
+                                || (qn.isEmpty() && simple.equals(sn)); // unresolved simple-name match
 
-            if (!sameType) continue;
+                if (!sameType) continue;
 
-            int n = 0;
-            try { n = ref.getActualTypeArguments().size(); } catch (Throwable ignored) {}
-            if (n > max) max = n;
+                int n = 0;
+                try { n = ref.getActualTypeArguments().size(); } catch (Throwable ignored) {}
+                if (n > max) max = n;
+            }
         }
         return max;
     }
@@ -819,35 +945,40 @@ public final class SpoonStubber {
         if (want == null || want.isEmpty()) want = ownerRef.getSimpleName();
         if (want == null || want.isEmpty()) return false;
 
-        // scan locals
-        for (CtLocalVariable<?> lv : f.getModel().getElements((CtLocalVariable<?> v) -> true)) {
-            CtTypeReference<?> t = lv.getType();
-            if (t == null) continue;
-            String qn = safeQN(t);
-            if (!want.equals(qn) && !t.getSimpleName().equals(ownerRef.getSimpleName())) continue;
+        // Only scan slice types for performance
+        Collection<CtType<?>> sliceTypes = getSliceTypes(f.getModel());
+        
+        // scan locals in slice types only
+        for (CtType<?> sliceType : sliceTypes) {
+            for (CtLocalVariable<?> lv : sliceType.getElements((CtLocalVariable<?> v) -> true)) {
+                CtTypeReference<?> t = lv.getType();
+                if (t == null) continue;
+                String qn = safeQN(t);
+                if (!want.equals(qn) && !t.getSimpleName().equals(ownerRef.getSimpleName())) continue;
 
-            CtExpression<?> init = lv.getDefaultExpression();
-            if (init == null) continue;
+                CtExpression<?> init = lv.getDefaultExpression();
+                if (init == null) continue;
 
-            // method reference: e.g., String[]::new, SomeType::factory, this::m
-            if (init instanceof spoon.reflect.code.CtExecutableReferenceExpression) return true;
+                // method reference: e.g., String[]::new, SomeType::factory, this::m
+                if (init instanceof spoon.reflect.code.CtExecutableReferenceExpression) return true;
 
-            // lambda: x -> ..., (a,b) -> ...
-            if (init instanceof spoon.reflect.code.CtLambda) return true;
-        }
+                // lambda: x -> ..., (a,b) -> ...
+                if (init instanceof spoon.reflect.code.CtLambda) return true;
+            }
 
-        // scan fields too (for completeness)
-        for (CtField<?> fd : f.getModel().getElements((CtField<?> v) -> true)) {
-            CtTypeReference<?> t = fd.getType();
-            if (t == null) continue;
-            String qn = safeQN(t);
-            if (!want.equals(qn) && !t.getSimpleName().equals(ownerRef.getSimpleName())) continue;
+            // scan fields too (for completeness)
+            for (CtField<?> fd : sliceType.getElements((CtField<?> v) -> true)) {
+                CtTypeReference<?> t = fd.getType();
+                if (t == null) continue;
+                String qn = safeQN(t);
+                if (!want.equals(qn) && !t.getSimpleName().equals(ownerRef.getSimpleName())) continue;
 
-            CtExpression<?> init = fd.getDefaultExpression();
-            if (init == null) continue;
+                CtExpression<?> init = fd.getDefaultExpression();
+                if (init == null) continue;
 
-            if (init instanceof spoon.reflect.code.CtExecutableReferenceExpression) return true;
-            if (init instanceof spoon.reflect.code.CtLambda) return true;
+                if (init instanceof spoon.reflect.code.CtExecutableReferenceExpression) return true;
+                if (init instanceof spoon.reflect.code.CtLambda) return true;
+            }
         }
 
         return false;
@@ -885,7 +1016,7 @@ public final class SpoonStubber {
     public void finalizeRepeatableAnnotations() {
         // package -> simpleName -> annotation type
         Map<String, Map<String, CtAnnotationType<?>>> byPkg = new LinkedHashMap<>();
-        for (CtType<?> t : f.getModel().getAllTypes()) {
+        for (CtType<?> t : getSliceTypes(f.getModel())) {
             if (!(t instanceof CtAnnotationType)) continue;
             String pkg = Optional.ofNullable(t.getPackage()).map(CtPackage::getQualifiedName).orElse("");
             byPkg.computeIfAbsent(pkg, k -> new LinkedHashMap<>())
@@ -1059,7 +1190,7 @@ public final class SpoonStubber {
 
 
     public void canonicalizeAllMetaAnnotations() {
-        for (CtType<?> t : f.getModel().getAllTypes()) {
+        for (CtType<?> t : getSliceTypes(f.getModel())) {
             if (!(t instanceof CtAnnotationType)) continue;
             CtAnnotationType<?> at = (CtAnnotationType<?>) t;
             for (CtAnnotation<?> a : at.getAnnotations()) canonicalizeMetaAnnotationType(a);
