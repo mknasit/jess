@@ -20,7 +20,7 @@ public class JessConfiguration {
     private boolean disableStubbing = false;
     private boolean minimalStubbing = true; // Default to minimal stubbing mode (conservative, fewer stubs but safer)
     private boolean includeJdkStubs = false; // Default to false - JDK types are available from JRE, stubs cause conflicts
-    public enum StubberKind { JESS, SPOON }
+    public enum StubberKind { JESS, SPOON, SPOON_MINIMAL }
 
     private StubberKind stubberKind = StubberKind.SPOON;
 
