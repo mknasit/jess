@@ -25,7 +25,6 @@ import de.upb.sse.jess.model.stubs.ClassType;
 import de.upb.sse.jess.stats.StubbingStats;
 import de.upb.sse.jess.stubbing.JessStubberAdapter;
 import de.upb.sse.jess.stubbing.SpoonStubbingRunner;
-import de.upb.sse.jess.stubbing.MinimalSpoonStubbingRunner;
 import de.upb.sse.jess.stubbing.Stubber;
 import de.upb.sse.jess.util.FileUtil;
 import de.upb.sse.jess.util.ImportUtil;
@@ -39,7 +38,6 @@ import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.tree.ClassNode;
 import org.objectweb.asm.tree.MethodNode;
 
-import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.DirectoryStream;
@@ -139,15 +137,13 @@ public class Jess {
 
         symbolSolver = new JavaSymbolSolver(combinedTypeSolver);
 
-        // prefer config, let system property override if provided
-        boolean useMinimalSpoon = config.getStubberKind() == JessConfiguration.StubberKind.SPOON_MINIMAL;
+
+
         boolean useSpoon =
                 config.getStubberKind() == JessConfiguration.StubberKind.SPOON
                         || "spoon".equalsIgnoreCase(System.getProperty("jess.stubber", ""));
 
-        if (useMinimalSpoon) {
-            this.stubber = new MinimalSpoonStubbingRunner(this.config);
-        } else if (useSpoon) {
+        if (useSpoon) {
             this.stubber = new SpoonStubbingRunner(this.config);
         } else {
             this.stubber = new JessStubberAdapter(this);

@@ -7,6 +7,7 @@ import spoon.reflect.code.*;
 import spoon.reflect.declaration.*;
 import spoon.reflect.factory.Factory;
 import spoon.reflect.reference.CtTypeReference;
+import spoon.reflect.reference.CtArrayTypeReference;
 
 import spoon.reflect.declaration.CtType;
 import spoon.reflect.declaration.CtPackage;
@@ -30,6 +31,10 @@ public final class SpoonStubber {
     private final List<String> createdFields = new ArrayList<>();
     private final List<String> createdCtors  = new ArrayList<>();
     private final List<String> createdMethods= new ArrayList<>();
+    
+    // Centralized unknown package constant
+    private static final String UNKNOWN_PACKAGE = de.upb.sse.jess.generation.unknown.UnknownType.PACKAGE;
+    private static final String UNKNOWN_CLASS = de.upb.sse.jess.generation.unknown.UnknownType.CLASS;
 
     /* ======================================================================
      *                              CONSTRUCTION
@@ -95,6 +100,17 @@ public final class SpoonStubber {
                             case INTERFACE:
                                 created = f.Interface().create(parent, simple);
                                 break;
+                            case ENUM:
+                                // For nested enums, use Core API and addNestedType
+                                if (parent instanceof CtClass) {
+                                    created = f.Core().createEnum();
+                                    created.setSimpleName(simple);
+                                    ((CtClass<?>) parent).addNestedType(created);
+                                } else {
+                                    // Fallback: create as class if parent is not a class
+                                    created = f.Class().create((CtClass<?>) parent, simple);
+                                }
+                                break;
                             case ANNOTATION:
                                 created = f.Annotation().create((CtPackage) parent, simple);
                                 // make sure it has public and a default 'value()' (like your top-level path)
@@ -131,17 +147,39 @@ public final class SpoonStubber {
         String name = "Missing";
         int i = qn.lastIndexOf('.');
         if (i >= 0) { pkg = qn.substring(0, i); name = qn.substring(i + 1); }
-        else { pkg = "unknown"; name = qn; }
+        else { pkg = UNKNOWN_PACKAGE; name = qn; }
 
         CtPackage packageObj = f.Package().getOrCreate(pkg);
         CtType<?> existing = packageObj.getType(name);
-        if (existing != null) return false;
+        
+        // If type exists in model, check if it's from slice or context
+        if (existing != null) {
+            // If it's from slice, it will be pretty-printed, so no stub needed
+            if (isFromSlice(existing)) {
+                return false;
+            }
+            // CRITICAL FIX: Even if type exists in context, we should NOT copy the full source code
+            // because it may have dependencies that don't exist (e.g., cn.wildfirechat.common).
+            // Instead, we should generate a minimal stub based on what's actually needed.
+            // The collection results tell us what members are needed, so we'll create a minimal stub.
+            // 
+            // Example: Utility class exists in context with full implementation, but we only need
+            // printExecption(Logger, Exception). Copying the full class would bring in dependencies
+            // like IMExceptionEvent, Server, Gson, etc. that don't exist in the stub environment.
+            //
+            // Solution: Always generate minimal stub for context types, don't copy full source.
+            // Fall through to create minimal stub below.
+            System.out.println("[SpoonStubber] DEBUG: Type " + qn + " exists in context, but generating minimal stub instead of copying full source");
+        }
 
         CtType<?> created;
 
         switch (p.kind) {
             case INTERFACE:
                 created = f.Interface().create(packageObj, name);
+                break;
+            case ENUM:
+                created = f.Enum().create(packageObj, name);
                 break;
             case ANNOTATION: {
                 CtAnnotationType<?> at = f.Annotation().create(packageObj, name);
@@ -164,7 +202,12 @@ public final class SpoonStubber {
 
         // Add generic parameters if usages imply arity.
         int arity = inferGenericArityFromUsages(qn);
-        if (arity > 0) addTypeParameters(created, arity);
+        if (arity > 0) {
+            addTypeParameters(created, arity);
+        } else {
+            // DEBUG: Log when we're not adding type parameters
+            System.out.println("[SpoonStubber] DEBUG: Not adding type parameters for " + qn + " (arity=" + arity + ")");
+        }
 
         // If it looks like an exception/error, set a throwable superclass.
         if (created instanceof CtClass) {
@@ -202,7 +245,8 @@ public final class SpoonStubber {
             if (owner.getField(p.fieldName) != null) continue;
 
             CtTypeReference<?> fieldType = normalizeUnknownRef(p.fieldType);
-            if ("unknown.Unknown".equals(readable(fieldType)) || "Unknown".equals(fieldType.getSimpleName())) {
+            String fieldTypeQn = readable(fieldType);
+            if ((UNKNOWN_PACKAGE + "." + UNKNOWN_CLASS).equals(fieldTypeQn) || "Unknown".equals(fieldType.getSimpleName())) {
                 ensureExplicitUnknownImport(owner);
             }
 
@@ -248,7 +292,7 @@ public final class SpoonStubber {
             CtConstructor<?> ctor = f.Constructor().create(owner, mods, params, Collections.emptySet(), f.Core().createBlock());
 
             boolean ctorUsesUnknown = params.stream().anyMatch(d ->
-                    "unknown.Unknown".equals(readable(d.getType()))
+                    (UNKNOWN_PACKAGE + "." + UNKNOWN_CLASS).equals(readable(d.getType()))
                             || "Unknown".equals(d.getType().getSimpleName())
             );
             if (ctorUsesUnknown) {
@@ -288,7 +332,37 @@ public final class SpoonStubber {
 
             List<CtTypeReference<?>> normParams = new ArrayList<>();
             for (CtTypeReference<?> t : p.paramTypes) normParams.add(normalizeUnknownRef(t));
-            List<CtParameter<?>> params = makeParams(normParams);
+            
+            // Detect varargs: if we have 2 params and second is Object, and method name suggests varargs,
+            // make it varargs (String, Object...)
+            // Also check if we have 3+ params with first being String (logging pattern)
+            boolean isVarargs = false;
+            if (normParams.size() == 2 && normParams.get(1) != null) {
+                String secondParamQn = safeQN(normParams.get(1));
+                if ("java.lang.Object".equals(secondParamQn)) {
+                    // Check if method name suggests varargs (logging methods)
+                    if (p.name != null && (p.name.equals("info") || p.name.equals("debug") || p.name.equals("warn") 
+                            || p.name.equals("error") || p.name.equals("trace") || p.name.equals("log"))) {
+                        isVarargs = true;
+                    }
+                }
+            } else if (normParams.size() >= 3 && normParams.get(0) != null) {
+                // If we have 3+ params and first is String, likely varargs (should have been converted in collector)
+                // But if it wasn't, convert here
+                String firstParamQn = safeQN(normParams.get(0));
+                if ("java.lang.String".equals(firstParamQn)) {
+                    if (p.name != null && (p.name.equals("info") || p.name.equals("debug") || p.name.equals("warn") 
+                            || p.name.equals("error") || p.name.equals("trace") || p.name.equals("log"))) {
+                        // Convert to varargs: keep first, convert rest to Object...
+                        normParams = new ArrayList<>();
+                        normParams.add(p.paramTypes.get(0)); // Keep original first param
+                        normParams.add(f.Type().createReference("java.lang.Object")); // Varargs param
+                        isVarargs = true;
+                    }
+                }
+            }
+            
+            List<CtParameter<?>> params = makeParams(normParams, isVarargs);
 
             Set<CtTypeReference<? extends Throwable>> thrown = new LinkedHashSet<>();
             for (CtTypeReference<?> t : p.thrownTypes) {
@@ -363,10 +437,10 @@ public final class SpoonStubber {
             }
 
             boolean usesUnknown =
-                    "unknown.Unknown".equals(readable(rt0))
+                    (UNKNOWN_PACKAGE + "." + UNKNOWN_CLASS).equals(readable(rt0))
                             || "Unknown".equals(rt0.getSimpleName())
                             || params.stream().anyMatch(d ->
-                            "unknown.Unknown".equals(readable(d.getType()))
+                            (UNKNOWN_PACKAGE + "." + UNKNOWN_CLASS).equals(readable(d.getType()))
                                     || "Unknown".equals(d.getType().getSimpleName()));
             if (usesUnknown) ensureExplicitUnknownImport(owner);
 
@@ -455,6 +529,10 @@ public final class SpoonStubber {
 
     /** Create CtParameter list for the provided types; assigns arg0..argN. */
     private List<CtParameter<?>> makeParams(List<CtTypeReference<?>> types) {
+        return makeParams(types, false);
+    }
+    
+    private List<CtParameter<?>> makeParams(List<CtTypeReference<?>> types, boolean lastIsVarargs) {
         List<CtParameter<?>> params = new ArrayList<>();
         for (int i = 0; i < types.size(); i++) {
             CtParameter<?> par = f.Core().createParameter();
@@ -463,7 +541,29 @@ public final class SpoonStubber {
                     ? f.Type().createReference(de.upb.sse.jess.generation.unknown.UnknownType.CLASS)
                     : normalizeUnknownRef(raw); // ensure normalization survives
 
-            par.setType(safe);
+            // For varargs, we need to create an array type reference
+            if (lastIsVarargs && i == types.size() - 1) {
+                // Create array type reference for varargs (e.g., Object[] becomes Object...)
+                // Ensure we get a proper array type reference
+                CtTypeReference<?> arrayType = f.Type().createArrayReference(safe);
+                // Verify it's actually an array type
+                if (!(arrayType instanceof spoon.reflect.reference.CtArrayTypeReference)) {
+                    // If createArrayReference didn't return the right type, try creating it differently
+                    try {
+                        spoon.reflect.reference.CtArrayTypeReference<?> arrayRef = 
+                            f.Core().createArrayTypeReference();
+                        arrayRef.setComponentType(safe);
+                        arrayType = arrayRef;
+                    } catch (Throwable ignored) {
+                        // Fallback: use createArrayReference result anyway
+                    }
+                }
+                par.setType(arrayType);
+                par.setVarArgs(true);
+            } else {
+                par.setType(safe);
+            }
+            
             par.setSimpleName("arg" + i);
             params.add(par);
         }
@@ -630,8 +730,17 @@ public final class SpoonStubber {
                             && pkg.length() > 0 && qn.startsWith(pkg + ".");
                     if (looksCurrentPkg && ref.getDeclaration() == null) {
                         String qn2 = safeQN(ref);
-                        if (qn2.isEmpty() || !qn2.startsWith("unknown.")) {
+                        // Don't dequalify unknown.* types - they need their package
+                        if (qn2.isEmpty() || !qn2.startsWith(UNKNOWN_PACKAGE + ".")) {
                             ref.setPackage(null);
+                        } else {
+                            // Ensure unknown.* types have their package set correctly
+                            if (ref.getPackage() == null && qn2.startsWith(UNKNOWN_PACKAGE + ".")) {
+                                ref.setPackage(f.Package().createReference(UNKNOWN_PACKAGE));
+                            }
+                            // Ensure it will use import, not FQN
+                            ref.setImplicit(false);
+                            ref.setSimplyQualified(false);
                         }
                     }
                 });
@@ -663,6 +772,14 @@ public final class SpoonStubber {
         
         return false;
     }
+    
+    /**
+     * Check if a type is from the slice directory (alias for isSliceType for clarity).
+     */
+    private boolean isFromSlice(CtType<?> type) {
+        return isSliceType(type);
+    }
+    
 
     /** Safely get a type's qualified name; returns empty string on failure. */
     private static String safeQN(CtTypeReference<?> t) {
@@ -675,7 +792,9 @@ public final class SpoonStubber {
     }
 
     /**
-     * Force FQN printing for non-JDK, non-primitive types and skip imports.
+     * Ensure proper import handling for type references.
+     * For unknown.* types: add explicit import and use simple name.
+     * For other non-JDK types: force FQN printing (no import).
      * Keeps primitives/void/arrays and JDK types untouched.
      */
     private void ensureImport(CtType<?> owner, CtTypeReference<?> ref) {
@@ -699,6 +818,20 @@ public final class SpoonStubber {
             return;
         }
 
+        // Special handling for unknown.* types: add import and use simple name
+        String UNKNOWN_PACKAGE = de.upb.sse.jess.generation.unknown.UnknownType.PACKAGE;
+        if (qn.startsWith(UNKNOWN_PACKAGE + ".")) {
+            // Ensure package is set
+            if (ref.getPackage() == null) {
+                ref.setPackage(f.Package().createReference(UNKNOWN_PACKAGE));
+            }
+            // Use simple name (not FQN) and ensure import exists
+            ref.setImplicit(false);
+            ref.setSimplyQualified(false); // simple name, rely on import
+            ensureExplicitImport(owner, ref);
+            return;
+        }
+
         // If it already has a package (qn contains '.'), keep it qualified.
         // If it is a simple name (no package), DO NOT add any import—just force FQN printing.
         if (!qn.contains(".")) {
@@ -707,7 +840,7 @@ public final class SpoonStubber {
             return;
         }
 
-        // For non-JDK, non-primitive, with a package: force FQN printing (no import).
+        // For other non-JDK, non-primitive, with a package: force FQN printing (no import).
         if (ref.getPackage() == null) {
             int i = qn.lastIndexOf('.');
             if (i > 0) ref.setPackage(f.Package().createReference(qn.substring(0, i)));
@@ -717,32 +850,59 @@ public final class SpoonStubber {
     }
 
     /**
+     * Add an explicit import for a type reference to the owner's compilation unit.
+     */
+    private void ensureExplicitImport(CtType<?> owner, CtTypeReference<?> ref) {
+        String qn = safeQN(ref);
+        if (qn == null || qn.isEmpty() || !qn.contains(".")) return;
+
+        CtCompilationUnit cu = f.CompilationUnit().getOrCreate(owner);
+        if (cu == null) return;
+
+        // Check if import already exists
+        boolean present = cu.getImports().stream().anyMatch(imp -> {
+            try {
+                var r = imp.getReference();
+                return (r instanceof CtTypeReference)
+                        && qn.equals(((CtTypeReference<?>) r).getQualifiedName());
+            } catch (Throwable ignored) { return false; }
+        });
+
+        if (!present) {
+            cu.getImports().add(f.createImport(f.Type().createReference(qn)));
+        }
+    }
+
+    /**
      * Normalize a reference to 'unknown.Unknown' when it appears as bare 'Unknown'
      * or inside the 'unknown.' package; makes it rely on an explicit import.
+     * Also handles all unknown.* types (not just Unknown).
      */
     private CtTypeReference<?> normalizeUnknownRef(CtTypeReference<?> t) {
         if (t == null) return null;
         String qn = safeQN(t);
         String simple = t.getSimpleName();
+        String UNKNOWN_PACKAGE = de.upb.sse.jess.generation.unknown.UnknownType.PACKAGE;
 
         if ("Unknown".equals(simple) && (qn.isEmpty() || !qn.contains("."))) {
             CtTypeReference<?> u = f.Type().createReference(
-                    de.upb.sse.jess.generation.unknown.UnknownType.CLASS
+                    UNKNOWN_PACKAGE + "." + de.upb.sse.jess.generation.unknown.UnknownType.CLASS
             );
             u.setImplicit(false);
             u.setSimplyQualified(false);   // simple name, rely on the explicit import
             return u;
         }
-        if (qn.startsWith("unknown.")) {
-                t.setImplicit(false);
+        if (qn.startsWith(UNKNOWN_PACKAGE + ".")) {
+            t.setImplicit(false);
             t.setSimplyQualified(false);   // simple name, rely on the explicit import
         }
-            return t;
+        return t;
     }
 
     /** Adds `import unknown.Unknown;` to the owner's CU once (idempotent). */
     private void ensureExplicitUnknownImport(CtType<?> owner) {
-        final String FQN = "unknown.Unknown";
+        final String UNKNOWN_PACKAGE = de.upb.sse.jess.generation.unknown.UnknownType.PACKAGE;
+        final String FQN = UNKNOWN_PACKAGE + "." + de.upb.sse.jess.generation.unknown.UnknownType.CLASS;
         CtCompilationUnit cu = f.CompilationUnit().getOrCreate(owner);
 
         boolean present = cu.getImports().stream().anyMatch(imp -> {
@@ -828,25 +988,207 @@ public final class SpoonStubber {
     }
 
     /**
+     * Ensure that all type references to unknown.* types have proper imports added.
+     * This fixes cases where types like IMHandler (unknown.IMHandler) are referenced
+     * but the import statement is missing or malformed.
+     */
+    public void ensureUnknownPackageImports() {
+        CtModel model = f.getModel();
+        getSliceTypes(model).forEach(t -> {
+            try {
+                spoon.reflect.declaration.CtCompilationUnit cu = f.CompilationUnit().getOrCreate(t);
+                if (cu == null) return;
+                
+                String typePkg = t.getPackage() != null ? t.getPackage().getQualifiedName() : "";
+                
+                // Find all type references to unknown.* types
+                Set<String> unknownTypeFqns = new HashSet<>();
+                
+                // Check superclass (extends clause) - this is often where the issue occurs
+                if (t instanceof CtClass) {
+                    CtClass<?> cls = (CtClass<?>) t;
+                    CtTypeReference<?> superclass = cls.getSuperclass();
+                    if (superclass != null) {
+                        // Check the raw type (without generics)
+                        try {
+                            String superQn = superclass.getQualifiedName();
+                            if (superQn == null || superQn.isEmpty()) {
+                                // Try to get it from the declaration
+                                CtType<?> superDecl = superclass.getTypeDeclaration();
+                                if (superDecl != null) {
+                                    superQn = superDecl.getQualifiedName();
+                                }
+                            }
+                            // If still empty, check if it's a simple name that should be unknown.*
+                            if ((superQn == null || superQn.isEmpty()) || 
+                                (!superQn.contains(".") && superclass.getSimpleName() != null)) {
+                                String simple = superclass.getSimpleName();
+                                // Check if this type exists in unknown package
+                                CtType<?> unknownType = f.Type().get(UNKNOWN_PACKAGE + "." + simple);
+                                if (unknownType != null) {
+                                    superQn = UNKNOWN_PACKAGE + "." + simple;
+                                    // Fix the reference
+                                    superclass.setPackage(f.Package().createReference(UNKNOWN_PACKAGE));
+                                    superclass.setImplicit(false);
+                                    superclass.setSimplyQualified(false);
+                                }
+                            }
+                            if (superQn != null && superQn.startsWith(UNKNOWN_PACKAGE + ".") && !superQn.equals(UNKNOWN_PACKAGE + "." + UNKNOWN_CLASS)) {
+                                unknownTypeFqns.add(superQn);
+                            }
+                        } catch (Throwable ignored) {}
+                    }
+                }
+                
+                // Also check all type references in the type
+                t.getElements(e -> e instanceof CtTypeReference<?>).forEach(refEl -> {
+                    CtTypeReference<?> ref = (CtTypeReference<?>) refEl;
+                    String qn = safeQN(ref);
+                    // If qn is empty or doesn't contain '.', check if it should be unknown.*
+                    if ((qn == null || qn.isEmpty() || !qn.contains(".")) && ref.getSimpleName() != null) {
+                        String simple = ref.getSimpleName();
+                        // Check if this type exists in unknown package
+                        try {
+                            CtType<?> unknownType = f.Type().get(UNKNOWN_PACKAGE + "." + simple);
+                            if (unknownType != null) {
+                                qn = UNKNOWN_PACKAGE + "." + simple;
+                                // Fix the reference
+                                ref.setPackage(f.Package().createReference(UNKNOWN_PACKAGE));
+                                ref.setImplicit(false);
+                                ref.setSimplyQualified(false);
+                            }
+                        } catch (Throwable ignored) {}
+                    }
+                    if (qn != null && qn.startsWith(UNKNOWN_PACKAGE + ".") && !qn.equals(UNKNOWN_PACKAGE + "." + UNKNOWN_CLASS)) {
+                        unknownTypeFqns.add(qn);
+                    }
+                });
+                
+                // First, remove any invalid imports (imports without package names)
+                cu.getImports().removeIf(imp -> {
+                    try {
+                        if (imp.getImportKind() == spoon.reflect.declaration.CtImportKind.TYPE) {
+                            var ref = imp.getReference();
+                            if (ref instanceof CtTypeReference) {
+                                String impQn = ((CtTypeReference<?>) ref).getQualifiedName();
+                                // Remove imports that don't have a package (invalid)
+                                if (impQn == null || impQn.isEmpty() || !impQn.contains(".")) {
+                                    return true;
+                                }
+                            }
+                        }
+                    } catch (Throwable ignored) {}
+                    return false;
+                });
+                
+                // Add imports for unknown.* types (only if not in same package)
+                for (String fqn : unknownTypeFqns) {
+                    if (fqn.startsWith(UNKNOWN_PACKAGE + ".") && !typePkg.equals(UNKNOWN_PACKAGE)) {
+                        // Check if import already exists
+                        boolean exists = cu.getImports().stream().anyMatch(imp -> {
+                            try {
+                                if (imp.getImportKind() == spoon.reflect.declaration.CtImportKind.TYPE) {
+                                    var ref = imp.getReference();
+                                    if (ref instanceof CtTypeReference) {
+                                        String impQn = ((CtTypeReference<?>) ref).getQualifiedName();
+                                        return fqn.equals(impQn);
+                                    }
+                                }
+                            } catch (Throwable ignored) {}
+                            return false;
+                        });
+                        
+                        if (!exists) {
+                            try {
+                                CtTypeReference<?> ref = f.Type().createReference(fqn);
+                                if (ref != null) {
+                                    cu.getImports().add(f.createImport(ref));
+                                }
+                            } catch (Throwable ignored) {}
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {}
+        });
+    }
+    
+    /**
      * Inspect model usages of a type FQN to infer maximum number of generic type arguments.
      * Only scans slice types for performance.
      * @return maximum arity observed (0 if none)
      */
     private int inferGenericArityFromUsages(String fqn) {
         String simple = fqn.substring(fqn.lastIndexOf('.') + 1);
+        String pkg = fqn.contains(".") ? fqn.substring(0, fqn.lastIndexOf('.')) : "";
         int max = 0;
         
         // Only scan slice types for performance
         Collection<CtType<?>> sliceTypes = getSliceTypes(f.getModel());
         for (CtType<?> sliceType : sliceTypes) {
+            // Check superclass (extends clause) - this is critical for generic detection
+            if (sliceType instanceof CtClass) {
+                CtClass<?> cls = (CtClass<?>) sliceType;
+                CtTypeReference<?> superclass = cls.getSuperclass();
+                if (superclass != null) {
+                    String qn = safeQN(superclass);
+                    String sn = superclass.getSimpleName();
+                    
+                    // Match if:
+                    // 1. Exact FQN match
+                    // 2. Simple name matches AND (qn is empty OR qn equals simple name OR qn equals fqn)
+                    //    This handles cases where the reference doesn't have a package set
+                    // 3. Also check if the type exists in the model with the expected FQN
+                    boolean sameType = fqn.equals(qn) 
+                            || (simple.equals(sn) && (qn.isEmpty() || qn.equals(simple) || qn.equals(fqn)));
+                    
+                    // If simple name matches but qn doesn't match fqn, check if type exists in model
+                    if (!sameType && simple.equals(sn)) {
+                        try {
+                            CtType<?> typeInModel = f.Type().get(fqn);
+                            if (typeInModel != null) {
+                                sameType = true;
+                            }
+                        } catch (Throwable ignored) {}
+                    }
+                    
+                    if (sameType) {
+                        try {
+                            // Check actual type arguments
+                            List<CtTypeReference<?>> typeArgs = superclass.getActualTypeArguments();
+                            int n = (typeArgs != null) ? typeArgs.size() : 0;
+                            if (n > max) {
+                                max = n;
+                                System.out.println("[SpoonStubber] DEBUG: Found generic usage of " + fqn + " with " + n + " type argument(s) in superclass of " + sliceType.getQualifiedName());
+                            }
+                        } catch (Throwable ignored) {}
+                    } else {
+                        // DEBUG: Log when we're not matching
+                        System.out.println("[SpoonStubber] DEBUG: Not matching superclass: qn=" + qn + ", sn=" + sn + ", fqn=" + fqn + ", simple=" + simple);
+                    }
+                }
+            }
+            
+            // Check all type references in the type
             for (var el : sliceType.getElements(e -> e instanceof CtTypeReference<?>)) {
                 CtTypeReference<?> ref = (CtTypeReference<?>) el;
-                String qn = safeQN(ref);              // empty if unknown
+                String qn = safeQN(ref);              // empty if unknown, or simple name if no package
                 String sn = ref.getSimpleName();      // never null for normal refs
 
-                boolean sameType =
-                        fqn.equals(qn)                    // exact FQN match
-                                || (qn.isEmpty() && simple.equals(sn)); // unresolved simple-name match
+                // Match if:
+                // 1. Exact FQN match
+                // 2. Simple name matches AND (qn is empty OR qn equals simple name OR qn equals fqn)
+                boolean sameType = fqn.equals(qn) 
+                        || (simple.equals(sn) && (qn.isEmpty() || qn.equals(simple) || qn.equals(fqn)));
+
+                // If simple name matches but qn doesn't match fqn, check if type exists in model
+                if (!sameType && simple.equals(sn)) {
+                    try {
+                        CtType<?> typeInModel = f.Type().get(fqn);
+                        if (typeInModel != null) {
+                            sameType = true;
+                        }
+                    } catch (Throwable ignored) {}
+                }
 
                 if (!sameType) continue;
 
@@ -982,35 +1324,6 @@ public final class SpoonStubber {
         }
 
         return false;
-    }
-
-
-
-    /** Returns an existing type if present. If missing, creates an interface when preferInterface==true, else a class. */
-    private CtType<?> ensurePublicOwner(CtTypeReference<?> ref, boolean preferInterface) {
-        String qn = safeQN(ref);
-        String pkg = "";
-        String name = "Missing";
-        int i = (qn != null ? qn.lastIndexOf('.') : -1);
-        if (qn != null && !qn.isEmpty()) {
-            if (i >= 0) { pkg = qn.substring(0, i); name = qn.substring(i + 1); }
-            else { pkg = "unknown"; name = qn; }
-        }
-        CtPackage p = f.Package().getOrCreate(pkg);
-        CtType<?> ex = p.getType(name);
-        if (ex != null) return ex;
-
-        if (preferInterface) {
-            CtInterface<?> itf = f.Interface().create(p, name);
-            itf.addModifier(ModifierKind.PUBLIC);
-            createdTypes.add((pkg.isEmpty() ? name : (pkg + "." + name)));
-            return itf;
-        } else {
-            CtClass<?> cls = f.Class().create(p, name);
-            cls.addModifier(ModifierKind.PUBLIC);
-            createdTypes.add((pkg.isEmpty() ? name : (pkg + "." + name)));
-            return cls;
-        }
     }
 
     public void finalizeRepeatableAnnotations() {

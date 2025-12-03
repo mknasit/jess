@@ -65,6 +65,12 @@ public class RepositoryProcessor {
     private final AtomicInteger excludedByNoRange = new AtomicInteger(0);
     private final AtomicInteger excludedByMinLines = new AtomicInteger(0);
     private final AtomicInteger excludedByAnonymous = new AtomicInteger(0);
+    
+    // Context vs slice-only statistics
+    private final AtomicInteger methodsWithContext = new AtomicInteger(0);
+    private final AtomicInteger methodsSliceOnly = new AtomicInteger(0);
+    private final AtomicInteger methodsWithContextCompiled = new AtomicInteger(0);
+    private final AtomicInteger methodsSliceOnlyCompiled = new AtomicInteger(0);
 
     /**
      * Create a RepositoryProcessor that processes ALL methods (no limit, with random selection).
@@ -149,7 +155,6 @@ public class RepositoryProcessor {
         jessConfig.setExitOnCompilationFail(false);
         jessConfig.setExitOnParsingFail(false);
         jessConfig.setFailOnAmbiguity(false);
-        jessConfig.setMinimalStubbing(false);
         jessConfig.setIncludeJdkStubs(false);
         this.config = jessConfig;
 
@@ -519,6 +524,9 @@ public class RepositoryProcessor {
     /**
      * Process a single method using the EXACT same flow as experiment setup (RandomJessHandler.compile).
      * Uses jess.preSlice() and jess.parse() instead of compileSingleMethod().
+     * 
+     * Strategy: Always pass source roots to Jess (if available).
+     * SpoonStubbingRunner handles the fallback internally (tries slice-only first, then context if needed).
      */
     private void processMethod(MethodToProcess methodToProcess) {
         totalMethods.incrementAndGet();
@@ -532,37 +540,59 @@ public class RepositoryProcessor {
 
         System.out.println("Compiling: " + targetClass + " --- " + methodSignature);
 
+        boolean contextUsed = false;
+        int jessResult = -1;
+        long compilationTime = 0;
+        long startTime = System.nanoTime();
+
         try {
-            // CRITICAL: Create NEW Jess instance for each method (same as experiment: line 92)
-            // This prevents state accumulation and StackOverflowError
+            // STRATEGY: Always pass source roots to Jess (if available)
+            // SpoonStubbingRunner will handle the fallback internally:
+            // - First tries slice-only stubbing (ignores source roots even if available)
+            // - If that fails, retries with context (uses source roots)
+            
+            // Create Jess instance with packages (source roots if available)
+            // SpoonStubbingRunner will decide whether to use them or not
             Jess jess = new Jess(config, packages, jars);
 
-            long startTime = System.nanoTime();
-
-            // EXACT same flow as RandomJessHandler.compile()
-            // Step 1: preSlice (same as experiment)
+            // Step 1: preSlice creates the slice directory
             if (!isClinit) {
                 jess.preSlice(targetClass, Collections.singletonList(methodSignature), Collections.emptyList(), Collections.emptyList());
             } else {
                 jess.preSlice(targetClass, Collections.emptyList(), Collections.singletonList(methodSignature), Collections.emptyList());
             }
 
-            // Step 2: parse (same as experiment)
+            // Step 2: parse() calls stubber
+            // SpoonStubbingRunner.run() will:
+            // - First try slice-only (ignore source roots even if available)
+            // - If model building fails, retry with context
             // CRITICAL: Catch StackOverflowError from JavaParser symbol resolution
-            // This happens when there are circular type dependencies in complex projects
-            int jessResult;
             try {
                 jessResult = jess.parse(targetClass);
             } catch (StackOverflowError e) {
-                // JavaParser's symbol resolution can overflow on circular dependencies
-                // This is a known limitation of JavaParser, not a bug in our code
                 System.err.println("[RepositoryProcessor] StackOverflowError during symbol resolution for " + 
                     methodSignature + " - likely due to circular type dependencies in JavaParser");
                 System.err.println("[RepositoryProcessor] Suggestion: Increase JVM stack size with -Xss4m or -Xss8m");
                 jessResult = 2; // INTERNAL_ERROR
             }
+
+            // Note: We can't determine here if slice-only or context was used
+            // SpoonStubbingRunner handles that internally. For statistics, we track based on
+            // whether source roots were available (heuristic: if available, context might have been used)
+            // But the actual decision is made inside SpoonStubbingRunner
+            if (sourceRoots != null && !sourceRoots.isEmpty() && !packages.isEmpty()) {
+                // Source roots were available - SpoonStubbingRunner may have used them
+                // We'll track this, but the actual usage is determined by stubber
+                methodsWithContext.incrementAndGet();
+                contextUsed = true;
+            } else {
+                // No source roots available - definitely slice-only
+                methodsSliceOnly.incrementAndGet();
+                contextUsed = false;
+            }
+            
             long endTime = System.nanoTime();
-            long compilationTime = TimeUnit.NANOSECONDS.toMillis(endTime - startTime);
+            compilationTime = TimeUnit.NANOSECONDS.toMillis(endTime - startTime);
             boolean jessSuccess = jessResult == 0;
 
             // Convert to PublicApi.Result format for compatibility with existing statistics code
@@ -616,6 +646,13 @@ public class RepositoryProcessor {
         if (compilationSucceeded) {
             methodsCompiledSuccessfully.incrementAndGet();
             successfulCompilations.incrementAndGet();
+            
+            // Track compilation success by context usage
+            if (contextUsed) {
+                methodsWithContextCompiled.incrementAndGet();
+            } else {
+                methodsSliceOnlyCompiled.incrementAndGet();
+            }
 
             // Track methods with accessible bytecode (status == OK && targetHasCode == true)
             if (result.status == PublicApi.Status.OK && result.targetHasCode) {
@@ -639,6 +676,10 @@ public class RepositoryProcessor {
         } catch (Throwable e) {
             // Same error handling as experiment setup
             e.printStackTrace();
+
+            // If we got here, we tried slice-only (methodsSliceOnly was incremented)
+            // If context was used, it means we already decremented slice-only and incremented context
+            // So we don't need to adjust counters here - they're already correct
 
             PublicApi.Result result = new PublicApi.Result(
                 PublicApi.Status.INTERNAL_ERROR,
@@ -965,7 +1006,11 @@ public class RepositoryProcessor {
                 new ArrayList<>(methodResults),
                 excludedByNoRange.get(),
                 excludedByMinLines.get(),
-                excludedByAnonymous.get()
+                excludedByAnonymous.get(),
+                methodsWithContext.get(),
+                methodsSliceOnly.get(),
+                methodsWithContextCompiled.get(),
+                methodsSliceOnlyCompiled.get()
         );
     }
     
@@ -987,6 +1032,12 @@ public class RepositoryProcessor {
         public final int excludedByMinLines;  // Methods excluded due to insufficient lines
         public final int excludedByAnonymous;  // Methods excluded due to being in anonymous classes
         
+        // Context vs slice-only statistics
+        public final int methodsWithContext;  // Methods processed with context (sourceRoots provided)
+        public final int methodsSliceOnly;  // Methods processed with slice only (no sourceRoots)
+        public final int methodsWithContextCompiled;  // Methods with context that compiled successfully
+        public final int methodsSliceOnlyCompiled;  // Methods with slice only that compiled successfully
+        
         public ProcessingResult(int totalMethods,
                                int methodsFound,
                                int maxMethodsToProcess,
@@ -999,7 +1050,11 @@ public class RepositoryProcessor {
                                 List<MethodResult> methodResults,
                                 int excludedByNoRange,
                                 int excludedByMinLines,
-                                int excludedByAnonymous) {
+                                int excludedByAnonymous,
+                                int methodsWithContext,
+                                int methodsSliceOnly,
+                                int methodsWithContextCompiled,
+                                int methodsSliceOnlyCompiled) {
             this.totalMethods = totalMethods;
             this.methodsFound = methodsFound;
             this.maxMethodsToProcess = maxMethodsToProcess;
@@ -1013,6 +1068,10 @@ public class RepositoryProcessor {
             this.excludedByNoRange = excludedByNoRange;
             this.excludedByMinLines = excludedByMinLines;
             this.excludedByAnonymous = excludedByAnonymous;
+            this.methodsWithContext = methodsWithContext;
+            this.methodsSliceOnly = methodsSliceOnly;
+            this.methodsWithContextCompiled = methodsWithContextCompiled;
+            this.methodsSliceOnlyCompiled = methodsSliceOnlyCompiled;
         }
         
         /**

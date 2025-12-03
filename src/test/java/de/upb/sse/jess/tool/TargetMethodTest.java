@@ -28,12 +28,13 @@ public class TargetMethodTest {
     }
 
     @Test
-    @DisplayName("Test WFCMessage.getDeviceTokenBytes() through whole Jess pipeline")
+    @DisplayName("Run target method")
     void testWFCMessageGetDeviceTokenBytes() throws IOException {
         // File path
-        String classPath = "/Users/mitul/Documents/study/Thesis/partial compilation/jess/src/test/resources/project/server/common/src/main/java/cn/wildfirechat/proto/WFCMessage.java";
-        String methodSignature = "getDeviceTokenBytes()";
-        
+        String classPath = "/Users/mitul/Documents/study/Thesis/partial compilation/jess/src/test/resources/project/server/broker/src/main/java/win/liyufan/im/HttpUtils.java";
+        String methodSignature = "httpJsonPost(String, String, HttpPostType)";
+
+
         System.out.println("\n==================================================================================");
         System.out.println("1. SOURCE CODE OF METHOD (What JavaParser Got)");
         System.out.println("==================================================================================");
@@ -134,15 +135,48 @@ public class TargetMethodTest {
         System.out.println("  2 = Parsing Failed");
         
         if (result == 1) {
+            System.out.println("\n✗ COMPILATION FAILED");
+            System.out.println("--------------------------------------------------------------------------------");
             String errors = jess.getLastCompilationErrors();
             if (errors != null && !errors.isEmpty()) {
-                System.out.println("\nCOMPILATION ERRORS:");
-                System.out.println(errors);
+                System.out.println("COMPILATION ERRORS:");
+                System.out.println("--------------------------------------------------------------------------------");
+                // Format errors for better readability
+                String[] errorLines = errors.split("\n");
+                for (int i = 0; i < errorLines.length; i++) {
+                    String line = errorLines[i];
+                    // Highlight error lines
+                    if (line.contains("error:") || line.contains("Error:") || line.contains("cannot find symbol") 
+                        || line.contains("package") || line.contains("does not exist") 
+                        || line.contains("actual and formal argument lists differ")
+                        || line.contains("symbol:") || line.contains("location:")) {
+                        System.out.println("  ✗ " + line);
+                    } else if (line.trim().isEmpty()) {
+                        System.out.println();
+                    } else {
+                        System.out.println("    " + line);
+                    }
+                }
+                System.out.println("--------------------------------------------------------------------------------");
             } else {
-                System.out.println("\n(No detailed error messages captured)");
+                System.out.println("(No detailed error messages captured)");
+                System.out.println("  • Check the gen/ directory for generated code");
+                System.out.println("  • Try compiling manually: javac -cp <classpath> gen/**/*.java");
             }
         } else if (result == 0) {
-            System.out.println("\n✓ Compilation successful!");
+            System.out.println("\n✓ COMPILATION SUCCESSFUL");
+            System.out.println("--------------------------------------------------------------------------------");
+            System.out.println("  • All code compiled without errors");
+            if (stubsWereGenerated) {
+                System.out.println("  • Stubs were generated and used successfully");
+            } else {
+                System.out.println("  • No stubs were needed - all dependencies resolved");
+            }
+        } else if (result == 2) {
+            System.out.println("\n✗ PARSING FAILED");
+            System.out.println("--------------------------------------------------------------------------------");
+            System.out.println("  • Failed to parse the source file");
+            System.out.println("  • Check if the file path is correct and the file is valid Java code");
         }
         
         System.out.println("\n==================================================================================");

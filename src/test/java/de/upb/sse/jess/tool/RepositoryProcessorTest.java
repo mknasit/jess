@@ -244,6 +244,22 @@ public class RepositoryProcessorTest {
         System.out.println("  Failed Compilations: " + result.failedCompilations);
         System.out.println();
 
+        // Context vs slice-only statistics
+        System.out.println("CONTEXT VS SLICE-ONLY STATISTICS:");
+        System.out.println("  Methods Processed with Context: " + result.methodsWithContext);
+        System.out.println("  Methods Processed with Slice Only: " + result.methodsSliceOnly);
+        if (result.methodsWithContext > 0) {
+            double contextCompilationRate = (double) result.methodsWithContextCompiled / result.methodsWithContext * 100.0;
+            System.out.println("  Context Methods Compiled: " + result.methodsWithContextCompiled + 
+                             " / " + result.methodsWithContext + " (" + String.format("%.2f%%", contextCompilationRate) + ")");
+        }
+        if (result.methodsSliceOnly > 0) {
+            double sliceCompilationRate = (double) result.methodsSliceOnlyCompiled / result.methodsSliceOnly * 100.0;
+            System.out.println("  Slice-Only Methods Compiled: " + result.methodsSliceOnlyCompiled + 
+                             " / " + result.methodsSliceOnly + " (" + String.format("%.2f%%", sliceCompilationRate) + ")");
+        }
+        System.out.println();
+
         // Bytecode access statistics
         System.out.println("BYTECODE ACCESS STATISTICS:");
         System.out.println("  Methods with Accessible Bytecode: " + result.methodsWithAccessibleBytecode);
@@ -365,6 +381,25 @@ public class RepositoryProcessorTest {
                 content.append("Methods with Accessible Bytecode: ").append(result.methodsWithAccessibleBytecode).append("\n");
                 content.append("Bytecode Access Rate: ").append(String.format("%.2f%%", result.getBytecodeAccessRate())).append("\n");
                 content.append("Failed Compilations: ").append(result.failedCompilations).append("\n");
+                content.append("\n");
+                
+                // Context vs slice-only statistics
+                content.append("CONTEXT VS SLICE-ONLY STATISTICS:\n");
+                content.append("-".repeat(100)).append("\n");
+                content.append("Methods Processed with Context: ").append(result.methodsWithContext).append("\n");
+                content.append("Methods Processed with Slice Only: ").append(result.methodsSliceOnly).append("\n");
+                if (result.methodsWithContext > 0) {
+                    double contextCompilationRate = (double) result.methodsWithContextCompiled / result.methodsWithContext * 100.0;
+                    content.append("Context Methods Compiled: ").append(result.methodsWithContextCompiled)
+                           .append(" / ").append(result.methodsWithContext)
+                           .append(" (").append(String.format("%.2f%%", contextCompilationRate)).append(")\n");
+                }
+                if (result.methodsSliceOnly > 0) {
+                    double sliceCompilationRate = (double) result.methodsSliceOnlyCompiled / result.methodsSliceOnly * 100.0;
+                    content.append("Slice-Only Methods Compiled: ").append(result.methodsSliceOnlyCompiled)
+                           .append(" / ").append(result.methodsSliceOnly)
+                           .append(" (").append(String.format("%.2f%%", sliceCompilationRate)).append(")\n");
+                }
                 content.append("\n");
 
                 // Status breakdown with diagnostic information
