@@ -216,7 +216,7 @@ public class Jess {
             // Extract original file with adjusted imports
             ex.extract(getFullyQualifiedRootName(root), root);
             System.out.println("\n>> Using stubber: " + this.stubber.getClass().getSimpleName());
-            logger.info( "\n>> Using stubber:::::::::::::::::::::::::::::: " + this.stubber.getClass().getSimpleName());
+            logger.info( "\n>> Using stubber::::::::::::::::::::::::::::::V2.0:::" + this.stubber.getClass().getSimpleName());
             // Stub unresolvable types if not disabled
             if (!config.isDisableStubbing()) {
                 // Compile sliced files

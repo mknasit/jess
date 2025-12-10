@@ -26,6 +26,7 @@ public final class SpoonStubber {
     private final Factory f;
     private final java.nio.file.Path slicedSrcDir;
     private final Set<String> sliceTypeFqns;
+    private final Map<String, Map<String, String>> annotationAttributes; // RULE 4: Annotation attributes (FQN -> attrName -> attrType)
 
     private final Set<String> createdTypes  = new LinkedHashSet<>();
     private final List<String> createdFields = new ArrayList<>();
@@ -45,6 +46,7 @@ public final class SpoonStubber {
         this.f = f;
         this.slicedSrcDir = null;
         this.sliceTypeFqns = null;
+        this.annotationAttributes = new HashMap<>();
     }
     
     /** Create a stubber bound to a Spoon Factory with slice filtering. */
@@ -52,6 +54,15 @@ public final class SpoonStubber {
         this.f = f;
         this.slicedSrcDir = slicedSrcDir;
         this.sliceTypeFqns = sliceTypeFqns != null ? sliceTypeFqns : new HashSet<>();
+        this.annotationAttributes = new HashMap<>();
+    }
+    
+    /** Create a stubber with annotation attributes. */
+    public SpoonStubber(Factory f, java.nio.file.Path slicedSrcDir, Set<String> sliceTypeFqns, Map<String, Map<String, String>> annotationAttributes) { 
+        this.f = f;
+        this.slicedSrcDir = slicedSrcDir;
+        this.sliceTypeFqns = sliceTypeFqns != null ? sliceTypeFqns : new HashSet<>();
+        this.annotationAttributes = annotationAttributes != null ? annotationAttributes : new HashMap<>();
     }
 
     /* ======================================================================
@@ -185,7 +196,50 @@ public final class SpoonStubber {
                 CtAnnotationType<?> at = f.Annotation().create(packageObj, name);
                 at.addModifier(ModifierKind.PUBLIC);
 
+                // RULE 4: Add annotation attributes collected from usages
+                Map<String, String> attributes = annotationAttributes.get(qn);
+                if (attributes != null && !attributes.isEmpty()) {
+                    for (Map.Entry<String, String> attr : attributes.entrySet()) {
+                        String attrName = attr.getKey();
+                        String attrType = attr.getValue();
+                        
+                        // Skip if method already exists
+                        if (at.getMethods().stream().anyMatch(m -> attrName.equals(m.getSimpleName()))) {
+                            continue;
+                        }
+                        
+                        CtAnnotationMethod<?> am = f.Core().createAnnotationMethod();
+                        am.setSimpleName(attrName);
+                        
+                        // Set type based on inferred type
+                        CtTypeReference<?> typeRef;
+                        switch (attrType) {
+                            case "int":
+                                typeRef = f.Type().INTEGER_PRIMITIVE;
+                                break;
+                            case "double":
+                                typeRef = f.Type().DOUBLE_PRIMITIVE;
+                                break;
+                            case "boolean":
+                                typeRef = f.Type().BOOLEAN_PRIMITIVE;
+                                break;
+                            case "char":
+                                typeRef = f.Type().CHARACTER_PRIMITIVE;
+                                break;
+                            case "java.lang.String":
+                                typeRef = f.Type().STRING;
+                                break;
+                            default:
+                                typeRef = f.Type().STRING; // Default to String
+                        }
+                        am.setType(typeRef);
+                        at.addMethod(am);
+                        System.out.println("[SpoonStubber] DEBUG: Added annotation attribute: " + qn + "." + attrName + " : " + attrType);
+                    }
+                }
+                
                 // Add default element: String value();  (harmless if not used, but enables @Tag("x") pattern)
+                // Only add if "value" wasn't already added from attributes
                 if (at.getMethods().stream().noneMatch(m -> "value".equals(m.getSimpleName()))) {
                     CtAnnotationMethod<?> am = f.Core().createAnnotationMethod();
                     am.setSimpleName("value");

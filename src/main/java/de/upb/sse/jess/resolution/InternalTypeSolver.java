@@ -31,6 +31,9 @@ public class InternalTypeSolver {
                             return arg.calculateResolvedType().erasure().toDescriptor();
                         } catch (UnsolvedSymbolException e) {
                             return e.getName();
+                        } catch (StackOverflowError | OutOfMemoryError e) {
+                            // Prevent infinite recursion when resolving argument types
+                            return "unknown";
                         }
                     })
                     .collect(Collectors.toList());
@@ -53,6 +56,9 @@ public class InternalTypeSolver {
 
             if (matchingMethodDecOpt.isEmpty()) return null;
             return new JavaParserMethodDeclaration(matchingMethodDecOpt.get(), new CombinedTypeSolver());
+        } catch (StackOverflowError | OutOfMemoryError e) {
+            // Prevent infinite recursion in JavaParser symbol resolution
+            return null;
         } catch (Exception e) {
             return null;
         }

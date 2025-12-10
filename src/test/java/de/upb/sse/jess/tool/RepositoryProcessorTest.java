@@ -40,7 +40,7 @@ public class RepositoryProcessorTest {
 
     /** Project directory path (REQUIRED) */
     //private static final String PROJECT_DIR = "/Users/mitul/Documents/study/Thesis/partial compilation/JessTesting/src/test/resources/projects/im-server";
-  private static final String PROJECT_DIR = "/Users/mitul/Documents/study/Thesis/partial compilation/jess/src/test/resources/project/server";
+  private static final String PROJECT_DIR = "/Users/mitul/Documents/study/Thesis/partial compilation/jess/src/test/resources/project/lwjgl3";
 
     /**
      * Source root directories (OPTIONAL - leave null to auto-detect like experiment script)

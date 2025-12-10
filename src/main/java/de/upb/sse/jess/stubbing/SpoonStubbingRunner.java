@@ -547,7 +547,7 @@ public final class SpoonStubbingRunner implements Stubber {
         System.out.println("==================================================================================\n");
 
         // 7) Generate stubs (separate handlers per kind)
-        SpoonStubber stubber = new SpoonStubber(f, slicedSrcDir, sliceTypeFqns);
+        SpoonStubber stubber = new SpoonStubber(f, slicedSrcDir, sliceTypeFqns, plans.annotationAttributes);
         int created = 0;
         created += stubber.applyTypePlans(plans.typePlans);// types (classes/interfaces/annotations)
         created += stubber.applyFieldPlans(plans.fieldPlans);         // fields

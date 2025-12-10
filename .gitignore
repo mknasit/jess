@@ -21,3 +21,4 @@ experiment_result
 *.zip
 /src/test/java/de/upb/sse/jess/tool/logs/
 /src/test/resources/logs/
+/gen/

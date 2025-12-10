@@ -22,6 +22,9 @@ public class RobustResolver {
     public static ResolvedType tryResolve(Type type) {
         try {
             return type.resolve();
+        } catch (StackOverflowError | OutOfMemoryError e) {
+            // Prevent infinite recursion in JavaParser symbol resolution
+            return null;
         } catch (Exception e) {
             return null;
         }
@@ -31,6 +34,9 @@ public class RobustResolver {
     public static ResolvedType tryResolve(Expression exp) {
         try {
             return exp.calculateResolvedType();
+        } catch (StackOverflowError | OutOfMemoryError e) {
+            // Prevent infinite recursion in JavaParser symbol resolution
+            return null;
         } catch (Exception e) {
             return null;
         }
@@ -39,6 +45,9 @@ public class RobustResolver {
     public static ResolvedType tryResolve(ClassOrInterfaceType cit) {
         try {
             return cit.resolve();
+        } catch (StackOverflowError | OutOfMemoryError e) {
+            // Prevent infinite recursion in JavaParser symbol resolution
+            return null;
         } catch (Exception e) {
             return null;
         }
@@ -47,6 +56,9 @@ public class RobustResolver {
     public static ResolvedValueDeclaration tryResolve(FieldAccessExpr fae) {
         try {
             return fae.resolve();
+        } catch (StackOverflowError | OutOfMemoryError e) {
+            // Prevent infinite recursion in JavaParser symbol resolution
+            return null;
         } catch (Exception e) {
             return null;
         }
@@ -55,6 +67,9 @@ public class RobustResolver {
     public static ResolvedValueDeclaration tryResolve(FieldDeclaration fd) {
         try {
             return fd.resolve();
+        } catch (StackOverflowError | OutOfMemoryError e) {
+            // Prevent infinite recursion in JavaParser symbol resolution
+            return null;
         } catch (Exception e) {
             return null;
         }
@@ -63,6 +78,9 @@ public class RobustResolver {
     public static ResolvedValueDeclaration tryResolve(NameExpr ne) {
         try {
             return ne.resolve();
+        } catch (StackOverflowError | OutOfMemoryError e) {
+            // Prevent infinite recursion in JavaParser symbol resolution
+            return null;
         } catch (Exception e) {
             return null;
         }
@@ -74,6 +92,10 @@ public class RobustResolver {
 //            System.out.println(mce.getArguments());
         try {
             return mce.resolve();
+        } catch (StackOverflowError | OutOfMemoryError e) {
+            // Prevent infinite recursion in JavaParser symbol resolution
+            // Try fallback resolution if available
+            return InternalTypeSolver.tryResolve(mce);
         } catch (Exception e) {
             return InternalTypeSolver.tryResolve(mce);
         }
@@ -82,6 +104,9 @@ public class RobustResolver {
     public static ResolvedMethodDeclaration tryResolve(MethodReferenceExpr mre) {
         try {
             return mre.resolve();
+        } catch (StackOverflowError | OutOfMemoryError e) {
+            // Prevent infinite recursion in JavaParser symbol resolution
+            return null;
         } catch (Exception e) {
             return null;
         }
@@ -90,6 +115,9 @@ public class RobustResolver {
     public static ResolvedMethodDeclaration tryResolve(MethodDeclaration md) {
         try {
             return md.resolve();
+        } catch (StackOverflowError | OutOfMemoryError e) {
+            // Prevent infinite recursion in JavaParser symbol resolution
+            return null;
         } catch (Exception e) {
             return null;
         }
@@ -98,6 +126,9 @@ public class RobustResolver {
     public static ResolvedConstructorDeclaration tryResolve(ConstructorDeclaration cd) {
         try {
             return cd.resolve();
+        } catch (StackOverflowError | OutOfMemoryError e) {
+            // Prevent infinite recursion in JavaParser symbol resolution
+            return null;
         } catch (Exception e) {
             return null;
         }
@@ -106,6 +137,9 @@ public class RobustResolver {
     public static ResolvedConstructorDeclaration tryResolve(ObjectCreationExpr oce) {
         try {
             return oce.resolve();
+        } catch (StackOverflowError | OutOfMemoryError e) {
+            // Prevent infinite recursion in JavaParser symbol resolution
+            return null;
         } catch (Exception e) {
             return null;
         }
@@ -114,6 +148,9 @@ public class RobustResolver {
     public static ResolvedConstructorDeclaration tryResolve(ExplicitConstructorInvocationStmt ecis) {
         try {
             return ecis.resolve();
+        } catch (StackOverflowError | OutOfMemoryError e) {
+            // Prevent infinite recursion in JavaParser symbol resolution
+            return null;
         } catch (Exception e) {
             return null;
         }
@@ -122,6 +159,9 @@ public class RobustResolver {
     public static ResolvedAnnotationDeclaration tryResolve(SingleMemberAnnotationExpr smae) {
         try {
             return smae.resolve();
+        } catch (StackOverflowError | OutOfMemoryError e) {
+            // Prevent infinite recursion in JavaParser symbol resolution
+            return null;
         } catch (Exception e) {
             return null;
         }
@@ -130,6 +170,9 @@ public class RobustResolver {
     public static ResolvedEnumConstantDeclaration tryResolve(EnumConstantDeclaration ecd) {
         try {
             return ecd.resolve();
+        } catch (StackOverflowError | OutOfMemoryError e) {
+            // Prevent infinite recursion in JavaParser symbol resolution
+            return null;
         } catch (Exception e) {
             return null;
         }
@@ -138,6 +181,9 @@ public class RobustResolver {
     public static ResolvedReferenceTypeDeclaration tryGetDeclaringType(ResolvedMethodDeclaration rmd) {
         try {
             return rmd.declaringType();
+        } catch (StackOverflowError | OutOfMemoryError e) {
+            // Prevent infinite recursion in JavaParser symbol resolution
+            return null;
         } catch (Exception e) {
             return null;
         }
@@ -146,6 +192,9 @@ public class RobustResolver {
     public static ResolvedTypeDeclaration tryGetDeclaringType(ResolvedFieldDeclaration rfd) {
         try {
             return rfd.declaringType();
+        } catch (StackOverflowError | OutOfMemoryError e) {
+            // Prevent infinite recursion in JavaParser symbol resolution
+            return null;
         } catch (Exception e) {
             return null;
         }
@@ -154,6 +203,9 @@ public class RobustResolver {
     public static ResolvedReferenceTypeDeclaration tryGetDeclaringType(ResolvedConstructorDeclaration rcd) {
         try {
             return rcd.declaringType();
+        } catch (StackOverflowError | OutOfMemoryError e) {
+            // Prevent infinite recursion in JavaParser symbol resolution
+            return null;
         } catch (Exception e) {
             return null;
         }
@@ -164,6 +216,9 @@ public class RobustResolver {
     public static String tryDescribe(ResolvedType rt) {
         try {
             return rt.describe();
+        } catch (StackOverflowError | OutOfMemoryError e) {
+            // Prevent infinite recursion in JavaParser symbol resolution
+            return null;
         } catch (Exception e) {
             return null;
         }
@@ -172,6 +227,9 @@ public class RobustResolver {
     public static List<ResolvedReferenceType> tryResolveAllInterfacesExtended(ResolvedInterfaceDeclaration rid) {
         try {
             return rid.getAllInterfacesExtended();
+        } catch (StackOverflowError | OutOfMemoryError e) {
+            // Prevent infinite recursion in JavaParser symbol resolution
+            return new ArrayList<>();
         } catch (Exception e) {
             return new ArrayList<>();
         }
@@ -180,6 +238,9 @@ public class RobustResolver {
     public static Optional<ResolvedReferenceType> tryResolveSuperClass(ResolvedClassDeclaration rcd) {
         try {
             return rcd.getSuperClass();
+        } catch (StackOverflowError | OutOfMemoryError e) {
+            // Prevent infinite recursion in JavaParser symbol resolution
+            return Optional.empty();
         } catch (Exception e) {
             return Optional.empty();
         }
@@ -188,6 +249,9 @@ public class RobustResolver {
     public static boolean tryIsFunctionalInterface(ResolvedReferenceTypeDeclaration rrtd) {
         try {
             return rrtd.isFunctionalInterface();
+        } catch (StackOverflowError | OutOfMemoryError e) {
+            // Prevent infinite recursion in JavaParser symbol resolution
+            return false;
         } catch (Exception e) {
             return false;
         }
@@ -196,6 +260,9 @@ public class RobustResolver {
     public static Set<MethodUsage> tryGetDeclaredMethods(ResolvedReferenceType type) {
         try {
             return type.getDeclaredMethods();
+        } catch (StackOverflowError | OutOfMemoryError e) {
+            // Prevent infinite recursion in JavaParser symbol resolution
+            return Collections.emptySet();
         } catch (Exception e) {
             return Collections.emptySet();
         }
@@ -204,6 +271,9 @@ public class RobustResolver {
     public static Set<ResolvedMethodDeclaration> tryGetDeclaredMethods(ResolvedReferenceTypeDeclaration type) {
         try {
             return type.getDeclaredMethods();
+        } catch (StackOverflowError | OutOfMemoryError e) {
+            // Prevent infinite recursion in JavaParser symbol resolution
+            return Collections.emptySet();
         } catch (Exception e) {
             return Collections.emptySet();
         }
@@ -238,6 +308,9 @@ public class RobustResolver {
     public static ResolvedType tryResolveParamType(ResolvedParameterDeclaration param) {
         try {
             return param.getType();
+        } catch (StackOverflowError | OutOfMemoryError e) {
+            // Prevent infinite recursion in JavaParser symbol resolution
+            return null;
         } catch (Exception e) {
             return null;
         }

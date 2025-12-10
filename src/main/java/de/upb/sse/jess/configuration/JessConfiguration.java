@@ -19,7 +19,7 @@ public class JessConfiguration {
     private boolean failOnAmbiguity = false;
     private boolean disableStubbing = false;
     private boolean includeJdkStubs = false; // Default to false - JDK types are available from JRE, stubs cause conflicts
-    public enum StubberKind { JESS, SPOON, SPOON_MINIMAL }
+    public enum StubberKind { JESS, SPOON }
 
     private StubberKind stubberKind = StubberKind.SPOON;
 
