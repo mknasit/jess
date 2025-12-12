@@ -2,6 +2,7 @@ package de.upb.sse.jess.stubbing.spoon.collector;
 
 import de.upb.sse.jess.configuration.JessConfiguration;
 import de.upb.sse.jess.exceptions.AmbiguityException;
+import de.upb.sse.jess.stubbing.SliceDescriptor;
 import de.upb.sse.jess.stubbing.spoon.plan.*;
 import spoon.reflect.CtModel;
 import spoon.reflect.code.*;
@@ -96,7 +97,12 @@ public final class SpoonCollector {
 
     private final Factory f;
     private final JessConfiguration cfg;
+    private final SliceDescriptor descriptor;  // Path-agnostic: uses descriptor instead of paths
+    
+    // Legacy fields for backward compatibility (deprecated, should not be used)
+    @Deprecated
     private final java.nio.file.Path slicedSrcDir;
+    @Deprecated
     private final Set<String> sliceTypeFqns;
 
     // Centralized unknown type FQN constant. (Do not rename or remove.)
@@ -109,35 +115,83 @@ public final class SpoonCollector {
      * ====================================================================== */
 
     /**
-     * Constructs a SpoonCollector bound to a Spoon Factory and the Jess configuration.
+     * Primary constructor: path-agnostic, uses SliceDescriptor.
      * @param f Factory
      * @param cfg Configuration
-     * @param slicedSrcDir The sliced source directory (only process types from here)
-     * @param sliceTypeFqns Set of FQNs for types in the slice (for filtering)
+     * @param descriptor SliceDescriptor describing the slice (null means process everything)
      */
+    public SpoonCollector(Factory f, JessConfiguration cfg, SliceDescriptor descriptor) {
+        this.f = f;
+        this.cfg = cfg;
+        this.descriptor = descriptor;
+        // Legacy fields for backward compatibility
+        this.slicedSrcDir = null;
+        this.sliceTypeFqns = descriptor != null ? descriptor.sliceTypeFqns : new HashSet<>();
+    }
+    
+    /**
+     * Legacy constructor for backward compatibility (deprecated).
+     * @deprecated Use {@link #SpoonCollector(Factory, JessConfiguration, SliceDescriptor)} instead
+     */
+    @Deprecated
     public SpoonCollector(Factory f, JessConfiguration cfg, java.nio.file.Path slicedSrcDir, Set<String> sliceTypeFqns) {
         this.f = f;
         this.cfg = cfg;
         this.slicedSrcDir = slicedSrcDir;
         this.sliceTypeFqns = sliceTypeFqns != null ? sliceTypeFqns : new HashSet<>();
+        this.descriptor = null;  // No descriptor in legacy mode
     }
 
     /**
-     * Legacy constructor for backward compatibility.
+     * Legacy constructor for backward compatibility (deprecated).
+     * @deprecated Use {@link #SpoonCollector(Factory, JessConfiguration, SliceDescriptor)} instead
      */
+    @Deprecated
     public SpoonCollector(Factory f, JessConfiguration cfg) {
         this(f, cfg, null, new HashSet<>());
     }
 
     /**
-     * Check if an element is from the slice directory (should be processed).
+     * Check if an element is from the slice (should be processed).
+     * PATH-AGNOSTIC: Uses SliceDescriptor instead of file paths.
      * An element is considered from the slice if:
-     * 1. Its source file is in the slice directory, OR
-     * 2. Its parent type (or any ancestor type) is a slice type
+     * 1. Its type's FQN is in the slice descriptor, OR
+     * 2. No descriptor is available (process everything for backward compat)
      */
     private boolean isFromSlice(CtElement element) {
+        // If no descriptor, process everything (backward compatibility or no filtering)
+        if (descriptor == null) {
+            // Fallback to legacy path-based check if legacy fields are set
+            if (slicedSrcDir != null && sliceTypeFqns != null && !sliceTypeFqns.isEmpty()) {
+                return isFromSliceLegacy(element);
+            }
+            return true; // No filtering info, process everything
+        }
+
+        // Path-agnostic check: use FQN from descriptor
+        CtType<?> type = element.getParent(CtType.class);
+        if (type != null) {
+            String typeFqn = type.getQualifiedName();
+            return descriptor.isSliceType(typeFqn);
+        }
+        
+        // If element has no parent type, check if it's a type itself
+        if (element instanceof CtType) {
+            String typeFqn = ((CtType<?>) element).getQualifiedName();
+            return descriptor.isSliceType(typeFqn);
+        }
+        
+        // Default: if we can't determine, process it (conservative)
+        return true;
+    }
+    
+    /**
+     * Legacy path-based check (deprecated, only used for backward compatibility).
+     */
+    @Deprecated
+    private boolean isFromSliceLegacy(CtElement element) {
         if (slicedSrcDir == null || sliceTypeFqns == null || sliceTypeFqns.isEmpty()) {
-            return true; // If no filtering info, process everything (backward compat)
+            return true;
         }
 
         // First check: is the element's file in the slice directory?
@@ -2005,12 +2059,14 @@ public final class SpoonCollector {
             // OPTIMIZATION: Iterate over slice types first, then get elements from each slice type
             // This avoids traversing all 594 types in the model
             Collection<CtType<?>> sliceTypes = getSliceTypes(model);
-            System.out.println("[SpoonCollector] DEBUG: getElementsFromSliceTypes - Found " + sliceTypes.size() + " slice types");
+            // Reduced verbosity: only log summary, not per-type details
+            // System.out.println("[SpoonCollector] DEBUG: getElementsFromSliceTypes - Found " + sliceTypes.size() + " slice types");
             
             for (CtType<?> sliceType : sliceTypes) {
                 try {
                     String typeName = sliceType.getQualifiedName();
-                    System.out.println("[SpoonCollector] DEBUG: Processing slice type: " + typeName);
+                    // Reduced verbosity: removed per-type logging to avoid spam
+                    // System.out.println("[SpoonCollector] DEBUG: Processing slice type: " + typeName);
                     
                     // Get all elements from this slice type, then filter with predicate
                     // This avoids type erasure issues with Filter<T>
@@ -2019,48 +2075,96 @@ public final class SpoonCollector {
                     final String debugTypeName = typeName; // Final copy for inner class
                     
                     try {
-                        // Get all elements first
-                        for (CtElement el : sliceType.getElements(new Filter<CtElement>() {
-                            @Override
-                            public boolean matches(CtElement element) {
-                                // Skip module elements
-                                if (element instanceof spoon.reflect.declaration.CtModule) {
-                                    return false;
+                        // Check if this is likely a very large generated class (protobuf, etc.)
+                        // These classes can have thousands of elements and cause performance issues
+                        boolean isLikelyLargeGeneratedClass = typeName.contains(".proto.") || 
+                                                             typeName.contains("WFCMessage");
+                        
+                        if (isLikelyLargeGeneratedClass) {
+                            // For very large protobuf classes, skip detailed element traversal
+                            // These classes are typically not part of the actual slice logic
+                            System.out.println("[SpoonCollector] DEBUG: Skipping detailed traversal of large generated class: " + typeName);
+                            // Still try to get elements, but with a strict limit
+                            int elementLimit = 1000; // Limit to prevent infinite loops
+                            int processed = 0;
+                            for (CtElement el : sliceType.getElements(new Filter<CtElement>() {
+                                @Override
+                                public boolean matches(CtElement element) {
+                                    if (element instanceof spoon.reflect.declaration.CtModule) {
+                                        return false;
+                                    }
+                                    return true;
                                 }
-                                allElementsCount.incrementAndGet();
-                                if (element instanceof CtInvocation) {
-                                    System.out.println("[SpoonCollector] DEBUG: Found CtInvocation in " + debugTypeName + ": " + element);
+                            })) {
+                                if (processed++ >= elementLimit) {
+                                    System.err.println("[SpoonCollector] WARNING: Type " + typeName + " exceeded element limit (" + elementLimit + "), stopping early");
+                                    break;
                                 }
-                                return true;
+                                try {
+                                    @SuppressWarnings("unchecked")
+                                    T typedElement = (T) el;
+                                    if (predicate.test(typedElement)) {
+                                        matchingElementsCount.incrementAndGet();
+                                        result.add(typedElement);
+                                    }
+                                } catch (ClassCastException e) {
+                                    // Element is not of type T, skip it
+                                }
                             }
-                        })) {
-                            // Now filter with the predicate
-                            try {
-                                @SuppressWarnings("unchecked")
-                                T typedElement = (T) el;
-                                if (predicate.test(typedElement)) {
-                                    matchingElementsCount.incrementAndGet();
-                                    result.add(typedElement);
+                            allElementsCount.set(processed);
+                        } else {
+                            // Get all elements first (for normal types)
+                            for (CtElement el : sliceType.getElements(new Filter<CtElement>() {
+                                @Override
+                                public boolean matches(CtElement element) {
+                                    // Skip module elements
+                                    if (element instanceof spoon.reflect.declaration.CtModule) {
+                                        return false;
+                                    }
+                                    allElementsCount.incrementAndGet();
+                                    // Removed verbose per-invocation logging to avoid spam
+                                    return true;
                                 }
-                            } catch (ClassCastException e) {
-                                // Element is not of type T, skip it
-                                // This is expected for elements that don't match the generic type
+                            })) {
+                                // Now filter with the predicate
+                                try {
+                                    @SuppressWarnings("unchecked")
+                                    T typedElement = (T) el;
+                                    if (predicate.test(typedElement)) {
+                                        matchingElementsCount.incrementAndGet();
+                                        result.add(typedElement);
+                                    }
+                                } catch (ClassCastException e) {
+                                    // Element is not of type T, skip it
+                                    // This is expected for elements that don't match the generic type
+                                }
                             }
                         }
                     } catch (Throwable e) {
-                        System.err.println("[SpoonCollector] DEBUG: Error processing elements: " + e.getMessage());
-                        e.printStackTrace();
+                        System.err.println("[SpoonCollector] DEBUG: Error processing elements in " + typeName + ": " + e.getMessage());
+                        // Don't print full stack trace for large types to avoid spam
+                        if (!typeName.contains("WFCMessage") && !typeName.contains(".proto.")) {
+                            e.printStackTrace();
+                        }
                     }
                     
-                    System.out.println("[SpoonCollector] DEBUG: Type " + typeName + " has " + allElementsCount.get() + " total elements, matched " + matchingElementsCount.get() + " with predicate");
+                    // Reduced verbosity: removed per-type summary logging to avoid spam
+                    // System.out.println("[SpoonCollector] DEBUG: Type " + typeName + " has " + allElementsCount.get() + " total elements, matched " + matchingElementsCount.get() + " with predicate");
                 } catch (Throwable e) {
-                    System.err.println("[SpoonCollector] DEBUG: Error processing slice type: " + e.getMessage());
-                    e.printStackTrace();
+                    // Only log errors for non-large types to avoid spam
+                    String typeName = "unknown";
+                    try {
+                        typeName = sliceType.getQualifiedName();
+                    } catch (Throwable ignored) {}
+                    if (!typeName.contains("WFCMessage") && !typeName.contains(".proto.")) {
+                        System.err.println("[SpoonCollector] DEBUG: Error processing slice type " + typeName + ": " + e.getMessage());
+                    }
                     // Skip types we can't process
                 }
             }
             
-            System.out.println("[SpoonCollector] DEBUG: getElementsFromSliceTypes returning " + result.size() + " elements");
+            // Reduced verbosity: only log summary once per call
+            // System.out.println("[SpoonCollector] DEBUG: getElementsFromSliceTypes returning " + result.size() + " elements");
         } catch (StackOverflowError e) {
             System.err.println("[SpoonCollector] StackOverflowError getting elements from slice types");
             // Return empty list on StackOverflowError

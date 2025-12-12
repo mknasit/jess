@@ -16,6 +16,7 @@ import de.upb.sse.jess.configuration.JessConfiguration;
 import de.upb.sse.jess.finder.PackageFinder;
 import de.upb.sse.jess.util.FileUtil;
 
+import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -546,6 +547,17 @@ public class RepositoryProcessor {
         long startTime = System.nanoTime();
 
         try {
+            // CRITICAL: Clean gen/ directory before processing each method to prevent stub conflicts
+            // When processing multiple methods sequentially, stubs from previous methods can cause conflicts:
+            // - Example: Method 1 creates IMExceptionEvent.java (class file)
+            // - Method 2 tries to create IMExceptionEvent/EventType.java (directory + file)
+            // - This causes "class clashes with package of same name" error
+            File genDir = new File(Jess.SRC_OUTPUT);
+            if (genDir.exists()) {
+                de.upb.sse.jess.util.FileUtil.deleteRecursively(genDir);
+            }
+            genDir.mkdirs(); // Recreate empty directory
+            
             // STRATEGY: Always pass source roots to Jess (if available)
             // SpoonStubbingRunner will handle the fallback internally:
             // - First tries slice-only stubbing (ignores source roots even if available)

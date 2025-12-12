@@ -5,7 +5,8 @@ import com.github.javaparser.ParseResult;
 import com.github.javaparser.ParserConfiguration;
 import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.Node;
-import com.github.javaparser.ast.body.TypeDeclaration;
+import com.github.javaparser.ast.body.*;
+import com.github.javaparser.ast.type.Type;
 import com.github.javaparser.symbolsolver.JavaSymbolSolver;
 import com.github.javaparser.symbolsolver.javaparsermodel.JavaParserFacade;
 import com.github.javaparser.symbolsolver.resolution.typesolvers.CombinedTypeSolver;
@@ -24,6 +25,7 @@ import de.upb.sse.jess.model.ResolutionInformation;
 import de.upb.sse.jess.model.stubs.ClassType;
 import de.upb.sse.jess.stats.StubbingStats;
 import de.upb.sse.jess.stubbing.JessStubberAdapter;
+import de.upb.sse.jess.stubbing.SliceDescriptor;
 import de.upb.sse.jess.stubbing.SpoonStubbingRunner;
 import de.upb.sse.jess.stubbing.Stubber;
 import de.upb.sse.jess.util.FileUtil;
@@ -63,6 +65,12 @@ public class Jess {
     private final List<Path> jarPaths = new ArrayList<>();
     private final Stubber stubber;
     private String lastCompilationErrors; // Store last compilation error messages
+    
+    // Target method info (stored when preSlice is called, used to build SliceDescriptor)
+    private List<String> lastMethodsToKeep = null;
+    private List<String> lastKeepClinit = null;
+    private List<String> lastKeepInit = null;
+    private String lastTargetClass = null;
 
     /**
      * Get the last compilation error messages (if any).
@@ -223,7 +231,16 @@ public class Jess {
                 boolean successfulPreCompilation = compile(targetClass, classOutput, true);
                 if (successfulPreCompilation) return 0;
 
-                int created = this.stubber.run(Paths.get(SRC_OUTPUT), this.jarPaths);
+                // Build SliceDescriptor from sliced types
+                SliceDescriptor sliceDescriptor = buildSliceDescriptor(types, root);
+                
+                // Pass descriptor to stubber (if it supports it)
+                if (stubber instanceof SpoonStubbingRunner) {
+                    ((SpoonStubbingRunner) stubber).run(Paths.get(SRC_OUTPUT), this.jarPaths, sliceDescriptor);
+                } else {
+                    // Fallback for non-Spoon stubbers
+                    int created = this.stubber.run(Paths.get(SRC_OUTPUT), this.jarPaths);
+                }
             }
 
             // Compile sliced files and capture errors
@@ -255,6 +272,12 @@ public class Jess {
     }
 
     public void preSlice(String targetClass, List<String> methodsToKeep, List<String> keepClinit, List<String> keepInit) throws IOException {
+        // Store target method info for later use in building SliceDescriptor
+        this.lastTargetClass = targetClass;
+        this.lastMethodsToKeep = methodsToKeep != null ? new ArrayList<>(methodsToKeep) : new ArrayList<>();
+        this.lastKeepClinit = keepClinit != null ? new ArrayList<>(keepClinit) : new ArrayList<>();
+        this.lastKeepInit = keepInit != null ? new ArrayList<>(keepInit) : new ArrayList<>();
+        
         Path targetClassPath = Paths.get(targetClass);
 
         ParserConfiguration parserConfig = new ParserConfiguration();
@@ -389,6 +412,110 @@ public class Jess {
         return (String) cu.findFirst(TypeDeclaration.class)
                 .flatMap(TypeDeclaration::getFullyQualifiedName)
                 .orElse("unknown.Root");
+    }
+    
+    /**
+     * Build a SliceDescriptor from the sliced CompilationUnits.
+     * Extracts all types, methods, fields, and constructors from the slice.
+     */
+    private SliceDescriptor buildSliceDescriptor(Map<String, CompilationUnit> types, CompilationUnit root) {
+        Set<String> sliceTypeFqns = new LinkedHashSet<>();
+        Map<String, List<SliceDescriptor.MethodSignatureDescriptor>> sliceMethods = new HashMap<>();
+        Map<String, List<String>> sliceFields = new HashMap<>();
+        Map<String, List<SliceDescriptor.MethodSignatureDescriptor>> sliceConstructors = new HashMap<>();
+        
+        // Extract all types and their members from the slice
+        for (Map.Entry<String, CompilationUnit> entry : types.entrySet()) {
+            String typeFqn = entry.getKey();
+            CompilationUnit cu = entry.getValue();
+            sliceTypeFqns.add(typeFqn);
+            
+            // Find all type declarations in this CompilationUnit
+            // Use getTypes() instead of findAll() to avoid type inference issues
+            for (TypeDeclaration<?> typeDecl : cu.getTypes()) {
+                String declFqn = typeDecl.getFullyQualifiedName().orElse(typeFqn);
+                
+                // Extract methods
+                List<MethodDeclaration> methods = typeDecl.getMethods();
+                List<SliceDescriptor.MethodSignatureDescriptor> methodSigs = new ArrayList<>();
+                for (MethodDeclaration method : methods) {
+                    List<String> paramTypes = method.getParameters().stream()
+                            .map(p -> p.getType().asString())
+                            .collect(Collectors.toList());
+                    methodSigs.add(new SliceDescriptor.MethodSignatureDescriptor(
+                            method.getNameAsString(), paramTypes));
+                }
+                if (!methodSigs.isEmpty()) {
+                    sliceMethods.put(declFqn, methodSigs);
+                }
+                
+                // Extract fields
+                List<FieldDeclaration> fields = typeDecl.getFields();
+                List<String> fieldNames = new ArrayList<>();
+                for (FieldDeclaration field : fields) {
+                    for (VariableDeclarator var : field.getVariables()) {
+                        fieldNames.add(var.getNameAsString());
+                    }
+                }
+                if (!fieldNames.isEmpty()) {
+                    sliceFields.put(declFqn, fieldNames);
+                }
+                
+                // Extract constructors
+                List<ConstructorDeclaration> constructors = typeDecl.getConstructors();
+                List<SliceDescriptor.MethodSignatureDescriptor> ctorSigs = new ArrayList<>();
+                for (ConstructorDeclaration ctor : constructors) {
+                    List<String> paramTypes = ctor.getParameters().stream()
+                            .map(p -> p.getType().asString())
+                            .collect(Collectors.toList());
+                    ctorSigs.add(new SliceDescriptor.MethodSignatureDescriptor(
+                            "<init>", paramTypes));
+                }
+                if (!ctorSigs.isEmpty()) {
+                    sliceConstructors.put(declFqn, ctorSigs);
+                }
+            }
+        }
+        
+        // Build target method descriptor
+        SliceDescriptor.TargetMethodDescriptor targetMethod = null;
+        String rootFqn = getFullyQualifiedRootName(root);
+        
+        if (lastMethodsToKeep != null && !lastMethodsToKeep.isEmpty()) {
+            // Parse the first method signature (e.g., "methodName(Type1, Type2)")
+            String methodSig = lastMethodsToKeep.get(0);
+            String methodName = methodSig.split("\\(")[0];
+            String paramsStr = methodSig.contains("(") ? methodSig.substring(methodSig.indexOf("(") + 1, methodSig.lastIndexOf(")")) : "";
+            List<String> paramTypes = paramsStr.isEmpty() ? new ArrayList<>() :
+                    Arrays.stream(paramsStr.split(","))
+                            .map(String::trim)
+                            .filter(s -> !s.isEmpty())
+                            .collect(Collectors.toList());
+            
+            targetMethod = new SliceDescriptor.TargetMethodDescriptor(
+                    rootFqn, methodName, paramTypes, false, false);
+        } else if (lastKeepClinit != null && !lastKeepClinit.isEmpty()) {
+            targetMethod = new SliceDescriptor.TargetMethodDescriptor(
+                    rootFqn, "<clinit>", new ArrayList<>(), true, false);
+        } else if (lastKeepInit != null && !lastKeepInit.isEmpty()) {
+            // Parse constructor signature
+            String ctorSig = lastKeepInit.get(0);
+            String paramsStr = ctorSig.contains("(") ? ctorSig.substring(ctorSig.indexOf("(") + 1, ctorSig.lastIndexOf(")")) : "";
+            List<String> paramTypes = paramsStr.isEmpty() ? new ArrayList<>() :
+                    Arrays.stream(paramsStr.split(","))
+                            .map(String::trim)
+                            .filter(s -> !s.isEmpty())
+                            .collect(Collectors.toList());
+            
+            targetMethod = new SliceDescriptor.TargetMethodDescriptor(
+                    rootFqn, "<init>", paramTypes, false, true);
+        } else {
+            // Fallback: use root class as target
+            targetMethod = new SliceDescriptor.TargetMethodDescriptor(
+                    rootFqn, "unknown", new ArrayList<>(), false, false);
+        }
+        
+        return new SliceDescriptor(targetMethod, sliceTypeFqns, sliceMethods, sliceFields, sliceConstructors);
     }
 
 

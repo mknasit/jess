@@ -1,6 +1,8 @@
 // de/upb/sse/jess/stubbing/spoon/generate/SpoonStubber.java
 package de.upb.sse.jess.stubbing.spoon.generate;
 
+import de.upb.sse.jess.configuration.JessConfiguration;
+import de.upb.sse.jess.stubbing.SliceDescriptor;
 import de.upb.sse.jess.stubbing.spoon.plan.*;
 import spoon.reflect.CtModel;
 import spoon.reflect.code.*;
@@ -24,8 +26,15 @@ public final class SpoonStubber {
      * ====================================================================== */
 
     private final Factory f;
+    private final JessConfiguration cfg;
+    private final SliceDescriptor descriptor;  // Path-agnostic: uses descriptor instead of paths
+    
+    // Legacy fields for backward compatibility (deprecated, should not be used)
+    @Deprecated
     private final java.nio.file.Path slicedSrcDir;
+    @Deprecated
     private final Set<String> sliceTypeFqns;
+    
     private final Map<String, Map<String, String>> annotationAttributes; // RULE 4: Annotation attributes (FQN -> attrName -> attrType)
 
     private final Set<String> createdTypes  = new LinkedHashSet<>();
@@ -41,25 +50,60 @@ public final class SpoonStubber {
      *                              CONSTRUCTION
      * ====================================================================== */
 
-    /** Create a stubber bound to a Spoon Factory. */
+    /**
+     * Primary constructor: path-agnostic, uses SliceDescriptor.
+     * @param f Factory
+     * @param cfg Configuration
+     * @param descriptor SliceDescriptor (null means no filtering)
+     * @param annotationAttributes Annotation attributes map
+     */
+    public SpoonStubber(Factory f, JessConfiguration cfg, SliceDescriptor descriptor, Map<String, Map<String, String>> annotationAttributes) {
+        this.f = f;
+        this.cfg = cfg;
+        this.descriptor = descriptor;
+        this.annotationAttributes = annotationAttributes != null ? annotationAttributes : new HashMap<>();
+        // Legacy fields for backward compatibility
+        this.slicedSrcDir = null;
+        this.sliceTypeFqns = descriptor != null ? descriptor.sliceTypeFqns : new HashSet<>();
+    }
+    
+    /**
+     * Legacy constructor (deprecated).
+     * @deprecated Use {@link #SpoonStubber(Factory, JessConfiguration, SliceDescriptor, Map)} instead
+     */
+    @Deprecated
     public SpoonStubber(Factory f) { 
         this.f = f;
+        this.cfg = null;
+        this.descriptor = null;
         this.slicedSrcDir = null;
         this.sliceTypeFqns = null;
         this.annotationAttributes = new HashMap<>();
     }
     
-    /** Create a stubber bound to a Spoon Factory with slice filtering. */
+    /**
+     * Legacy constructor (deprecated).
+     * @deprecated Use {@link #SpoonStubber(Factory, JessConfiguration, SliceDescriptor, Map)} instead
+     */
+    @Deprecated
     public SpoonStubber(Factory f, java.nio.file.Path slicedSrcDir, Set<String> sliceTypeFqns) { 
         this.f = f;
+        this.cfg = null;
+        this.descriptor = null;
         this.slicedSrcDir = slicedSrcDir;
         this.sliceTypeFqns = sliceTypeFqns != null ? sliceTypeFqns : new HashSet<>();
         this.annotationAttributes = new HashMap<>();
     }
     
-    /** Create a stubber with annotation attributes. */
+    /**
+     * Legacy constructor (deprecated).
+     * @deprecated Use {@link #SpoonStubber(Factory, JessConfiguration, SliceDescriptor, Map)} instead
+     */
+    @Deprecated
     public SpoonStubber(Factory f, java.nio.file.Path slicedSrcDir, Set<String> sliceTypeFqns, Map<String, Map<String, String>> annotationAttributes) { 
         this.f = f;
+        this.cfg = null;
+        this.descriptor = null;
         this.slicedSrcDir = slicedSrcDir;
         this.sliceTypeFqns = sliceTypeFqns != null ? sliceTypeFqns : new HashSet<>();
         this.annotationAttributes = annotationAttributes != null ? annotationAttributes : new HashMap<>();
@@ -802,11 +846,31 @@ public final class SpoonStubber {
     }
     
     /**
-     * Check if a type is from the slice directory.
+     * Check if a type is from the slice (path-agnostic).
+     * Uses SliceDescriptor instead of file paths.
      */
     private boolean isSliceType(CtType<?> type) {
+        // If no descriptor, process everything (backward compatibility or no filtering)
+        if (descriptor == null) {
+            // Fallback to legacy path-based check if legacy fields are set
+            if (slicedSrcDir != null && sliceTypeFqns != null && !sliceTypeFqns.isEmpty()) {
+                return isSliceTypeLegacy(type);
+            }
+            return true; // No filtering info, process everything
+        }
+        
+        // Path-agnostic check: use FQN from descriptor
+        String qn = type.getQualifiedName();
+        return qn != null && descriptor.isSliceType(qn);
+    }
+    
+    /**
+     * Legacy path-based check (deprecated, only used for backward compatibility).
+     */
+    @Deprecated
+    private boolean isSliceTypeLegacy(CtType<?> type) {
         if (slicedSrcDir == null || sliceTypeFqns == null || sliceTypeFqns.isEmpty()) {
-            return true; // If no filtering info, process everything (backward compat)
+            return true;
         }
         
         String qn = type.getQualifiedName();
@@ -828,7 +892,7 @@ public final class SpoonStubber {
     }
     
     /**
-     * Check if a type is from the slice directory (alias for isSliceType for clarity).
+     * Check if a type is from the slice (alias for isSliceType for clarity).
      */
     private boolean isFromSlice(CtType<?> type) {
         return isSliceType(type);
