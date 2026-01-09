@@ -4,6 +4,7 @@ import de.upb.sse.jess.configuration.JessConfiguration;
 import de.upb.sse.jess.exceptions.AmbiguityException;
 import de.upb.sse.jess.stubbing.SliceDescriptor;
 import de.upb.sse.jess.stubbing.spoon.plan.*;
+import de.upb.sse.jess.stubbing.spoon.context.ContextIndex;
 import spoon.reflect.CtModel;
 import spoon.reflect.code.*;
 import spoon.reflect.cu.SourcePosition;
@@ -44,7 +45,7 @@ public final class SpoonCollector {
      * ====================================================================== */
 
     /** Aggregates all plans found during collection. */
-    public static final class CollectResult {
+    public final class CollectResult {
         public final List<TypeStubPlan> typePlans = new ArrayList<>();
         public final List<FieldStubPlan> fieldPlans = new ArrayList<>();
         public final List<ConstructorStubPlan> ctorPlans = new ArrayList<>();
@@ -55,23 +56,58 @@ public final class SpoonCollector {
 
         // RULE 4: Track annotation attributes (annotation FQN -> attribute name -> attribute type)
         public final Map<String, Map<String, String>> annotationAttributes = new HashMap<>();
+        
+        // BUG CLASS 1 FIX: Store factory reference for checking if types exist in model
+        private Factory factory;
+        
+        public void setFactory(Factory factory) {
+            this.factory = factory;
+        }
 
         /**
          * Add a type plan only if it hasn't been added before (by FQN).
          * Also checks if a type with the same simple name already exists in a known package,
          * and if so, skips adding the unknown package version.
+         * 
+         * BUG CLASS 1 FIX: Also checks if the type already exists in the model before adding as missing.
          */
-        public void addTypePlanIfNew(TypeStubPlan plan) {
+        public void addTypePlanIfNew(TypeStubPlan plan, Factory factory) {
             String fqn = plan.qualifiedName;
             if (fqn == null || typePlanFqns.contains(fqn)) {
                 return; // Already added or invalid
             }
 
+            // Canonicalize FQN using ContextIndex if available (access outer class method)
+            String canonicalFqn = canonicalizeTypeFqn(fqn, null);
+            if (canonicalFqn == null) {
+                canonicalFqn = fqn; // Fallback
+            }
+            
+            // Check if canonicalized FQN already exists
+            if (typePlanFqns.contains(canonicalFqn)) {
+                return; // Already added (possibly with different FQN)
+            }
+
+            // BUG CLASS 1 FIX: Check if type already exists in the model (e.g., org.lwjgl.system.Checks)
+            // If it exists, it's not missing - don't add it as a missing type plan
+            Factory checkFactory = factory != null ? factory : this.factory;
+            if (checkFactory != null) {
+                try {
+                    CtType<?> existingType = checkFactory.Type().get(canonicalFqn);
+                    if (existingType != null) {
+                        System.out.println("[SpoonCollector] DEBUG: Type " + canonicalFqn + " already exists in model, skipping missing type plan");
+                        return; // Type exists - not missing
+                    }
+                } catch (Throwable ignored) {
+                    // If we can't check, proceed with adding the plan
+                }
+            }
+
             // CRITICAL FIX: If this is an unknown package type, check if a type with the same
             // simple name already exists in a known package. If so, skip adding the unknown version.
             String unknownPackage = de.upb.sse.jess.generation.unknown.UnknownType.PACKAGE;
-            if (fqn.startsWith(unknownPackage + ".")) {
-                String simpleName = fqn.substring(unknownPackage.length() + 1);
+            if (canonicalFqn.startsWith(unknownPackage + ".")) {
+                String simpleName = canonicalFqn.substring(unknownPackage.length() + 1);
                 // Check if any existing type plan has the same simple name but in a known package
                 for (String existingFqn : typePlanFqns) {
                     if (existingFqn != null && !existingFqn.startsWith(unknownPackage + ".")) {
@@ -79,15 +115,51 @@ public final class SpoonCollector {
                         if (simpleName.equals(existingSimple)) {
                             // A type with the same simple name already exists in a known package
                             // Skip adding the unknown package version
-                            System.out.println("[SpoonCollector] DEBUG: Skipping " + fqn + " - " + existingFqn + " already exists");
+                            System.out.println("[SpoonCollector] DEBUG: Skipping " + canonicalFqn + " - " + existingFqn + " already exists");
                             return;
                         }
                     }
                 }
             }
 
-                typePlanFqns.add(fqn);
-                typePlans.add(plan);
+            // IMPROVEMENT 7: Use ContextIndex.typeKindOf to choose stub kind more accurately
+            TypeStubPlan.Kind finalKind = plan.kind;
+            if (contextIndex != null) {
+                Optional<ContextIndex.TypeKind> contextKind = contextIndex.typeKindOf(canonicalFqn);
+                if (contextKind.isPresent()) {
+                    // Map ContextIndex.TypeKind to TypeStubPlan.Kind
+                    switch (contextKind.get()) {
+                        case CLASS:
+                            finalKind = TypeStubPlan.Kind.CLASS;
+                            break;
+                        case INTERFACE:
+                            finalKind = TypeStubPlan.Kind.INTERFACE;
+                            break;
+                        case ENUM:
+                            finalKind = TypeStubPlan.Kind.ENUM;
+                            break;
+                        case ANNOTATION:
+                            finalKind = TypeStubPlan.Kind.ANNOTATION;
+                            break;
+                    }
+                    System.out.println("[SpoonCollector] [ContextIndex] Using type kind " + finalKind + " for " + canonicalFqn + " (from context)");
+                }
+            }
+            
+            // Create new plan with canonicalized FQN and determined kind
+            TypeStubPlan canonicalPlan = new TypeStubPlan(canonicalFqn, finalKind);
+            typePlanFqns.add(canonicalFqn);
+            typePlans.add(canonicalPlan);
+        }
+        
+        /**
+         * Legacy method for backward compatibility (deprecated).
+         * @deprecated Use {@link #addTypePlanIfNew(TypeStubPlan, Factory)} instead
+         */
+        @Deprecated
+        public void addTypePlanIfNew(TypeStubPlan plan) {
+            // Call with null factory (will skip model check but still do canonicalization)
+            addTypePlanIfNew(plan, null);
         }
     }
 
@@ -97,13 +169,10 @@ public final class SpoonCollector {
 
     private final Factory f;
     private final JessConfiguration cfg;
-    private final SliceDescriptor descriptor;  // Path-agnostic: uses descriptor instead of paths
-    
-    // Legacy fields for backward compatibility (deprecated, should not be used)
-    @Deprecated
-    private final java.nio.file.Path slicedSrcDir;
-    @Deprecated
-    private final Set<String> sliceTypeFqns;
+    private final SliceDescriptor descriptor;  // Optional metadata
+    private final java.nio.file.Path slicedSrcDir;  // Primary source of truth for slice detection
+    private final Set<String> sliceTypeFqns;  // Cached from descriptor for convenience
+    private final ContextIndex contextIndex;  // Optional lightweight context for tie-breaking
 
     // Centralized unknown type FQN constant. (Do not rename or remove.)
     private static final String UNKNOWN_TYPE_FQN = de.upb.sse.jess.generation.unknown.UnknownType.CLASS;
@@ -115,18 +184,40 @@ public final class SpoonCollector {
      * ====================================================================== */
 
     /**
-     * Primary constructor: path-agnostic, uses SliceDescriptor.
+     * Primary constructor: uses path-based slice detection (primary) + descriptor (secondary).
      * @param f Factory
      * @param cfg Configuration
-     * @param descriptor SliceDescriptor describing the slice (null means process everything)
+     * @param descriptor SliceDescriptor (optional metadata, not primary source of truth)
+     * @param slicedSrcDir Path to slice directory (gen/) - primary source of truth for slice detection
+     * @param contextIndex Optional ContextIndex for tie-breaking (type ambiguity, owner resolution)
      */
-    public SpoonCollector(Factory f, JessConfiguration cfg, SliceDescriptor descriptor) {
+    public SpoonCollector(Factory f, JessConfiguration cfg, SliceDescriptor descriptor, java.nio.file.Path slicedSrcDir, ContextIndex contextIndex) {
         this.f = f;
         this.cfg = cfg;
         this.descriptor = descriptor;
-        // Legacy fields for backward compatibility
-        this.slicedSrcDir = null;
-        this.sliceTypeFqns = descriptor != null ? descriptor.sliceTypeFqns : new HashSet<>();
+        this.slicedSrcDir = slicedSrcDir;
+        this.sliceTypeFqns = descriptor != null && descriptor.sliceTypeFqns != null ? descriptor.sliceTypeFqns : new HashSet<>();
+        this.contextIndex = contextIndex;
+    }
+    
+    /**
+     * Constructor without ContextIndex (backward compatibility).
+     * @param f Factory
+     * @param cfg Configuration
+     * @param descriptor SliceDescriptor (optional metadata, not primary source of truth)
+     * @param slicedSrcDir Path to slice directory (gen/) - primary source of truth for slice detection
+     */
+    public SpoonCollector(Factory f, JessConfiguration cfg, SliceDescriptor descriptor, java.nio.file.Path slicedSrcDir) {
+        this(f, cfg, descriptor, slicedSrcDir, null);
+    }
+    
+    /**
+     * Legacy constructor for backward compatibility (deprecated).
+     * @deprecated Use {@link #SpoonCollector(Factory, JessConfiguration, SliceDescriptor, Path, ContextIndex)} instead
+     */
+    @Deprecated
+    public SpoonCollector(Factory f, JessConfiguration cfg, SliceDescriptor descriptor) {
+        this(f, cfg, descriptor, null, null);
     }
     
     /**
@@ -135,11 +226,8 @@ public final class SpoonCollector {
      */
     @Deprecated
     public SpoonCollector(Factory f, JessConfiguration cfg, java.nio.file.Path slicedSrcDir, Set<String> sliceTypeFqns) {
-        this.f = f;
-        this.cfg = cfg;
-        this.slicedSrcDir = slicedSrcDir;
-        this.sliceTypeFqns = sliceTypeFqns != null ? sliceTypeFqns : new HashSet<>();
-        this.descriptor = null;  // No descriptor in legacy mode
+        // Delegate to descriptor-based constructor with null descriptor (process everything)
+        this(f, cfg, null);
     }
 
     /**
@@ -152,88 +240,145 @@ public final class SpoonCollector {
     }
 
     /**
-     * Check if an element is from the slice (should be processed).
-     * PATH-AGNOSTIC: Uses SliceDescriptor instead of file paths.
-     * An element is considered from the slice if:
-     * 1. Its type's FQN is in the slice descriptor, OR
-     * 2. No descriptor is available (process everything for backward compat)
+     * Canonicalize a type FQN using ContextIndex for tie-breaking.
+     * 
+     * If fqn is "unknown.X" OR bare "X" (no dot), query contextIndex.lookupBySimpleName("X"):
+     * - If exactly one anchored candidate exists -> return it.
+     * - If multiple candidates -> prefer one matching common imports of the usage site if available; otherwise keep current fqn.
+     * 
+     * If contextIndex is null -> keep existing behavior (return fqn as-is).
+     * 
+     * @param fqn The type FQN to canonicalize
+     * @param usageSite Optional element where this type is used (for import-based disambiguation)
+     * @return Canonicalized FQN
      */
-    private boolean isFromSlice(CtElement element) {
-        // If no descriptor, process everything (backward compatibility or no filtering)
-        if (descriptor == null) {
-            // Fallback to legacy path-based check if legacy fields are set
-            if (slicedSrcDir != null && sliceTypeFqns != null && !sliceTypeFqns.isEmpty()) {
-                return isFromSliceLegacy(element);
+    private String canonicalizeTypeFqn(String fqn, CtElement usageSite) {
+        if (fqn == null || fqn.isEmpty() || contextIndex == null) {
+            if (contextIndex == null && (fqn != null && !fqn.isEmpty())) {
+                // Only log once per run, not for every call - this would be too verbose
+                // ContextIndex usage is logged at the start
             }
-            return true; // No filtering info, process everything
-        }
-
-        // Path-agnostic check: use FQN from descriptor
-        CtType<?> type = element.getParent(CtType.class);
-        if (type != null) {
-            String typeFqn = type.getQualifiedName();
-            return descriptor.isSliceType(typeFqn);
+            return fqn;
         }
         
-        // If element has no parent type, check if it's a type itself
-        if (element instanceof CtType) {
-            String typeFqn = ((CtType<?>) element).getQualifiedName();
-            return descriptor.isSliceType(typeFqn);
+        String unknownPackage = de.upb.sse.jess.generation.unknown.UnknownType.PACKAGE;
+        String simpleName;
+        boolean isUnknownPackage = fqn.startsWith(unknownPackage + ".");
+        boolean isBareName = !fqn.contains(".");
+        
+        if (isUnknownPackage) {
+            simpleName = fqn.substring(unknownPackage.length() + 1);
+        } else if (isBareName) {
+            simpleName = fqn;
+        } else {
+            // Already fully qualified and not in unknown package - keep as-is
+            return fqn;
         }
         
-        // Default: if we can't determine, process it (conservative)
-        return true;
+        // Query context index
+        Set<String> candidates = contextIndex.lookupBySimpleName(simpleName);
+        if (candidates.isEmpty()) {
+            // No candidates found - keep current FQN
+            return fqn;
+        }
+        
+        if (candidates.size() == 1) {
+            // Exactly one candidate - use it
+            String candidate = candidates.iterator().next();
+            System.out.println("[SpoonCollector] [ContextIndex] Canonicalized " + fqn + " -> " + candidate + " (single candidate from context)");
+            // VERIFICATION ASSERTION: Log canonicalization success (unknown.X or bare X -> real FQN)
+            if (isUnknownPackage || isBareName) {
+                System.out.println("[SpoonCollector] [ContextIndex] ✓ VERIFIED: Canonicalized " + fqn + " -> " + candidate);
+            }
+            return candidate;
+        }
+        
+        // Multiple candidates - try to disambiguate using imports from usage site
+        if (usageSite != null) {
+            try {
+                CtCompilationUnit cu = usageSite.getParent(CtCompilationUnit.class);
+                if (cu != null) {
+                    // Check imports to see if any candidate matches
+                    for (CtImport imp : cu.getImports()) {
+                        if (imp.getImportKind() == CtImportKind.TYPE) {
+                            try {
+                                CtReference ref = imp.getReference();
+                                if (ref instanceof CtTypeReference) {
+                                    String importFqn = ((CtTypeReference<?>) ref).getQualifiedName();
+                                    if (candidates.contains(importFqn)) {
+                                        System.out.println("[SpoonCollector] [ContextIndex] Canonicalized " + fqn + " -> " + importFqn + " (matches import from context)");
+                                        return importFqn;
+                                    }
+                                }
+                            } catch (Throwable ignored) {
+                                // Skip invalid imports
+                            }
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {
+                // Can't check imports - fall through
+            }
+        }
+        
+        // Multiple candidates but can't disambiguate - keep current FQN
+        System.out.println("[SpoonCollector] [ContextIndex] Multiple candidates for " + fqn + ": " + candidates + ", keeping original (cannot disambiguate)");
+        return fqn;
     }
     
     /**
-     * Legacy path-based check (deprecated, only used for backward compatibility).
+     * Check if an element is from the slice (should be processed).
+     * PRIMARY: Uses file path under slicedSrcDir (gen/).
+     * SECONDARY: Uses SliceDescriptor.sliceTypeFqns as additional confirmation.
+     * 
+     * An element is considered from the slice if:
+     * 1. Its source file is under slicedSrcDir (gen/), OR
+     * 2. Its type's FQN is in the slice descriptor (if descriptor available)
+     * 
+     * If slicedSrcDir is null and descriptor is null/empty, conservatively process everything.
      */
-    @Deprecated
-    private boolean isFromSliceLegacy(CtElement element) {
-        if (slicedSrcDir == null || sliceTypeFqns == null || sliceTypeFqns.isEmpty()) {
+    private boolean isFromSlice(CtElement element) {
+        CtType<?> type = element.getParent(CtType.class);
+        if (type == null && element instanceof CtType) {
+            type = (CtType<?>) element;
+        }
+        
+        if (type == null) {
+            // Can't determine - conservatively process it
             return true;
         }
-
-        // First check: is the element's file in the slice directory?
-        try {
-            spoon.reflect.cu.SourcePosition pos = element.getPosition();
-            if (pos != null && pos.getFile() != null) {
-                java.nio.file.Path filePath = pos.getFile().toPath().toAbsolutePath().normalize();
-                java.nio.file.Path sliceRoot = slicedSrcDir.toAbsolutePath().normalize();
-                if (filePath.startsWith(sliceRoot)) {
-                    return true;
-                }
-            }
-        } catch (Throwable ignored) {}
-
-        // Second check: is the element's parent type (or any ancestor) a slice type?
-        // This catches elements that are referenced from slice types but defined in source roots
-        CtElement current = element;
-        int depth = 0;
-        while (current != null && depth < 10) { // Limit depth to avoid infinite loops
-            CtType<?> parentType = current.getParent(CtType.class);
-            if (parentType != null) {
-                String qn = parentType.getQualifiedName();
-                if (qn != null && sliceTypeFqns.contains(qn)) {
-                    return true;
-                }
-                // Also check if the parent type's file is in slice
-                try {
-                    spoon.reflect.cu.SourcePosition typePos = parentType.getPosition();
-                    if (typePos != null && typePos.getFile() != null) {
-                        java.nio.file.Path typeFilePath = typePos.getFile().toPath().toAbsolutePath().normalize();
-                        java.nio.file.Path sliceRoot = slicedSrcDir.toAbsolutePath().normalize();
-                        if (typeFilePath.startsWith(sliceRoot)) {
-                            return true;
-                        }
+        
+        // PRIMARY CHECK: Use source position path (file path under gen/)
+        if (slicedSrcDir != null) {
+            try {
+                spoon.reflect.cu.SourcePosition pos = type.getPosition();
+                if (pos != null && pos.getFile() != null) {
+                    java.nio.file.Path filePath = pos.getFile().toPath().toAbsolutePath().normalize();
+                    java.nio.file.Path sliceRoot = slicedSrcDir.toAbsolutePath().normalize();
+                    if (filePath.startsWith(sliceRoot)) {
+                        return true;  // File is in gen/ - definitely slice type
                     }
-                } catch (Throwable ignored) {}
+                }
+            } catch (Throwable ignored) {
+                // If we can't check path, fall through to descriptor check
             }
-            current = current.getParent();
-            depth++;
         }
-
-        return false; // Conservative: don't process if we can't determine
+        
+        // SECONDARY CHECK: Use descriptor.sliceTypeFqns as additional confirmation
+        if (descriptor != null && descriptor.sliceTypeFqns != null && !descriptor.sliceTypeFqns.isEmpty()) {
+            String typeFqn = type.getQualifiedName();
+            if (typeFqn != null && descriptor.isSliceType(typeFqn)) {
+                return true;  // FQN is in descriptor - treat as slice type
+            }
+        }
+        
+        // If no path match and no descriptor match, it's not from slice
+        // But if we have no way to determine (no slicedSrcDir, no descriptor), be conservative
+        if (slicedSrcDir == null && (descriptor == null || descriptor.sliceTypeFqns == null || descriptor.sliceTypeFqns.isEmpty())) {
+            return true;  // No slice info available - process everything (backward compat)
+        }
+        
+        return false;
     }
 
     /* ======================================================================
@@ -245,6 +390,7 @@ public final class SpoonCollector {
      */
     public CollectResult collect(CtModel model) {
         CollectResult result = new CollectResult();
+        result.setFactory(f); // BUG CLASS 1 FIX: Provide factory for type existence checks
 
         // --- order matters: normalize constants BEFORE collecting types ---
         normalizeUnresolvedConstants(model);
@@ -360,7 +506,7 @@ public final class SpoonCollector {
             CtTypeReference<?> ownerRef = null;
             if (rawOwnerQn != null && rawOwnerQn.contains(".") && !rawOwnerQn.startsWith(UNKNOWN_PACKAGE + ".")) {
                 // Priority 1: Check if this type is in the slice - if so, use it directly
-                if (sliceTypeFqns.contains(rawOwnerQn)) {
+                if (descriptor != null && descriptor.isSliceType(rawOwnerQn)) {
                     System.out.println("[SpoonCollector] DEBUG: Type is in slice, using directly: " + rawOwnerQn);
                     ownerRef = rawOwner;
                 } else {
@@ -451,6 +597,39 @@ public final class SpoonCollector {
                 ownerRef = chooseOwnerPackage(rawOwner, fa);
             }
 
+            // IMPROVEMENT 8: Use ContextIndex.fieldExists + getSuperTypes for field owner resolution
+            // If owner is still unknown or missing, try ContextIndex
+            if (contextIndex != null && (ownerRef == null || (UNKNOWN_PACKAGE + ".Missing").equals(safeQN(ownerRef)))) {
+                // Try to find field in super types of enclosing class
+                try {
+                    CtClass<?> enclosingClass = fa.getParent(CtClass.class);
+                    if (enclosingClass != null) {
+                        String declaringTypeFqn = safeQN(enclosingClass.getReference());
+                        if (declaringTypeFqn != null && !declaringTypeFqn.isEmpty()) {
+                            // Use getSuperTypes which includes superclass chain + interfaces
+                            List<String> superTypes = contextIndex.getSuperTypes(declaringTypeFqn);
+                            List<String> chainToCheck = new ArrayList<>();
+                            chainToCheck.add(declaringTypeFqn);
+                            chainToCheck.addAll(superTypes);
+                            
+                            System.out.println("[SpoonCollector] [ContextIndex] Checking super types for field " + fieldName + " starting from " + declaringTypeFqn);
+                            
+                            // Walk the chain to find the first type where the field exists
+                            for (String typeFqn : chainToCheck) {
+                                if (contextIndex.fieldExists(typeFqn, fieldName)) {
+                                    ownerRef = f.Type().createReference(typeFqn);
+                                    ownerRef = chooseOwnerPackage(ownerRef, fa);
+                                    System.out.println("[SpoonCollector] [ContextIndex] ✓ Found field " + fieldName + " on " + typeFqn + " (via super types)");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                } catch (Throwable ignored) {
+                    // Best-effort: continue with existing ownerRef
+                }
+            }
+            
             // Ensure ownerRef is initialized (fallback)
             if (ownerRef == null) {
                 ownerRef = chooseOwnerPackage(rawOwner, fa);
@@ -465,7 +644,7 @@ public final class SpoonCollector {
                 // This is likely Owner.CONSTANT pattern - determine owner type kind
                 TypeStubPlan.Kind ownerKind = determineOwnerTypeKind(ownerRef, fieldName, fa, model);
                 // Ensure owner type exists with the determined kind
-                out.addTypePlanIfNew(new TypeStubPlan(ownerRef.getQualifiedName(), ownerKind));
+                out.addTypePlanIfNew(new TypeStubPlan(ownerRef.getQualifiedName(), ownerKind), f);
             }
 
             CtTypeReference<?> fieldType = null;
@@ -1171,8 +1350,8 @@ public final class SpoonCollector {
                     List<CtTypeReference<?>> ps =
                             inferParamTypesFromCall(cc.getExecutable(), cc.getArguments());
 
-                    out.addTypePlanIfNew(new TypeStubPlan(outerFqn, TypeStubPlan.Kind.CLASS));
-                    out.addTypePlanIfNew(new TypeStubPlan(outerFqn + "$" + innerSimple, TypeStubPlan.Kind.CLASS));
+                    out.addTypePlanIfNew(new TypeStubPlan(outerFqn, TypeStubPlan.Kind.CLASS), f);
+                    out.addTypePlanIfNew(new TypeStubPlan(outerFqn + "$" + innerSimple, TypeStubPlan.Kind.CLASS), f);
                     out.ctorPlans.add(new ConstructorStubPlan(memberOwner, ps));
                     continue; // handled -> do NOT fall back to generic path
                 }
@@ -1272,25 +1451,114 @@ public final class SpoonCollector {
             Boolean defaultOnIface = false;
             CtExpression<?> tgt = inv.getTarget();
             boolean implicitThis = (tgt == null) || (tgt instanceof spoon.reflect.code.CtThisAccess<?>);
+            
+            // BUG CLASS 2 FIX: For unqualified method invocations (no explicit target), check superclasses
+            // Example: getProject() in Ant tasks should be attached to org.apache.tools.ant.Task, not the task class
             if (implicitThis) {
                 CtClass<?> enclosingClass = inv.getParent(CtClass.class);
                 if (enclosingClass != null) {
-                    List<CtTypeReference<?>> nonJdkIfaces = enclosingClass.getSuperInterfaces()
-                            .stream()
-                                .filter(Objects::nonNull)
-                                .filter(ifr -> {
-                                    String qn = safeQN(ifr);
-                                    return !(qn.startsWith("java.") || qn.startsWith("javax.")
-                                            || qn.startsWith("jakarta.") || qn.startsWith("sun.")
-                                            || qn.startsWith("jdk."));
-                                })
-                            .collect(java.util.stream.Collectors.toList());
-
-                        if (nonJdkIfaces.size() == 1) {
-                            owner = chooseOwnerPackage(nonJdkIfaces.get(0), inv);
-                            defaultOnIface = true;
+                    String declaringTypeFqn = safeQN(enclosingClass.getReference());
+                    
+                    // IMPROVEMENT 8: Use ContextIndex.getSuperTypes (includes interfaces) and methodExists with param names
+                    // First infer parameter types to get arity and param simple names
+                    List<CtTypeReference<?>> inferredParamTypes = inferParamTypesFromCall(ex, inv.getArguments());
+                    int arity = inferredParamTypes.size();
+                    
+                    // Extract param simple names for more precise matching
+                    List<String> paramSimpleNames = new ArrayList<>();
+                    for (CtTypeReference<?> paramType : inferredParamTypes) {
+                        try {
+                            String simpleName = paramType.getSimpleName();
+                            if (simpleName != null && !simpleName.isEmpty()) {
+                                paramSimpleNames.add(simpleName);
+                            } else {
+                                paramSimpleNames.add("Object"); // Fallback
+                            }
+                        } catch (Throwable ignored) {
+                            paramSimpleNames.add("Object"); // Fallback
                         }
-                    // if 0 or >1, keep the original owner heuristic (usually the class)
+                    }
+                    
+                    if (contextIndex != null && declaringTypeFqn != null && !declaringTypeFqn.isEmpty()) {
+                        // Use getSuperTypes which includes superclass chain + interfaces
+                        List<String> superTypes = contextIndex.getSuperTypes(declaringTypeFqn);
+                        // Also include the declaring type itself
+                        List<String> chainToCheck = new ArrayList<>();
+                        chainToCheck.add(declaringTypeFqn);
+                        chainToCheck.addAll(superTypes);
+                        
+                        System.out.println("[SpoonCollector] [ContextIndex] Checking super types for method " + name + "(" + arity + " params) starting from " + declaringTypeFqn);
+                        if (!superTypes.isEmpty()) {
+                            System.out.println("[SpoonCollector] [ContextIndex] Super types: " + superTypes);
+                        }
+                        
+                        // Walk the chain to find the first type where the method exists
+                        // Try with param simple names first (more precise), then fallback to arity
+                        for (String typeFqn : chainToCheck) {
+                            boolean found = false;
+                            if (!paramSimpleNames.isEmpty()) {
+                                found = contextIndex.methodExists(typeFqn, name, paramSimpleNames);
+                            }
+                            if (!found) {
+                                found = contextIndex.methodExists(typeFqn, name, arity);
+                            }
+                            if (found) {
+                                owner = f.Type().createReference(typeFqn);
+                                owner = chooseOwnerPackage(owner, inv);
+                                System.out.println("[SpoonCollector] [ContextIndex] ✓ Found method " + name + " on " + typeFqn + " (via super types)");
+                                // VERIFICATION ASSERTION: Log interface owner resolution
+                                if (contextIndex != null) {
+                                    Optional<ContextIndex.TypeKind> kind = contextIndex.typeKindOf(typeFqn);
+                                    if (kind.isPresent() && kind.get() == ContextIndex.TypeKind.INTERFACE) {
+                                        System.out.println("[SpoonCollector] [ContextIndex] ✓ VERIFIED: Method owner resolved to INTERFACE " + typeFqn);
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    } else if (contextIndex == null) {
+                        // ContextIndex not available - this is logged once at start, but we can note it here for debugging
+                        // (commented out to avoid spam - already logged at start)
+                    }
+                    
+                    // Fallback: First check superclass (for methods like getProject() on Ant Task)
+                    if (owner == null || (UNKNOWN_PACKAGE + ".Missing").equals(safeQN(owner))) {
+                        try {
+                            CtTypeReference<?> superClass = enclosingClass.getSuperclass();
+                            if (superClass != null && !isJdkType(superClass)) {
+                                String superQn = safeQN(superClass);
+                                // Use superclass if it's not java.lang.Object and not a JDK type
+                                if (superQn != null && !superQn.equals("java.lang.Object") && 
+                                    !superQn.startsWith("java.lang.")) {
+                                    owner = chooseOwnerPackage(superClass, inv);
+                                    System.out.println("[SpoonCollector] DEBUG: Attaching unqualified method " + name + 
+                                        " to superclass " + superQn + " instead of " + safeQN(enclosingClass.getReference()));
+                                }
+                            }
+                        } catch (Throwable ignored) {
+                            // If we can't check superclass, fall through to interface check
+                        }
+                    }
+                    
+                    // Then check interfaces (existing logic)
+                    if (owner == null || (UNKNOWN_PACKAGE + ".Missing").equals(safeQN(owner))) {
+                        List<CtTypeReference<?>> nonJdkIfaces = enclosingClass.getSuperInterfaces()
+                                .stream()
+                                    .filter(Objects::nonNull)
+                                    .filter(ifr -> {
+                                        String qn = safeQN(ifr);
+                                        return !(qn.startsWith("java.") || qn.startsWith("javax.")
+                                                || qn.startsWith("jakarta.") || qn.startsWith("sun.")
+                                                || qn.startsWith("jdk."));
+                                    })
+                                .collect(java.util.stream.Collectors.toList());
+
+                            if (nonJdkIfaces.size() == 1) {
+                                owner = chooseOwnerPackage(nonJdkIfaces.get(0), inv);
+                                defaultOnIface = true;
+                            }
+                        // if 0 or >1, keep the original owner heuristic (usually the class)
+                    }
                 }
             }
 
@@ -1758,7 +2026,7 @@ public final class SpoonCollector {
             CtTypeReference<?> resolved = chooseOwnerPackage(t, ann);
             if (resolved == null) continue;
             String annFqn = resolved.getQualifiedName();
-            out.addTypePlanIfNew(new TypeStubPlan(annFqn, TypeStubPlan.Kind.ANNOTATION));
+            out.addTypePlanIfNew(new TypeStubPlan(annFqn, TypeStubPlan.Kind.ANNOTATION), f);
 
             // RULE 4: Collect annotation attributes from usage
             Map<String, String> attributes = out.annotationAttributes.computeIfAbsent(annFqn, k -> new HashMap<>());
@@ -1808,7 +2076,7 @@ public final class SpoonCollector {
                         // container naming: Tag -> Tags
                         String containerSimple = simple.endsWith("s") ? (simple + "es") : (simple + "s");
                         String containerFqn = pkg + "." + containerSimple;
-                    out.addTypePlanIfNew(new TypeStubPlan(containerFqn, TypeStubPlan.Kind.ANNOTATION));
+                    out.addTypePlanIfNew(new TypeStubPlan(containerFqn, TypeStubPlan.Kind.ANNOTATION), f);
                 }
             }
         }
@@ -1825,13 +2093,13 @@ public final class SpoonCollector {
             if (!qn.contains(".")) {
                 CtTypeReference<?> resolved = resolveFromExplicitTypeImports(a, at.getSimpleName());
                 if (resolved != null) {
-                    out.addTypePlanIfNew(new TypeStubPlan(resolved.getQualifiedName(), TypeStubPlan.Kind.ANNOTATION));
+                    out.addTypePlanIfNew(new TypeStubPlan(resolved.getQualifiedName(), TypeStubPlan.Kind.ANNOTATION), f);
                     // Also plan container (Tag -> Tags) in same pkg, as annotation
                     String pkg = resolved.getPackage() == null ? "" : resolved.getPackage().getQualifiedName();
                     String simple = resolved.getSimpleName();
                     String containerSimple = simple.endsWith("s") ? simple + "es" : simple + "s";
                     String containerFqn = (pkg.isEmpty() ? containerSimple : pkg + "." + containerSimple);
-                    out.addTypePlanIfNew(new TypeStubPlan(containerFqn, TypeStubPlan.Kind.ANNOTATION));
+                    out.addTypePlanIfNew(new TypeStubPlan(containerFqn, TypeStubPlan.Kind.ANNOTATION), f);
                     continue;
                 }
             }
@@ -1839,7 +2107,7 @@ public final class SpoonCollector {
             // Otherwise, keep whatever we have if it’s non-JDK
             if (!isJdkType(at)) {
                 out.addTypePlanIfNew(new TypeStubPlan((qn.isEmpty() ? UNKNOWN_PACKAGE + "." + at.getSimpleName() : qn),
-                        TypeStubPlan.Kind.ANNOTATION));
+                        TypeStubPlan.Kind.ANNOTATION), f);
                 // Plan container in same package
                 String pkg = at.getPackage() == null ? "" : at.getPackage().getQualifiedName();
                 String simple = at.getSimpleName();
@@ -1866,7 +2134,7 @@ public final class SpoonCollector {
                 if (t == null) continue;
                 CtTypeReference<?> owner = chooseOwnerPackage(t, m);
                 if (isJdkType(owner)) continue;
-                out.addTypePlanIfNew(new TypeStubPlan(owner.getQualifiedName(), TypeStubPlan.Kind.CLASS));
+                out.addTypePlanIfNew(new TypeStubPlan(owner.getQualifiedName(), TypeStubPlan.Kind.CLASS), f);
                 out.ctorPlans.add(new ConstructorStubPlan(owner, Collections.emptyList()));
             }
         }
@@ -1878,7 +2146,7 @@ public final class SpoonCollector {
                 if (t == null) continue;
                 CtTypeReference<?> owner = chooseOwnerPackage(t, c);
                 if (isJdkType(owner)) continue;
-                out.addTypePlanIfNew(new TypeStubPlan(owner.getQualifiedName(), TypeStubPlan.Kind.CLASS));
+                out.addTypePlanIfNew(new TypeStubPlan(owner.getQualifiedName(), TypeStubPlan.Kind.CLASS), f);
                 out.ctorPlans.add(new ConstructorStubPlan(owner, Collections.emptyList()));
             }
         }
@@ -1900,7 +2168,7 @@ public final class SpoonCollector {
                 if (raw == null) continue;
                 CtTypeReference<?> owner = chooseOwnerPackage(raw, cat);
                 if (isJdkType(owner)) continue;
-                out.addTypePlanIfNew(new TypeStubPlan(owner.getQualifiedName(), TypeStubPlan.Kind.CLASS));
+                out.addTypePlanIfNew(new TypeStubPlan(owner.getQualifiedName(), TypeStubPlan.Kind.CLASS), f);
                 out.ctorPlans.add(new ConstructorStubPlan(owner, Collections.emptyList()));
             }
         }
@@ -1913,7 +2181,7 @@ public final class SpoonCollector {
                 CtConstructorCall<?> cc = (CtConstructorCall<?>) ex;
                 CtTypeReference<?> owner = chooseOwnerPackage(cc.getType(), thr);
                 if (!isJdkType(owner)) {
-                    out.addTypePlanIfNew(new TypeStubPlan(owner.getQualifiedName(), TypeStubPlan.Kind.CLASS));
+                    out.addTypePlanIfNew(new TypeStubPlan(owner.getQualifiedName(), TypeStubPlan.Kind.CLASS), f);
                     List<CtTypeReference<?>> ps = inferParamTypesFromCall(cc.getExecutable(), cc.getArguments());
                     out.ctorPlans.add(new ConstructorStubPlan(owner, ps));
                 }
@@ -1922,7 +2190,7 @@ public final class SpoonCollector {
                     CtTypeReference<?> t = ex.getType();
                     if (t != null && !isJdkType(t) && t.getDeclaration() == null) {
                         CtTypeReference<?> owner = chooseOwnerPackage(t, thr);
-                        out.addTypePlanIfNew(new TypeStubPlan(owner.getQualifiedName(), TypeStubPlan.Kind.CLASS));
+                        out.addTypePlanIfNew(new TypeStubPlan(owner.getQualifiedName(), TypeStubPlan.Kind.CLASS), f);
                         out.ctorPlans.add(new ConstructorStubPlan(owner, Collections.emptyList()));
                     }
                 } catch (Throwable ignored) {}
@@ -1980,11 +2248,18 @@ public final class SpoonCollector {
             if (t.equals(f.Type().VOID_PRIMITIVE)) return;
         } catch (Throwable ignored) { }
 
-        // Check if type declaration exists in model (from any source - slice or context)
-        // If it exists in slice, it will be pretty-printed, so we don't need a stub
-        // If it exists only in context, we still need a stub (context types won't be pretty-printed)
+        // IMPROVEMENT 6: Use real resolution check before stubbing types
+        // Try ref.getTypeDeclaration() or ref.getDeclaration() first
         try { 
-            CtType<?> decl = t.getDeclaration();
+            CtType<?> decl = null;
+            try {
+                decl = t.getTypeDeclaration();
+            } catch (Throwable ignored) {
+                // Fallback to getDeclaration()
+                try {
+                    decl = t.getDeclaration();
+                } catch (Throwable ignored2) {}
+            }
             if (decl != null) {
                 // Type exists in model - check if it's from slice
                 if (isFromSlice(decl)) {
@@ -2033,13 +2308,13 @@ public final class SpoonCollector {
             // For simple names, use chooseOwnerPackage which handles ambiguity correctly
             CtTypeReference<?> resolved = chooseOwnerPackage(t, ctx);
             String resolvedFqn = resolved.getQualifiedName();
-            out.addTypePlanIfNew(new TypeStubPlan(resolvedFqn, TypeStubPlan.Kind.CLASS));
+            out.addTypePlanIfNew(new TypeStubPlan(resolvedFqn, TypeStubPlan.Kind.CLASS), f);
                 return;
             }
 
        // out.typePlans.add(new TypeStubPlan(qn, TypeStubPlan.Kind.CLASS));
         String nestedFqn = nestedAwareFqnOf(t);
-        out.addTypePlanIfNew(new TypeStubPlan(nestedFqn, TypeStubPlan.Kind.CLASS));
+        out.addTypePlanIfNew(new TypeStubPlan(nestedFqn, TypeStubPlan.Kind.CLASS), f);
 
     }
 
@@ -2210,12 +2485,11 @@ public final class SpoonCollector {
     
     /**
      * Get only slice types from the model (for performance - avoid processing all types).
-     * Uses direct FQN lookup when possible to avoid getAllTypes().
+     * Uses path-based detection (primary) + descriptor FQN lookup (secondary).
      */
     private Collection<CtType<?>> getSliceTypes(CtModel model) {
-        List<CtType<?>> sliceTypes = new ArrayList<>();
-        if (slicedSrcDir == null || sliceTypeFqns == null || sliceTypeFqns.isEmpty()) {
-            // No filtering - return all types (backward compat)
+        // If no slicedSrcDir and no descriptor info, return all types (backward compat)
+        if (slicedSrcDir == null && (descriptor == null || descriptor.sliceTypeFqns == null || descriptor.sliceTypeFqns.isEmpty())) {
             try {
                 return safeGetAllTypes(model);
             } catch (Throwable e) {
@@ -2223,36 +2497,19 @@ public final class SpoonCollector {
             }
         }
         
-        // OPTIMIZATION: Use direct FQN lookup instead of getAllTypes()
-        for (String fqn : sliceTypeFqns) {
-            try {
-                CtType<?> type = f.Type().get(fqn);
-                if (type != null) {
-                    sliceTypes.add(type);
-                }
-            } catch (Throwable ignored) {
-                // Skip types we can't get
-            }
-        }
+        // Collect slice types using path-based check (primary) + descriptor FQNs (secondary)
+        Set<String> foundFqns = new HashSet<>();
+        List<CtType<?>> sliceTypes = new ArrayList<>();
         
-        // If we found all types via FQN lookup, return early
-        if (sliceTypes.size() == sliceTypeFqns.size()) {
-            return sliceTypes;
-        }
-        
-        // Fallback: check file paths (only if FQN lookup didn't find all types)
-        Path sliceRoot = slicedSrcDir.toAbsolutePath().normalize();
         try {
             Collection<CtType<?>> allTypes = safeGetAllTypes(model);
             for (CtType<?> type : allTypes) {
-                // Skip if already found via FQN lookup
-                String qn = type.getQualifiedName();
-                if (qn != null && sliceTypeFqns.contains(qn)) {
-                    continue; // Already added
-                }
-                
                 if (isFromSlice(type)) {
-                    sliceTypes.add(type);
+                    String qn = type.getQualifiedName();
+                    if (qn != null && !foundFqns.contains(qn)) {
+                        sliceTypes.add(type);
+                        foundFqns.add(qn);
+                    }
                 }
             }
         } catch (Throwable e) {
@@ -2280,31 +2537,60 @@ public final class SpoonCollector {
     
     /**
      * Post-processing: Remove duplicate unknown package types that have known package equivalents.
-     * This handles cases where unknown.PushMessage is added before cn.wildfirechat.push.PushMessage.
+     * BUG CLASS 1 FIX: Canonicalize missing types by simple name - prefer anchored FQNs over unknown/bare variants.
+     * 
+     * This handles cases like:
+     * - unknown.Project vs org.apache.tools.ant.Project → keep only org.apache.tools.ant.Project
+     * - Project vs org.apache.tools.ant.Project → keep only org.apache.tools.ant.Project
+     * - unknown.PushMessage vs cn.wildfirechat.push.PushMessage → keep only cn.wildfirechat.push.PushMessage
      */
     private void removeDuplicateUnknownPackageTypes(CollectResult result) {
         String unknownPackage = de.upb.sse.jess.generation.unknown.UnknownType.PACKAGE;
         List<TypeStubPlan> toRemove = new ArrayList<>();
         
-        // Build a map of simple names to known package FQNs
-        Map<String, String> knownPackageTypes = new HashMap<>();
+        // Group all type plans by simple name
+        Map<String, List<TypeStubPlan>> bySimpleName = new HashMap<>();
         for (TypeStubPlan plan : result.typePlans) {
             String fqn = plan.qualifiedName;
-            if (fqn != null && !fqn.startsWith(unknownPackage + ".")) {
-                String simple = fqn.substring(fqn.lastIndexOf('.') + 1);
-                knownPackageTypes.put(simple, fqn);
-            }
+            if (fqn == null) continue;
+            String simple = fqn.substring(fqn.lastIndexOf('.') + 1);
+            bySimpleName.computeIfAbsent(simple, k -> new ArrayList<>()).add(plan);
         }
         
-        // Find unknown package types that have known equivalents
-        for (TypeStubPlan plan : result.typePlans) {
-            String fqn = plan.qualifiedName;
-            if (fqn != null && fqn.startsWith(unknownPackage + ".")) {
-                String simple = fqn.substring(unknownPackage.length() + 1);
-                if (knownPackageTypes.containsKey(simple)) {
-                    String knownFqn = knownPackageTypes.get(simple);
-                    System.out.println("[SpoonCollector] DEBUG: Removing duplicate " + fqn + " - " + knownFqn + " already exists");
-                    toRemove.add(plan);
+        // For each simple name group, if there's an anchored FQN (non-unknown package), remove unknown/bare variants
+        for (Map.Entry<String, List<TypeStubPlan>> entry : bySimpleName.entrySet()) {
+            String simpleName = entry.getKey();
+            List<TypeStubPlan> plans = entry.getValue();
+            
+            // Find anchored FQNs (non-unknown package, non-bare)
+            List<String> anchoredFqns = new ArrayList<>();
+            for (TypeStubPlan plan : plans) {
+                String fqn = plan.qualifiedName;
+                if (fqn != null && !fqn.startsWith(unknownPackage + ".") && fqn.contains(".")) {
+                    anchoredFqns.add(fqn);
+                }
+            }
+            
+            // If we have anchored FQNs, remove unknown.* and bare simple name variants
+            if (!anchoredFqns.isEmpty()) {
+                // Keep the first anchored FQN (or all if multiple - they'll be deduplicated elsewhere)
+                String preferredFqn = anchoredFqns.get(0);
+                
+                // Remove unknown.* variants and bare simple names
+                for (TypeStubPlan plan : plans) {
+                    String fqn = plan.qualifiedName;
+                    if (fqn == null) continue;
+                    
+                    // Remove if it's unknown.* variant
+                    if (fqn.startsWith(unknownPackage + "." + simpleName)) {
+                        System.out.println("[SpoonCollector] DEBUG: Canonicalizing - removing unknown.* variant " + fqn + " (preferring " + preferredFqn + ")");
+                        toRemove.add(plan);
+                    }
+                    // Remove if it's a bare simple name (no package, just the simple name)
+                    else if (fqn.equals(simpleName) && !fqn.contains(".")) {
+                        System.out.println("[SpoonCollector] DEBUG: Canonicalizing - removing bare simple name " + fqn + " (preferring " + preferredFqn + ")");
+                        toRemove.add(plan);
+                    }
                 }
             }
         }
@@ -2487,7 +2773,7 @@ public final class SpoonCollector {
                     if (isJdkType(tr)) continue;
                     if (existingTypePlanFqns.contains(ownerFqn)) continue;
 
-                    out.addTypePlanIfNew(new TypeStubPlan(ownerFqn, TypeStubPlan.Kind.CLASS));
+                    out.addTypePlanIfNew(new TypeStubPlan(ownerFqn, TypeStubPlan.Kind.CLASS), f);
                     existingTypePlanFqns.add(ownerFqn);
                 }
 
@@ -2536,7 +2822,7 @@ public final class SpoonCollector {
                         String ownerFqn = m.group(1);
                         if (isJdkPkg(ownerFqn)) continue;
                         if (!existingTypePlanFqns.contains(ownerFqn)) {
-                            out.addTypePlanIfNew(new TypeStubPlan(ownerFqn, TypeStubPlan.Kind.CLASS));
+                            out.addTypePlanIfNew(new TypeStubPlan(ownerFqn, TypeStubPlan.Kind.CLASS), f);
                             existingTypePlanFqns.add(ownerFqn);
                         }
                     }
@@ -2581,7 +2867,7 @@ public final class SpoonCollector {
             } catch (Throwable ignored) { }
 
             for (String pkg : starPkgs) {
-                out.addTypePlanIfNew(new TypeStubPlan(pkg + ".PackageAnchor", TypeStubPlan.Kind.CLASS));
+                out.addTypePlanIfNew(new TypeStubPlan(pkg + ".PackageAnchor", TypeStubPlan.Kind.CLASS), f);
             }
         });
     }
@@ -2766,7 +3052,7 @@ public final class SpoonCollector {
 
             for (String fqn : fqns) {
                 if (isJdkPkg(fqn)) continue;
-                out.addTypePlanIfNew(new TypeStubPlan(fqn, TypeStubPlan.Kind.CLASS));
+                out.addTypePlanIfNew(new TypeStubPlan(fqn, TypeStubPlan.Kind.CLASS), f);
             }
         });
     }
@@ -2964,14 +3250,14 @@ public final class SpoonCollector {
             if (sup != null) {
                 CtTypeReference<?> owner = chooseOwnerPackage(sup, c);
                 if (owner != null && !isJdkType(owner)) {
-                    out.addTypePlanIfNew(new TypeStubPlan(owner.getQualifiedName(), TypeStubPlan.Kind.CLASS));
+                    out.addTypePlanIfNew(new TypeStubPlan(owner.getQualifiedName(), TypeStubPlan.Kind.CLASS), f);
                 }
             }
             for (CtTypeReference<?> si : safe(c.getSuperInterfaces())) {
                 if (si == null) continue;
                 CtTypeReference<?> owner = chooseOwnerPackage(si, c);
                 if (owner != null && !isJdkType(owner)) {
-                    out.addTypePlanIfNew(new TypeStubPlan(owner.getQualifiedName(), TypeStubPlan.Kind.INTERFACE));
+                    out.addTypePlanIfNew(new TypeStubPlan(owner.getQualifiedName(), TypeStubPlan.Kind.INTERFACE), f);
                 }
             }
         }
@@ -2982,7 +3268,7 @@ public final class SpoonCollector {
                 if (si == null) continue;
                 CtTypeReference<?> owner = chooseOwnerPackage(si, i);
                 if (owner != null && !isJdkType(owner)) {
-                    out.addTypePlanIfNew(new TypeStubPlan(owner.getQualifiedName(), TypeStubPlan.Kind.INTERFACE));
+                    out.addTypePlanIfNew(new TypeStubPlan(owner.getQualifiedName(), TypeStubPlan.Kind.INTERFACE), f);
                 }
             }
         }
@@ -2996,7 +3282,7 @@ public final class SpoonCollector {
                     if (ta == null) continue;
                     CtTypeReference<?> owner = chooseOwnerPackage(ta, t);
                     if (owner != null && !isJdkType(owner) && owner.getDeclaration() == null) {
-                        out.addTypePlanIfNew(new TypeStubPlan(owner.getQualifiedName(), TypeStubPlan.Kind.CLASS));
+                        out.addTypePlanIfNew(new TypeStubPlan(owner.getQualifiedName(), TypeStubPlan.Kind.CLASS), f);
                     }
                 }
             }
@@ -3011,7 +3297,7 @@ public final class SpoonCollector {
                     if (ta == null) continue;
                     CtTypeReference<?> owner = chooseOwnerPackage(ta, t);
                     if (owner != null && !isJdkType(owner) && owner.getDeclaration() == null) {
-                        out.addTypePlanIfNew(new TypeStubPlan(owner.getQualifiedName(), TypeStubPlan.Kind.CLASS));
+                        out.addTypePlanIfNew(new TypeStubPlan(owner.getQualifiedName(), TypeStubPlan.Kind.CLASS), f);
                     }
                 }
             }

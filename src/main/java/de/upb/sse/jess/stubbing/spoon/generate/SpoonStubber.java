@@ -17,8 +17,6 @@ import spoon.reflect.declaration.CtPackage;
 import java.util.*;
 import java.nio.file.Path;
 
-import static com.github.javaparser.utils.CodeGenerationUtils.f;
-
 public final class SpoonStubber {
 
     /* ======================================================================
@@ -27,13 +25,9 @@ public final class SpoonStubber {
 
     private final Factory f;
     private final JessConfiguration cfg;
-    private final SliceDescriptor descriptor;  // Path-agnostic: uses descriptor instead of paths
-    
-    // Legacy fields for backward compatibility (deprecated, should not be used)
-    @Deprecated
-    private final java.nio.file.Path slicedSrcDir;
-    @Deprecated
-    private final Set<String> sliceTypeFqns;
+    private final SliceDescriptor descriptor;  // Optional metadata
+    private final java.nio.file.Path slicedSrcDir;  // Primary source of truth for slice detection
+    private final Set<String> sliceTypeFqns;  // Cached from descriptor for convenience
     
     private final Map<String, Map<String, String>> annotationAttributes; // RULE 4: Annotation attributes (FQN -> attrName -> attrType)
 
@@ -41,6 +35,9 @@ public final class SpoonStubber {
     private final List<String> createdFields = new ArrayList<>();
     private final List<String> createdCtors  = new ArrayList<>();
     private final List<String> createdMethods= new ArrayList<>();
+    
+    // Track slice types that were modified (had members added) - only for existing types in gen/
+    private final Set<String> modifiedSliceTypeFqns = new HashSet<>();
     
     // Centralized unknown package constant
     private static final String UNKNOWN_PACKAGE = de.upb.sse.jess.generation.unknown.UnknownType.PACKAGE;
@@ -51,20 +48,29 @@ public final class SpoonStubber {
      * ====================================================================== */
 
     /**
-     * Primary constructor: path-agnostic, uses SliceDescriptor.
+     * Primary constructor: uses path-based slice detection (primary) + descriptor (secondary).
      * @param f Factory
      * @param cfg Configuration
-     * @param descriptor SliceDescriptor (null means no filtering)
+     * @param descriptor SliceDescriptor (optional metadata, not primary source of truth)
      * @param annotationAttributes Annotation attributes map
+     * @param slicedSrcDir Path to slice directory (gen/) - primary source of truth for slice detection
      */
-    public SpoonStubber(Factory f, JessConfiguration cfg, SliceDescriptor descriptor, Map<String, Map<String, String>> annotationAttributes) {
+    public SpoonStubber(Factory f, JessConfiguration cfg, SliceDescriptor descriptor, Map<String, Map<String, String>> annotationAttributes, java.nio.file.Path slicedSrcDir) {
         this.f = f;
         this.cfg = cfg;
         this.descriptor = descriptor;
         this.annotationAttributes = annotationAttributes != null ? annotationAttributes : new HashMap<>();
-        // Legacy fields for backward compatibility
-        this.slicedSrcDir = null;
-        this.sliceTypeFqns = descriptor != null ? descriptor.sliceTypeFqns : new HashSet<>();
+        this.slicedSrcDir = slicedSrcDir;
+        this.sliceTypeFqns = descriptor != null && descriptor.sliceTypeFqns != null ? descriptor.sliceTypeFqns : new HashSet<>();
+    }
+    
+    /**
+     * Legacy constructor for backward compatibility (deprecated).
+     * @deprecated Use {@link #SpoonStubber(Factory, JessConfiguration, SliceDescriptor, Map, Path)} instead
+     */
+    @Deprecated
+    public SpoonStubber(Factory f, JessConfiguration cfg, SliceDescriptor descriptor, Map<String, Map<String, String>> annotationAttributes) {
+        this(f, cfg, descriptor, annotationAttributes, null);
     }
     
     /**
@@ -90,8 +96,8 @@ public final class SpoonStubber {
         this.f = f;
         this.cfg = null;
         this.descriptor = null;
-        this.slicedSrcDir = slicedSrcDir;
-        this.sliceTypeFqns = sliceTypeFqns != null ? sliceTypeFqns : new HashSet<>();
+        this.slicedSrcDir = null;
+        this.sliceTypeFqns = null;
         this.annotationAttributes = new HashMap<>();
     }
     
@@ -104,8 +110,8 @@ public final class SpoonStubber {
         this.f = f;
         this.cfg = null;
         this.descriptor = null;
-        this.slicedSrcDir = slicedSrcDir;
-        this.sliceTypeFqns = sliceTypeFqns != null ? sliceTypeFqns : new HashSet<>();
+        this.slicedSrcDir = null;
+        this.sliceTypeFqns = null;
         this.annotationAttributes = annotationAttributes != null ? annotationAttributes : new HashMap<>();
     }
 
@@ -198,6 +204,12 @@ public final class SpoonStubber {
             }
         }
 
+        // GUARD: Never stub primitive types or Java keywords
+        if (isPrimitiveOrKeyword(qn)) {
+            System.err.println("[SpoonStubber] WARNING: Skipping stub generation for primitive/keyword: " + qn);
+            return false;
+        }
+        
         String pkg = "";
         String name = "Missing";
         int i = qn.lastIndexOf('.');
@@ -207,24 +219,13 @@ public final class SpoonStubber {
         CtPackage packageObj = f.Package().getOrCreate(pkg);
         CtType<?> existing = packageObj.getType(name);
         
-        // If type exists in model, check if it's from slice or context
+        // HARD GUARD: Never create a new type stub if that FQN already exists in the gen model.
+        // Since model is built from gen/ only, any existing type is from gen/.
         if (existing != null) {
-            // If it's from slice, it will be pretty-printed, so no stub needed
-            if (isFromSlice(existing)) {
-                return false;
-            }
-            // CRITICAL FIX: Even if type exists in context, we should NOT copy the full source code
-            // because it may have dependencies that don't exist (e.g., cn.wildfirechat.common).
-            // Instead, we should generate a minimal stub based on what's actually needed.
-            // The collection results tell us what members are needed, so we'll create a minimal stub.
-            // 
-            // Example: Utility class exists in context with full implementation, but we only need
-            // printExecption(Logger, Exception). Copying the full class would bring in dependencies
-            // like IMExceptionEvent, Server, Gson, etc. that don't exist in the stub environment.
-            //
-            // Solution: Always generate minimal stub for context types, don't copy full source.
-            // Fall through to create minimal stub below.
-            System.out.println("[SpoonStubber] DEBUG: Type " + qn + " exists in context, but generating minimal stub instead of copying full source");
+            // Type exists in gen model - don't create a new stub, but allow adding members to it
+            // The type will be re-written with added members in prettyPrintSliceTypesOnly
+            System.out.println("[SpoonStubber] DEBUG: Type " + qn + " already exists in gen model, will add members instead of creating stub");
+            return false; // Type exists, no new type created, but members may be added
         }
 
         CtType<?> created;
@@ -279,6 +280,10 @@ public final class SpoonStubber {
                         am.setType(typeRef);
                         at.addMethod(am);
                         System.out.println("[SpoonStubber] DEBUG: Added annotation attribute: " + qn + "." + attrName + " : " + attrType);
+                        // Track if we modified an existing slice type
+                        if (isFromSlice(at)) {
+                            modifiedSliceTypeFqns.add(qn);
+                        }
                     }
                 }
                 
@@ -289,6 +294,10 @@ public final class SpoonStubber {
                     am.setSimpleName("value");
                     am.setType(f.Type().STRING);
                     at.addMethod(am);
+                    // Track if we modified an existing slice type
+                    if (isFromSlice(at)) {
+                        modifiedSliceTypeFqns.add(qn);
+                    }
                 }
                 created = at;
                 break;
@@ -354,6 +363,11 @@ public final class SpoonStubber {
 
             CtField<?> fd = f.Field().create(owner, mods, fieldType, p.fieldName);
             ensureImport(owner, fieldType);
+            
+            // Track if we modified an existing slice type
+            if (isFromSlice(owner)) {
+                modifiedSliceTypeFqns.add(owner.getQualifiedName());
+            }
 
             created++;
             createdFields.add(owner.getQualifiedName() + "#" + p.fieldName + ":" +
@@ -388,6 +402,11 @@ public final class SpoonStubber {
             List<CtParameter<?>> params = makeParams(normParams);
 
             CtConstructor<?> ctor = f.Constructor().create(owner, mods, params, Collections.emptySet(), f.Core().createBlock());
+            
+            // Track if we modified an existing slice type
+            if (isFromSlice(owner)) {
+                modifiedSliceTypeFqns.add(owner.getQualifiedName());
+            }
 
             boolean ctorUsesUnknown = params.stream().anyMatch(d ->
                     (UNKNOWN_PACKAGE + "." + UNKNOWN_CLASS).equals(readable(d.getType()))
@@ -545,6 +564,11 @@ public final class SpoonStubber {
             ensureImport(owner, rt0);
             for (CtParameter<?> par : params) ensureImport(owner, par.getType());
             for (CtTypeReference<?> t : thrown) ensureImport(owner, t);
+            
+            // Track if we modified an existing slice type
+            if (isFromSlice(owner)) {
+                modifiedSliceTypeFqns.add(owner.getQualifiedName());
+            }
 
             createdMethods.add(sig(owner.getQualifiedName(), p.name, normParams) + " : " + readable(rt0));
             created++;
@@ -570,6 +594,11 @@ public final class SpoonStubber {
     /** Get the set of created stub type FQNs. */
     public Set<String> getCreatedTypes() {
         return new LinkedHashSet<>(createdTypes);
+    }
+    
+    /** Get the set of slice type FQNs that were modified (had members added). */
+    public Set<String> getModifiedSliceTypeFqns() {
+        return Collections.unmodifiableSet(modifiedSliceTypeFqns);
     }
 
     /* ======================================================================
@@ -740,12 +769,11 @@ public final class SpoonStubber {
 
     /**
      * Get only slice types from the model (for performance - avoid processing all types).
-     * Uses direct FQN lookup when possible to avoid getAllTypes().
+     * Uses path-based detection (primary) + descriptor FQN lookup (secondary).
      */
     private Collection<CtType<?>> getSliceTypes(CtModel model) {
-        List<CtType<?>> sliceTypes = new ArrayList<>();
-        if (slicedSrcDir == null || sliceTypeFqns == null || sliceTypeFqns.isEmpty()) {
-            // No filtering - return all types (backward compat)
+        // If no slicedSrcDir and no descriptor info, return all types (backward compat)
+        if (slicedSrcDir == null && (descriptor == null || descriptor.sliceTypeFqns == null || descriptor.sliceTypeFqns.isEmpty())) {
             try {
                 return safeGetAllTypes(model);
             } catch (Throwable e) {
@@ -753,36 +781,19 @@ public final class SpoonStubber {
             }
         }
         
-        // OPTIMIZATION: Use direct FQN lookup instead of getAllTypes()
-        for (String fqn : sliceTypeFqns) {
-            try {
-                CtType<?> type = f.Type().get(fqn);
-                if (type != null) {
-                    sliceTypes.add(type);
-                }
-            } catch (Throwable ignored) {
-                // Skip types we can't get
-            }
-        }
+        // Collect slice types using path-based check (primary) + descriptor FQNs (secondary)
+        Set<String> foundFqns = new HashSet<>();
+        List<CtType<?>> sliceTypes = new ArrayList<>();
         
-        // If we found all types via FQN lookup, return early
-        if (sliceTypes.size() == sliceTypeFqns.size()) {
-            return sliceTypes;
-        }
-        
-        // Fallback: check file paths (only if FQN lookup didn't find all types)
-        Path sliceRoot = slicedSrcDir.toAbsolutePath().normalize();
         try {
             Collection<CtType<?>> allTypes = safeGetAllTypes(model);
             for (CtType<?> type : allTypes) {
-                // Skip if already found via FQN lookup
-                String qn = type.getQualifiedName();
-                if (qn != null && sliceTypeFqns.contains(qn)) {
-                    continue; // Already added
-                }
-                
                 if (isSliceType(type)) {
-                    sliceTypes.add(type);
+                    String qn = type.getQualifiedName();
+                    if (qn != null && !foundFqns.contains(qn)) {
+                        sliceTypes.add(type);
+                        foundFqns.add(qn);
+                    }
                 }
             }
         } catch (Throwable e) {
@@ -846,47 +857,47 @@ public final class SpoonStubber {
     }
     
     /**
-     * Check if a type is from the slice (path-agnostic).
-     * Uses SliceDescriptor instead of file paths.
+     * Check if a type is from the slice.
+     * PRIMARY: Uses file path under slicedSrcDir (gen/).
+     * SECONDARY: Uses SliceDescriptor.sliceTypeFqns as additional confirmation.
+     * 
+     * IMPORTANT: If a type is from the slice, we should NOT create a stub for it
+     * (it already exists in gen/ from JavaParser).
      */
     private boolean isSliceType(CtType<?> type) {
-        // If no descriptor, process everything (backward compatibility or no filtering)
-        if (descriptor == null) {
-            // Fallback to legacy path-based check if legacy fields are set
-            if (slicedSrcDir != null && sliceTypeFqns != null && !sliceTypeFqns.isEmpty()) {
-                return isSliceTypeLegacy(type);
+        if (type == null) {
+            return false;
+        }
+        
+        // PRIMARY CHECK: Use source position path (file path under gen/)
+        if (slicedSrcDir != null) {
+            try {
+                spoon.reflect.cu.SourcePosition pos = type.getPosition();
+                if (pos != null && pos.getFile() != null) {
+                    java.nio.file.Path filePath = pos.getFile().toPath().toAbsolutePath().normalize();
+                    java.nio.file.Path sliceRoot = slicedSrcDir.toAbsolutePath().normalize();
+                    if (filePath.startsWith(sliceRoot)) {
+                        return true;  // File is in gen/ - definitely slice type, don't stub
+                    }
+                }
+            } catch (Throwable ignored) {
+                // If we can't check path, fall through to descriptor check
             }
-            return true; // No filtering info, process everything
         }
         
-        // Path-agnostic check: use FQN from descriptor
-        String qn = type.getQualifiedName();
-        return qn != null && descriptor.isSliceType(qn);
-    }
-    
-    /**
-     * Legacy path-based check (deprecated, only used for backward compatibility).
-     */
-    @Deprecated
-    private boolean isSliceTypeLegacy(CtType<?> type) {
-        if (slicedSrcDir == null || sliceTypeFqns == null || sliceTypeFqns.isEmpty()) {
-            return true;
-        }
-        
-        String qn = type.getQualifiedName();
-        if (qn != null && sliceTypeFqns.contains(qn)) {
-            return true;
-        }
-        
-        // Also check by file path
-        try {
-            spoon.reflect.cu.SourcePosition pos = type.getPosition();
-            if (pos != null && pos.getFile() != null) {
-                java.nio.file.Path filePath = pos.getFile().toPath().toAbsolutePath().normalize();
-                java.nio.file.Path sliceRoot = slicedSrcDir.toAbsolutePath().normalize();
-                return filePath.startsWith(sliceRoot);
+        // SECONDARY CHECK: Use descriptor.sliceTypeFqns as additional confirmation
+        if (descriptor != null && descriptor.sliceTypeFqns != null && !descriptor.sliceTypeFqns.isEmpty()) {
+            String qn = type.getQualifiedName();
+            if (qn != null && descriptor.isSliceType(qn)) {
+                return true;  // FQN is in descriptor - treat as slice type, don't stub
             }
-        } catch (Throwable ignored) {}
+        }
+        
+        // If no path match and no descriptor match, it's not from slice (can stub)
+        // But if we have no way to determine (no slicedSrcDir, no descriptor), be conservative
+        if (slicedSrcDir == null && (descriptor == null || descriptor.sliceTypeFqns == null || descriptor.sliceTypeFqns.isEmpty())) {
+            return true;  // No slice info available - treat everything as slice (backward compat)
+        }
         
         return false;
     }
@@ -898,6 +909,46 @@ public final class SpoonStubber {
         return isSliceType(type);
     }
     
+    /**
+     * Check if a type name is a Java primitive or keyword that should never be stubbed.
+     * Prevents creation of bogus stubs like unknown/float.java, unknown/double.java, etc.
+     */
+    private boolean isPrimitiveOrKeyword(String fqn) {
+        if (fqn == null || fqn.isEmpty()) {
+            return false;
+        }
+        
+        // Extract simple name (last part after '.')
+        String simpleName = fqn.contains(".") ? fqn.substring(fqn.lastIndexOf('.') + 1) : fqn;
+        
+        // Java primitives
+        Set<String> primitives = Set.of(
+            "boolean", "byte", "char", "short", "int", "long", "float", "double", "void"
+        );
+        
+        if (primitives.contains(simpleName)) {
+            return true;
+        }
+        
+        // Common Java keywords that might appear as type names
+        Set<String> keywords = Set.of(
+            "null", "true", "false", "this", "super", "class", "interface", "enum"
+        );
+        
+        if (keywords.contains(simpleName)) {
+            return true;
+        }
+        
+        // Check if it's a primitive wrapper in unknown package (shouldn't happen, but guard anyway)
+        if (fqn.startsWith(UNKNOWN_PACKAGE + ".")) {
+            String unknownSimple = fqn.substring(UNKNOWN_PACKAGE.length() + 1);
+            if (primitives.contains(unknownSimple) || keywords.contains(unknownSimple)) {
+                return true;
+            }
+        }
+        
+        return false;
+    }
 
     /** Safely get a type's qualified name; returns empty string on failure. */
     private static String safeQN(CtTypeReference<?> t) {

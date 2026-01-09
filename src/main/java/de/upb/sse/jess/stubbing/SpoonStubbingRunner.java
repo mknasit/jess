@@ -7,7 +7,8 @@ import de.upb.sse.jess.Jess;
 import de.upb.sse.jess.stubbing.spoon.collector.SpoonCollector;
 import de.upb.sse.jess.stubbing.spoon.collector.SpoonCollector.CollectResult;
 import de.upb.sse.jess.stubbing.spoon.generate.SpoonStubber;
-import de.upb.sse.jess.stubbing.spoon.SpoonModelSlicer;
+import de.upb.sse.jess.stubbing.spoon.context.ContextIndex;
+import de.upb.sse.jess.stubbing.spoon.context.SourceRootsContextIndex;
 import de.upb.sse.jess.stubbing.spoon.plan.TypeStubPlan;
 import de.upb.sse.jess.stubbing.spoon.plan.MethodStubPlan;
 import de.upb.sse.jess.stubbing.spoon.plan.FieldStubPlan;
@@ -25,6 +26,8 @@ import spoon.reflect.declaration.CtType;
 import java.nio.file.Path;
 import java.nio.file.Files;
 import java.util.*;
+import java.util.stream.Collectors;
+import java.util.Objects;
 
 import com.github.javaparser.JavaParser;
 import com.github.javaparser.ParserConfiguration;
@@ -52,8 +55,7 @@ public final class SpoonStubbingRunner implements Stubber {
     /**
      * Run stubbing with SliceDescriptor support.
      * 
-     * Strategy A (model-from-gen): Build model from slicedSrcDir only.
-     * Strategy B (model-from-source-roots): Build model from source roots, then apply SpoonModelSlicer.
+     * Builds Spoon model from slicedSrcDir (gen/) ONLY - slice is canonical.
      * 
      * @param slicedSrcDir The directory containing sliced code (gen/)
      * @param classpathJars Classpath JARs for compilation
@@ -63,42 +65,11 @@ public final class SpoonStubbingRunner implements Stubber {
     public int run(Path slicedSrcDir, List<Path> classpathJars, SliceDescriptor descriptor) throws Exception {
         System.out.println("\n>> Using stubber: Spoon Based Stubber" );
         
-        // STRATEGY A: Try building model from sliced directory only (cheap, local)
-        System.out.println("[SpoonStubbingRunner] Strategy A: Building model from slice directory only...");
-        StubbingResult resultA = tryStubbingWithSliceOnly(slicedSrcDir, classpathJars, descriptor);
+        // Build model from slice directory only (gen/ is canonical)
+        System.out.println("[SpoonStubbingRunner] Building model from slice directory only...");
+        StubbingResult result = tryStubbingWithSliceOnly(slicedSrcDir, classpathJars, descriptor);
         
-        // If Strategy A succeeded, we're done
-        if (resultA.compilationSuccess) {
-            System.out.println("[SpoonStubbingRunner] Strategy A succeeded!");
-            return resultA.stubsCreated;
-        }
-        
-        // STRATEGY B: If Strategy A failed AND descriptor is available AND source roots are available,
-        // build model from source roots and apply SpoonModelSlicer
-        if (descriptor != null && !sourceRoots.isEmpty()) {
-            System.out.println("[SpoonStubbingRunner] Strategy A failed, trying Strategy B (full-context model + slicing)...");
-            // CRITICAL: Clean gen/ directory before Strategy B to remove incorrect stubs from Strategy A
-            // Strategy A may have written incorrect stubs (e.g., methods returning void instead of proper types)
-            // that will cause compilation conflicts when Strategy B tries to compile
-            try {
-                java.io.File genDir = slicedSrcDir.toFile();
-                if (genDir.exists()) {
-                    System.out.println("[SpoonStubbingRunner] Cleaning gen/ directory before Strategy B to remove incorrect stubs from Strategy A...");
-                    de.upb.sse.jess.util.FileUtil.deleteRecursively(genDir);
-                    genDir.mkdirs(); // Recreate empty directory
-                    // Note: Slice types from JavaParser will be re-written by Strategy B via prettyPrintSliceTypesOnly
-                }
-            } catch (Exception e) {
-                System.err.println("[SpoonStubbingRunner] WARNING: Failed to clean gen/ directory before Strategy B: " + e.getMessage());
-                // Continue anyway - Strategy B will overwrite files, but old incorrect stubs might remain
-            }
-            StubbingResult resultB = tryStubbingWithFullContext(slicedSrcDir, classpathJars, descriptor);
-            return resultB.stubsCreated;
-        } else {
-            System.out.println("[SpoonStubbingRunner] Strategy A failed, but Strategy B not available (descriptor=" + 
-                    (descriptor != null ? "available" : "null") + ", sourceRoots=" + sourceRoots.size() + ")");
-            return resultA.stubsCreated;
-        }
+        return result.stubsCreated;
     }
     
     /**
@@ -115,11 +86,10 @@ public final class SpoonStubbingRunner implements Stubber {
     }
     
     /**
-     * Strategy A: Build model from slice directory only (no context/source roots).
-     * This is the first attempt - always uses only slice directory regardless of source roots availability.
+     * Build model from slice directory only (gen/ is canonical).
      * @param slicedSrcDir The slice directory (gen/)
      * @param classpathJars Classpath JARs
-     * @param descriptor SliceDescriptor (optional, for future use)
+     * @param descriptor SliceDescriptor (optional metadata)
      * @return StubbingResult with number of stubs created and compilation success status
      */
     private StubbingResult tryStubbingWithSliceOnly(Path slicedSrcDir, List<Path> classpathJars, SliceDescriptor descriptor) throws Exception {
@@ -257,379 +227,64 @@ public final class SpoonStubbingRunner implements Stubber {
             return new StubbingResult(0, false);
         }
 
-        // 6) Collect unresolved elements and generate stubs, then compile (generic, path-agnostic)
-        // Strategy A: preserve existing JavaParser slice files (don't overwrite)
-        return performStubbing(model, f, slicedSrcDir, launcher, classpathJars, descriptor, true);
+        // 6) Collect unresolved elements and generate stubs, then compile
+        // Preserve existing JavaParser slice files (don't overwrite)
+        // Pass slicedSrcDir so collector/stubber can use path-based slice detection
+        return performStubbing(model, f, slicedSrcDir, launcher, classpathJars, descriptor);
     }
     
-    /**
-     * Strategy B: Build model from source roots, then apply SpoonModelSlicer to keep only slice-relevant elements.
-     * This is the fallback when Strategy A fails.
-     * 
-     * IMPORTANT: This does NOT add slicedSrcDir to the model. It builds from source roots only,
-     * then slices the model using SliceDescriptor, then writes output to slicedSrcDir.
-     * 
-     * @param slicedSrcDir Output directory (where to write the final code)
-     * @param classpathJars Classpath JARs
-     * @param descriptor SliceDescriptor describing what to keep
-     * @return StubbingResult with number of stubs created and compilation success status
-     */
-    private StubbingResult tryStubbingWithFullContext(Path slicedSrcDir, List<Path> classpathJars, SliceDescriptor descriptor) throws Exception {
-        System.out.println("[SpoonStubbingRunner] Strategy B: Building full model from source roots, then slicing...");
-        
-        // 1) Configure Spoon for Java 11
-        Launcher launcher = new Launcher();
-        var env = launcher.getEnvironment();
-        env.setComplianceLevel(11);
-        env.setAutoImports(true);
-        env.setSourceOutputDirectory(slicedSrcDir.toFile());
-
-        if (classpathJars == null || classpathJars.isEmpty()) {
-            env.setNoClasspath(true);
-        } else {
-            env.setNoClasspath(false);
-            env.setSourceClasspath(classpathJars.stream().map(Path::toString).toArray(String[]::new));
-        }
-
-        // 2) Add source roots ONLY (do NOT add slicedSrcDir - this is the key difference)
-        if (!sourceRoots.isEmpty()) {
-            System.out.println("[SpoonStubbingRunner] Adding source roots (NOT adding slice directory)...");
-            for (Path root : sourceRoots) {
-                if (root != null && Files.exists(root) && Files.isDirectory(root)) {
-                    launcher.addInputResource(root.toString());
-                    System.out.println("[SpoonStubbingRunner] Added source root: " + root);
-                }
-            }
-        } else {
-            System.err.println("[SpoonStubbingRunner] ERROR: Strategy B requires source roots but none are available");
-            return new StubbingResult(0, false);
-        }
-
-        // 3) Build full model from source roots
-        CtModel model = null;
-        Factory f = null;
-        
-        try {
-            System.out.println("[SpoonStubbingRunner] Building full model from source roots...");
-            launcher.buildModel();
-            model = launcher.getModel();
-            f = launcher.getFactory();
-            
-            if (model == null || f == null) {
-                throw new IllegalStateException("Model is null after build");
-            }
-            
-            // Verify model has types
-            Collection<CtType<?>> testTypes = safeGetAllTypes(model);
-            if (testTypes == null || testTypes.isEmpty()) {
-                System.err.println("[SpoonStubbingRunner] WARNING: Full model built but contains 0 types");
-                return new StubbingResult(0, false);
-            }
-            
-            System.out.println("[SpoonStubbingRunner] Full model built successfully with " + testTypes.size() + " types");
-        } catch (ModelBuildingException e) {
-            System.err.println("[SpoonStubbingRunner] ModelBuildingException building full model: " + e.getMessage());
-            // Try partial model
-            CtModel partial = launcher.getModel();
-            Factory partialFactory = launcher.getFactory();
-            
-            if (partial != null && partialFactory != null) {
-                try {
-                    Collection<CtType<?>> testTypes = safeGetAllTypes(partial);
-                    if (testTypes != null && !testTypes.isEmpty()) {
-                        System.err.println("[SpoonStubbingRunner] Using partial model despite errors (" + testTypes.size() + " types)");
-                        model = partial;
-                        f = partialFactory;
-                    } else {
-                        return new StubbingResult(0, false);
-                    }
-                } catch (Throwable t) {
-                    return new StubbingResult(0, false);
-                }
-            } else {
-                return new StubbingResult(0, false);
-            }
-        } catch (Exception e) {
-            System.err.println("[SpoonStubbingRunner] Error building full model: " + e.getMessage());
-            e.printStackTrace();
-            return new StubbingResult(0, false);
-        }
-        
-        if (model == null || f == null) {
-            System.err.println("[SpoonStubbingRunner] ERROR: Could not build full model");
-            return new StubbingResult(0, false);
-        }
-
-        // 4) Apply SpoonModelSlicer to keep only slice-relevant elements
-        System.out.println("[SpoonStubbingRunner] Applying SpoonModelSlicer to keep only slice-relevant elements...");
-        SpoonModelSlicer slicer = new SpoonModelSlicer();
-        slicer.sliceModel(model, descriptor);
-        
-        // 5) Collect unresolved elements and generate stubs, then compile (generic, path-agnostic)
-        // Strategy B: can overwrite slice files (we build from source roots, not from existing slice)
-        return performStubbing(model, f, slicedSrcDir, launcher, classpathJars, descriptor, false);
-    }
-    
-    /**
-     * OLD METHOD - DEPRECATED: Try stubbing with context (source roots added to model).
-     * This method is kept for backward compatibility but should not be used in the new pipeline.
-     * The new Strategy B uses tryStubbingWithFullContext instead.
-     * @deprecated Use tryStubbingWithFullContext instead
-     */
-    @Deprecated
-    private StubbingResult tryStubbingWithContext(Path slicedSrcDir, List<Path> classpathJars) throws Exception {
-        System.out.println("[SpoonStubbingRunner] Attempting stubbing with context (source roots)...");
-        
-        // Compute FQNs from slice directory first (to filter duplicates)
-        Set<String> slicedFqns = computeSlicedTypeFqns(slicedSrcDir);
-        System.out.println("[SpoonStubbingRunner] Found " + slicedFqns.size() + " FQNs in slice directory");
-        
-        // Track excluded classes across retries
-        Set<String> excludedFqns = new HashSet<>();
-        int maxRetries = 3;
-        int attempt = 0;
-        
-        while (attempt < maxRetries) {
-            attempt++;
-            if (attempt > 1) {
-                System.out.println("[SpoonStubbingRunner] Retry attempt " + attempt + " (excluding " + excludedFqns.size() + " duplicate classes)...");
-            }
-            
-            // 1) Configure Spoon for Java 11 (fresh launcher each attempt)
-            Launcher launcher = new Launcher();
-            var env = launcher.getEnvironment();
-            env.setComplianceLevel(11);
-            env.setAutoImports(true);
-            env.setSourceOutputDirectory(slicedSrcDir.toFile());
-
-            if (classpathJars == null || classpathJars.isEmpty()) {
-                env.setNoClasspath(true);
-            } else {
-                env.setNoClasspath(false);
-                env.setSourceClasspath(classpathJars.stream().map(Path::toString).toArray(String[]::new));
-            }
-            
-            // 2) Add source roots with FQN filtering (exclude files that define types already in slice OR excluded)
-            Set<String> fqnsToExclude = new HashSet<>(slicedFqns);
-            fqnsToExclude.addAll(excludedFqns);
-            
-            if (!sourceRoots.isEmpty() && !fqnsToExclude.isEmpty()) {
-                System.out.println("[SpoonStubbingRunner] Adding source roots with FQN filtering...");
-                addSourceRootsWithFqnFilter(launcher, fqnsToExclude);
-            } else if (!sourceRoots.isEmpty()) {
-                System.out.println("[SpoonStubbingRunner] Warning: Could not compute slice FQNs, adding all source roots (may cause duplicates)");
-                for (Path root : sourceRoots) {
-                    if (root != null && Files.exists(root) && Files.isDirectory(root)) {
-                        launcher.addInputResource(root.toString());
-                        System.out.println("[SpoonStubbingRunner] Added source root: " + root);
-                    }
-                }
-            }
-
-            // 3) Always add the sliced directory last (takes precedence)
-            launcher.addInputResource(slicedSrcDir.toString());
-            System.out.println("[SpoonStubbingRunner] Added slice directory: " + slicedSrcDir);
-
-            // 4) Build model with context
-            CtModel model = null;
-            Factory f = null;
-            
-            try {
-                System.out.println("[SpoonStubbingRunner] Building model with context...");
-                launcher.buildModel();
-                model = launcher.getModel();
-                f = launcher.getFactory();
-                
-                if (model == null || f == null) {
-                    throw new IllegalStateException("Model is null after build");
-                }
-                
-                // Verify model actually has types
-                try {
-                    Collection<CtType<?>> testTypes = safeGetAllTypes(model);
-                    if (testTypes == null || testTypes.isEmpty()) {
-                        System.err.println("[SpoonStubbingRunner] WARNING: Model built but contains 0 types");
-                        model = null;
-                        f = null;
-                    } else {
-                        System.out.println("[SpoonStubbingRunner] Model built successfully with " + testTypes.size() + " types (with context)");
-                    }
-                } catch (StackOverflowError e) {
-                    System.err.println("[SpoonStubbingRunner] StackOverflowError checking model types");
-                    model = null;
-                    f = null;
-                }
-            } catch (ModelBuildingException e) {
-                System.err.println("[SpoonStubbingRunner] ModelBuildingException on attempt " + attempt + ": " + e.getMessage());
-                
-                // Extract duplicate class names from exception
-                Set<String> duplicates = extractDuplicateClasses(e, slicedFqns);
-                if (!duplicates.isEmpty()) {
-                    System.err.println("[SpoonStubbingRunner] Detected " + duplicates.size() + " duplicate classes: " + duplicates);
-                    excludedFqns.addAll(duplicates);
-                    
-                    if (attempt < maxRetries) {
-                        System.err.println("[SpoonStubbingRunner] Will retry with excluded classes...");
-                        continue; // Retry with excluded classes
-                    } else {
-                        System.err.println("[SpoonStubbingRunner] Max retries reached, giving up");
-                        return new StubbingResult(0, false);
-                    }
-                } else {
-                    // Can't extract duplicates, try partial model
-                    System.err.println("[SpoonStubbingRunner] Could not extract duplicate classes, trying partial model...");
-                    CtModel partial = launcher.getModel();
-                    Factory partialFactory = launcher.getFactory();
-                    
-                    if (partial != null && partialFactory != null) {
-                        try {
-                            Collection<CtType<?>> testTypes = safeGetAllTypes(partial);
-                            if (testTypes != null && !testTypes.isEmpty()) {
-                                System.err.println("[SpoonStubbingRunner] Using partial model despite errors (" + testTypes.size() + " types)");
-                                model = partial;
-                                f = partialFactory;
-                            } else {
-                                if (attempt < maxRetries) {
-                                    continue; // Retry
-                                } else {
-                                    return new StubbingResult(0, false);
-                                }
-                            }
-                        } catch (Throwable t) {
-                            if (attempt < maxRetries) {
-                                continue; // Retry
-                            } else {
-                                return new StubbingResult(0, false);
-                            }
-                        }
-                    } else {
-                        if (attempt < maxRetries) {
-                            continue; // Retry
-                        } else {
-                            return new StubbingResult(0, false);
-                        }
-                    }
-                }
-            } catch (Exception e) {
-                System.err.println("[SpoonStubbingRunner] Error building model with context on attempt " + attempt + ": " + e.getMessage());
-                if (attempt < maxRetries) {
-                    // Try to extract duplicates from any exception message
-                    Set<String> duplicates = extractDuplicateClassesFromMessage(e.getMessage(), slicedFqns);
-                    if (!duplicates.isEmpty()) {
-                        excludedFqns.addAll(duplicates);
-                        System.err.println("[SpoonStubbingRunner] Extracted " + duplicates.size() + " duplicate classes from error message, retrying...");
-                        continue;
-                    }
-                }
-                if (attempt >= maxRetries) {
-                    throw new RuntimeException("Could not build model even with context after " + maxRetries + " attempts", e);
-                }
-                continue; // Retry
-            }
-            
-            // If we got here, model building succeeded
-            if (model != null && f != null) {
-                // 5) Collect unresolved elements and generate stubs, then compile
-                // Note: This is the deprecated path, so we pass null for descriptor (backward compatibility)
-                // Deprecated method - use preserveExistingSliceFiles=false for backward compatibility
-                // (old behavior allowed overwriting)
-                return performStubbing(model, f, slicedSrcDir, launcher, classpathJars, null, false);
-            }
-        }
-        
-        // If we exhausted all retries
-        System.err.println("[SpoonStubbingRunner] ERROR: Could not build model even with context after " + maxRetries + " attempts");
-        return new StubbingResult(0, false);
-    }
-    
-    /**
-     * Extract duplicate class names from ModelBuildingException.
-     * Looks for patterns like "class X already exists" or "duplicate class X".
-     */
-    private Set<String> extractDuplicateClasses(ModelBuildingException e, Set<String> slicedFqns) {
-        Set<String> duplicates = new HashSet<>();
-        String message = e.getMessage();
-        if (message == null) {
-            return duplicates;
-        }
-        
-        // Try to extract from exception message
-        duplicates.addAll(extractDuplicateClassesFromMessage(message, slicedFqns));
-        
-        // Also check cause
-        Throwable cause = e.getCause();
-        if (cause != null && cause.getMessage() != null) {
-            duplicates.addAll(extractDuplicateClassesFromMessage(cause.getMessage(), slicedFqns));
-        }
-        
-        return duplicates;
-    }
-    
-    /**
-     * Extract duplicate class names from an error message string.
-     */
-    private Set<String> extractDuplicateClassesFromMessage(String message, Set<String> slicedFqns) {
-        Set<String> duplicates = new HashSet<>();
-        if (message == null) {
-            return duplicates;
-        }
-        
-        // Pattern 1: "class X already exists" or "type X already exists"
-        java.util.regex.Pattern pattern1 = java.util.regex.Pattern.compile(
-            "(?:class|type)\\s+([a-zA-Z_][a-zA-Z0-9_.]*)\\s+already\\s+exists",
-            java.util.regex.Pattern.CASE_INSENSITIVE
-        );
-        java.util.regex.Matcher matcher1 = pattern1.matcher(message);
-        while (matcher1.find()) {
-            String className = matcher1.group(1);
-            // Only add if it's not already in slice (we want to exclude it from context)
-            if (!slicedFqns.contains(className)) {
-                duplicates.add(className);
-            }
-        }
-        
-        // Pattern 2: "duplicate class X" or "duplicate type X"
-        java.util.regex.Pattern pattern2 = java.util.regex.Pattern.compile(
-            "duplicate\\s+(?:class|type)\\s+([a-zA-Z_][a-zA-Z0-9_.]*)",
-            java.util.regex.Pattern.CASE_INSENSITIVE
-        );
-        java.util.regex.Matcher matcher2 = pattern2.matcher(message);
-        while (matcher2.find()) {
-            String className = matcher2.group(1);
-            if (!slicedFqns.contains(className)) {
-                duplicates.add(className);
-            }
-        }
-        
-        return duplicates;
-    }
-    
-    /**
-     * Perform the actual stubbing: collect unresolved elements and generate stubs, then compile.
-     * This is shared between slice-only and context attempts.
-     * @return StubbingResult with number of stubs created and compilation success status
-     */
     /**
      * Perform stubbing: collect missing elements, generate stubs, print to disk, and compile.
      * 
-     * @param preserveExistingSliceFiles If true (Strategy A), do not overwrite existing .java files
-     *                                   in slicedSrcDir that were written by JavaParser.
-     *                                   If false (Strategy B), allow overwriting (we build from source roots).
+     * Preserves existing JavaParser slice files (don't overwrite).
      */
-    private StubbingResult performStubbing(CtModel model, Factory f, Path slicedSrcDir, Launcher launcher, List<Path> classpathJars, SliceDescriptor descriptor, boolean preserveExistingSliceFiles) throws Exception {
-        // Get slice type FQNs from descriptor (if available) or compute from model
+    private StubbingResult performStubbing(CtModel model, Factory f, Path slicedSrcDir, Launcher launcher, List<Path> classpathJars, SliceDescriptor descriptor) throws Exception {
+        // Get slice type FQNs from descriptor (if available and non-empty) or treat all model types as slice types
         Set<String> sliceTypeFqns;
-        if (descriptor != null) {
+        boolean hasDescriptorSlice =
+            descriptor != null &&
+            descriptor.sliceTypeFqns != null &&
+            !descriptor.sliceTypeFqns.isEmpty();
+        
+        if (hasDescriptorSlice) {
             sliceTypeFqns = descriptor.sliceTypeFqns;
             System.out.println("[SpoonStubbingRunner] Using " + sliceTypeFqns.size() + " slice types from SliceDescriptor");
         } else {
-            // Fallback: compute from model (backward compatibility)
-            sliceTypeFqns = computeSliceTypeFqns(model, slicedSrcDir);
-            System.out.println("[SpoonStubbingRunner] Computed " + sliceTypeFqns.size() + " slice types from model (fallback)");
+            // Fallback: treat all types in the model as slice types (no filtering by descriptor)
+            sliceTypeFqns = safeGetAllTypes(model).stream()
+                .map(CtType::getQualifiedName)
+                .filter(Objects::nonNull)
+                .collect(Collectors.toCollection(LinkedHashSet::new));
+            System.out.println("[SpoonStubbingRunner] No slice types in descriptor; using all " +
+                sliceTypeFqns.size() + " model types as slice types");
         }
         
-        // Create collector with descriptor (path-agnostic)
-        SpoonCollector collector = new SpoonCollector(f, cfg, descriptor);
+        // Build ContextIndex from source roots if available (lightweight, for tie-breaking only)
+        ContextIndex contextIndex = null;
+        if (!sourceRoots.isEmpty()) {
+            System.out.println("[SpoonStubbingRunner] Building ContextIndex from source roots...");
+            System.out.println("[SpoonStubbingRunner] Source roots: " + sourceRoots);
+            try {
+                contextIndex = new SourceRootsContextIndex(sourceRoots);
+                System.out.println("[SpoonStubbingRunner] ✓ ContextIndex built successfully - will be used for tie-breaking");
+            } catch (Throwable e) {
+                System.err.println("[SpoonStubbingRunner] ✗ Warning: Failed to build ContextIndex: " + e.getMessage());
+                System.err.println("[SpoonStubbingRunner] Continuing without ContextIndex (best-effort)");
+                // Continue without ContextIndex (best-effort)
+            }
+        } else {
+            System.out.println("[SpoonStubbingRunner] No source roots available - ContextIndex will NOT be created");
+            System.out.println("[SpoonStubbingRunner] Stubbing will proceed without context-based tie-breaking");
+        }
+        
+        // Create collector with descriptor AND slicedSrcDir for path-based slice detection
+        // Pass ContextIndex for tie-breaking (type ambiguity, owner resolution)
+        if (contextIndex != null) {
+            System.out.println("[SpoonStubbingRunner] Passing ContextIndex to SpoonCollector for tie-breaking");
+        } else {
+            System.out.println("[SpoonStubbingRunner] SpoonCollector will run without ContextIndex");
+        }
+        SpoonCollector collector = new SpoonCollector(f, cfg, descriptor, slicedSrcDir, contextIndex);
         CollectResult plans = collector.collect(model);
 
         // Print collection results (what was detected as missing)
@@ -708,8 +363,8 @@ public final class SpoonStubbingRunner implements Stubber {
         System.out.println("  • " + plans.methodPlans.size() + " method plans");
         System.out.println("==================================================================================\n");
 
-        // 7) Generate stubs (separate handlers per kind) - path-agnostic
-        SpoonStubber stubber = new SpoonStubber(f, cfg, descriptor, plans.annotationAttributes);
+        // 7) Generate stubs (separate handlers per kind) - pass slicedSrcDir for path-based slice detection
+        SpoonStubber stubber = new SpoonStubber(f, cfg, descriptor, plans.annotationAttributes, slicedSrcDir);
         int created = 0;
         created += stubber.applyTypePlans(plans.typePlans);// types (classes/interfaces/annotations)
         created += stubber.applyFieldPlans(plans.fieldPlans);         // fields
@@ -725,14 +380,14 @@ public final class SpoonStubbingRunner implements Stubber {
         stubber.report();                                             // nice summary
 
         // 8) Pretty-print slice types AND stub types (use default printer; safer with JDK11 snippets)
-        // IMPORTANT:
-        // In Strategy A (slice-only), the JavaParser-generated slice in slicedSrcDir is canonical.
+        // IMPORTANT: The JavaParser-generated slice in slicedSrcDir is canonical.
         // Do not overwrite existing slice .java files with Spoon's view of those types.
         // Only add new stub types here.
-        // In Strategy B (full context), we build from source roots and can overwrite.
+        // Get set of modified slice types (types that had members added)
+        Set<String> modifiedSliceTypes = stubber.getModifiedSliceTypeFqns();
         var env = launcher.getEnvironment();
         env.setPrettyPrinterCreator(() -> new DefaultJavaPrettyPrinter(env));
-        prettyPrintSliceTypesOnly(f, sliceTypeFqns, slicedSrcDir, preserveExistingSliceFiles);
+        prettyPrintSliceTypesOnly(f, sliceTypeFqns, slicedSrcDir, modifiedSliceTypes);
         
         // 9) Also write stub types to disk (types that were created but are not slice types)
         Set<String> stubTypeFqns = stubber.getCreatedTypes();
@@ -742,6 +397,20 @@ public final class SpoonStubbingRunner implements Stubber {
         // 10) Compile the generated stubs
         System.out.println("[SpoonStubbingRunner] Compiling generated stubs...");
         boolean compilationSuccess = compileStubs(slicedSrcDir, classpathJars);
+        
+        // Summary: ContextIndex usage
+        System.out.println("\n==================================================================================");
+        System.out.println("CONTEXTINDEX SUMMARY");
+        System.out.println("==================================================================================");
+        if (contextIndex != null) {
+            System.out.println("✓ ContextIndex was created and used for tie-breaking");
+            System.out.println("  - Type canonicalization: Look for '[ContextIndex] Canonicalized' messages above");
+            System.out.println("  - Owner resolution: Look for '[ContextIndex] ✓ Found method' messages above");
+        } else {
+            System.out.println("✗ ContextIndex was NOT created (no source roots or build failed)");
+            System.out.println("  - Stubbing proceeded without context-based tie-breaking");
+        }
+        System.out.println("==================================================================================\n");
         
         if (compilationSuccess) {
             System.out.println("[SpoonStubbingRunner] Compilation succeeded!");
@@ -854,92 +523,6 @@ public final class SpoonStubbingRunner implements Stubber {
     }
     
     /**
-     * Add source roots with FQN filtering - exclude files that define types already in slice or excluded.
-     * This prevents duplicate type definitions while still providing context for type resolution.
-     * More aggressive: skips files that contain ANY excluded type (not just ALL).
-     */
-    private void addSourceRootsWithFqnFilter(Launcher launcher, Set<String> fqnsToExclude) {
-        java.util.concurrent.atomic.AtomicInteger addedFiles = new java.util.concurrent.atomic.AtomicInteger(0);
-        java.util.concurrent.atomic.AtomicInteger skippedFiles = new java.util.concurrent.atomic.AtomicInteger(0);
-        
-        for (Path root : sourceRoots) {
-            if (root == null || !Files.exists(root) || !Files.isDirectory(root)) {
-                continue;
-            }
-            
-            try {
-                Files.walk(root)
-                    .filter(p -> Files.isRegularFile(p) && p.toString().endsWith(".java"))
-                    .filter(p -> !p.toString().contains("package-info"))
-                    .filter(p -> !p.toString().contains("module-info"))
-                    .forEach(javaFile -> {
-                        try {
-                            Set<String> fileFqns = computeFqnsForSourceFile(javaFile);
-                            
-                            if (fileFqns.isEmpty()) {
-                                // Can't parse - be conservative and add it (might be needed for context)
-                                launcher.addInputResource(javaFile.toString());
-                                addedFiles.incrementAndGet();
-                            } else {
-                                // Check if ANY FQN in this file is in the exclusion list
-                                // More aggressive: skip file if it contains ANY excluded type
-                                boolean hasExcluded = fileFqns.stream().anyMatch(fqnsToExclude::contains);
-                                
-                                if (hasExcluded) {
-                                    // Skip - file contains at least one excluded type (would cause duplicates)
-                                    skippedFiles.incrementAndGet();
-                                } else {
-                                    // Add - contains only types not in exclusion list (for context/resolution)
-                                    launcher.addInputResource(javaFile.toString());
-                                    addedFiles.incrementAndGet();
-                                }
-                            }
-                } catch (Throwable ignored) {
-                            // Skip individual file errors
-                        }
-                    });
-            } catch (java.io.IOException e) {
-                System.err.println("[SpoonStubbingRunner] Error walking source root " + root + ": " + e.getMessage());
-            }
-        }
-        
-        System.out.println("[SpoonStubbingRunner] Source root filtering: added " + addedFiles.get() + " files, skipped " + skippedFiles.get() + " files (to avoid duplicates)");
-    }
-
-    /**
-     * Compute FQNs of slice types from the model (types whose source file is in slicedSrcDir).
-     * Uses safe wrapper to handle StackOverflowError.
-     */
-    private Set<String> computeSliceTypeFqns(CtModel model, Path slicedSrcDir) {
-        Set<String> sliceFqns = new HashSet<>();
-        Path sliceRoot = slicedSrcDir.toAbsolutePath().normalize();
-        
-        try {
-            Collection<CtType<?>> allTypes = safeGetAllTypes(model);
-            for (CtType<?> type : allTypes) {
-                try {
-                    spoon.reflect.cu.SourcePosition pos = type.getPosition();
-                    if (pos != null && pos.getFile() != null) {
-                        Path filePath = pos.getFile().toPath().toAbsolutePath().normalize();
-                        if (filePath.startsWith(sliceRoot)) {
-                    String qn = type.getQualifiedName();
-                    if (qn != null && !qn.isEmpty()) {
-                                sliceFqns.add(qn);
-                            }
-                        }
-            }
-        } catch (Throwable ignored) {
-                    // Skip types we can't process
-                }
-            }
-        } catch (Throwable e) {
-            System.err.println("[SpoonStubbingRunner] Error computing slice type FQNs: " + e.getMessage());
-        }
-        
-        return sliceFqns;
-    }
-    
-    /**
      * Safely get all types from model, handling StackOverflowError.
      */
     private Collection<CtType<?>> safeGetAllTypes(CtModel model) {
@@ -958,11 +541,11 @@ public final class SpoonStubbingRunner implements Stubber {
     /**
      * Pretty-print only slice types to the sliced directory.
      * 
-     * @param preserveExistingFiles If true, skip printing types whose .java files already exist
-     *                              (preserves JavaParser's canonical slice in Strategy A).
-     *                              If false, allow overwriting (Strategy B builds from source roots).
+     * Preserves existing JavaParser slice files (don't overwrite) unless they were modified.
+     * 
+     * @param modifiedSliceTypes Set of slice type FQNs that were modified (had members added)
      */
-    private void prettyPrintSliceTypesOnly(Factory f, Set<String> sliceTypeFqns, Path slicedSrcDir, boolean preserveExistingFiles) {
+    private void prettyPrintSliceTypesOnly(Factory f, Set<String> sliceTypeFqns, Path slicedSrcDir, Set<String> modifiedSliceTypes) {
         if (sliceTypeFqns == null || sliceTypeFqns.isEmpty()) {
             System.out.println("[SpoonStubbingRunner] No slice types to print");
                 return;
@@ -1000,16 +583,23 @@ public final class SpoonStubbingRunner implements Stubber {
                 Path outputPath = slicedSrcDir.resolve(relativePath);
                 outputPath.getParent().toFile().mkdirs();
                 
-                // IMPORTANT: In Strategy A, preserve existing JavaParser slice files.
+                // IMPORTANT: Preserve existing JavaParser slice files unless they were actually modified.
                 // JavaParser's TypeExtractor writes the original sliced code, which is the source of truth.
                 // If we overwrite it with Spoon's model version, we might introduce errors
                 // (e.g., incorrect return types inferred from an incomplete slice-only model).
-                // Strategy B can overwrite because it builds from full source roots.
-                if (preserveExistingFiles && Files.exists(outputPath)) {
-                    // File already exists from JavaParser slicing - don't overwrite it
-                    // The original slice is more accurate than what Spoon might infer from an incomplete model
-                    continue;
+                if (Files.exists(outputPath)) {
+                    // File exists - check if it was actually modified by stubber
+                    if (modifiedSliceTypes == null || !modifiedSliceTypes.contains(sliceFqn)) {
+                        // File exists and was NOT modified - preserve it (don't overwrite)
+                        System.out.println("[SpoonStubbingRunner] Preserving existing slice file: " + outputPath + " (no modifications)");
+                        continue;
+                    } else {
+                        // File exists and WAS modified - re-write it with added members
+                        System.out.println("[SpoonStubbingRunner] Re-writing slice type " + sliceFqn + 
+                            " with added members (was modified by stubber)");
+                    }
                 }
+                // File doesn't exist - print it (new stub file)
                 
                 // Use Spoon's prettyprint method to convert the compilation unit to a string
                 String code = cu.prettyprint();
@@ -1166,4 +756,5 @@ public final class SpoonStubbingRunner implements Stubber {
             System.out.println("[SpoonStubbingRunner] Printed " + printed + " stub type(s) to output directory");
         }
     }
+    
 }

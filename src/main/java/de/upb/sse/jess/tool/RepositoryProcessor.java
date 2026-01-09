@@ -552,6 +552,11 @@ public class RepositoryProcessor {
             // - Example: Method 1 creates IMExceptionEvent.java (class file)
             // - Method 2 tries to create IMExceptionEvent/EventType.java (directory + file)
             // - This causes "class clashes with package of same name" error
+            // 
+            // IMPORTANT: Since Spoon model is built from gen/ ONLY (single pipeline), cleaning gen/ ensures:
+            // - Each method starts with a clean slate (only the current method's slice)
+            // - No contamination from previous method's stubs
+            // - No duplicate type definitions in the model
             File genDir = new File(Jess.SRC_OUTPUT);
             if (genDir.exists()) {
                 de.upb.sse.jess.util.FileUtil.deleteRecursively(genDir);
@@ -559,15 +564,17 @@ public class RepositoryProcessor {
             genDir.mkdirs(); // Recreate empty directory
             
             // STRATEGY: Always pass source roots to Jess (if available)
-            // SpoonStubbingRunner will handle the fallback internally:
-            // - First tries slice-only stubbing (ignores source roots even if available)
-            // - If that fails, retries with context (uses source roots)
+            // SpoonStubbingRunner uses single pipeline:
+            // - Builds Spoon model from gen/ ONLY (ignores source roots for model building)
+            // - Builds optional ContextIndex from source roots (if available) for tie-breaking only
+            // - ContextIndex is read-only and never builds a Spoon model
             
             // Create Jess instance with packages (source roots if available)
-            // SpoonStubbingRunner will decide whether to use them or not
+            // SpoonStubbingRunner will use source roots only for ContextIndex (tie-breaking)
             Jess jess = new Jess(config, packages, jars);
 
-            // Step 1: preSlice creates the slice directory
+            // Step 1: preSlice creates the slice directory (writes to gen/)
+            // This is the ONLY source for the Spoon model
             if (!isClinit) {
                 jess.preSlice(targetClass, Collections.singletonList(methodSignature), Collections.emptyList(), Collections.emptyList());
             } else {
@@ -576,8 +583,10 @@ public class RepositoryProcessor {
 
             // Step 2: parse() calls stubber
             // SpoonStubbingRunner.run() will:
-            // - First try slice-only (ignore source roots even if available)
-            // - If model building fails, retry with context
+            // - Build Spoon model from gen/ ONLY (single pipeline)
+            // - Build optional ContextIndex from source roots (if available) for tie-breaking
+            // - Collect missing dependencies and generate stubs
+            // - Write stubs to gen/ and compile
             // CRITICAL: Catch StackOverflowError from JavaParser symbol resolution
             try {
                 jessResult = jess.parse(targetClass);
@@ -588,17 +597,17 @@ public class RepositoryProcessor {
                 jessResult = 2; // INTERNAL_ERROR
             }
 
-            // Note: We can't determine here if slice-only or context was used
-            // SpoonStubbingRunner handles that internally. For statistics, we track based on
-            // whether source roots were available (heuristic: if available, context might have been used)
-            // But the actual decision is made inside SpoonStubbingRunner
+            // Note: Statistics tracking for context vs slice-only
+            // Since we use single pipeline (gen-only model), the distinction is:
+            // - "with context" = ContextIndex was built from source roots (for tie-breaking)
+            // - "slice only" = No source roots available, no ContextIndex
+            // Both use the same pipeline (gen-only model), but ContextIndex improves accuracy
             if (sourceRoots != null && !sourceRoots.isEmpty() && !packages.isEmpty()) {
-                // Source roots were available - SpoonStubbingRunner may have used them
-                // We'll track this, but the actual usage is determined by stubber
+                // Source roots were available - ContextIndex may have been built and used for tie-breaking
                 methodsWithContext.incrementAndGet();
                 contextUsed = true;
             } else {
-                // No source roots available - definitely slice-only
+                // No source roots available - no ContextIndex, pure slice-only
                 methodsSliceOnly.incrementAndGet();
                 contextUsed = false;
             }
