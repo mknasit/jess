@@ -13,6 +13,7 @@ import de.upb.sse.jess.stubbing.spoon.plan.TypeStubPlan;
 import de.upb.sse.jess.stubbing.spoon.plan.MethodStubPlan;
 import de.upb.sse.jess.stubbing.spoon.plan.FieldStubPlan;
 import de.upb.sse.jess.stubbing.spoon.plan.ConstructorStubPlan;
+import de.upb.sse.jess.stubbing.spoon.diagnostics.DiagnosticsPlanExtractor;
 import spoon.Launcher;
 import spoon.compiler.ModelBuildingException;
 import spoon.reflect.CtModel;
@@ -25,6 +26,7 @@ import spoon.reflect.declaration.CtType;
 
 import java.nio.file.Path;
 import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.util.*;
 import java.util.stream.Collectors;
 import java.util.Objects;
@@ -38,6 +40,139 @@ import com.github.javaparser.ast.body.TypeDeclaration;
 public final class SpoonStubbingRunner implements Stubber {
     private final JessConfiguration cfg;
     private final List<Path> sourceRoots;
+    
+    // Experiment state tracking for summary
+    private static class ExperimentState {
+        String targetSourcePath;
+        String targetJavaVersion;
+        String spoonClasspathMode;
+        int spoonClasspathJars;
+        String javacClasspathMode;
+        int javacClasspathJars;
+        Path sliceDir;
+        int sliceTypeCount;
+        int modelTypeCount;
+        String contextIndexStatus;
+        String contextIndexReason;
+        int typePlans;
+        int methodPlans;
+        int fieldPlans;
+        int ctorPlans;
+        int newStubTypesPrinted;
+        int modifiedSliceTypesPrinted;
+        int compileAttempts;
+        List<String> compileAttemptDetails = new ArrayList<>();
+        String finalResult;
+        String failureCategory;
+        
+        void printSummary() {
+            System.out.println("\n==================================================================================");
+            System.out.println("EXPERIMENT SUMMARY");
+            System.out.println("==================================================================================");
+            if (targetSourcePath != null) {
+                System.out.println("Target: " + targetSourcePath);
+            }
+            System.out.println("Java version: " + (targetJavaVersion != null ? targetJavaVersion : "default"));
+            System.out.println("Spoon classpath: " + spoonClasspathMode + (spoonClasspathJars > 0 ? " (" + spoonClasspathJars + " jars)" : ""));
+            System.out.println("javac classpath: " + javacClasspathMode + (javacClasspathJars > 0 ? " (" + javacClasspathJars + " jars)" : ""));
+            System.out.println("Slice dir: " + sliceDir);
+            System.out.println("Slice types: " + sliceTypeCount + " / Model types: " + modelTypeCount);
+            System.out.println("ContextIndex: " + contextIndexStatus + (contextIndexReason != null ? " (" + contextIndexReason + ")" : ""));
+            System.out.println("Plans: types=" + typePlans + " methods=" + methodPlans + " fields=" + fieldPlans + " ctors=" + ctorPlans);
+            System.out.println("Stub output: new=" + newStubTypesPrinted + " modified=" + modifiedSliceTypesPrinted);
+            System.out.println("Compile attempts: " + compileAttempts);
+            for (String detail : compileAttemptDetails) {
+                System.out.println("  " + detail);
+            }
+            System.out.println("Result: " + finalResult);
+            if (failureCategory != null && !"SUCCESS".equals(finalResult)) {
+                System.out.println("Failure category: " + failureCategory);
+            }
+            System.out.println("==================================================================================\n");
+        }
+    }
+    
+    /**
+     * Classify why diagnostics extraction produced 0 plans.
+     */
+    private static String classifyDiagnosticsExtractionFailure(List<CompilerInvoker.DiagnosticInfo> diagnostics) {
+        if (diagnostics == null || diagnostics.isEmpty()) {
+            return "no diagnostics provided";
+        }
+        
+        boolean hasSourcePositions = false;
+        boolean hasSupportedPatterns = false;
+        boolean hasSyntaxErrors = false;
+        
+        for (CompilerInvoker.DiagnosticInfo diag : diagnostics) {
+            if (diag.sourcePath != null && !diag.sourcePath.isEmpty() && diag.line > 0) {
+                hasSourcePositions = true;
+            }
+            
+            String msg = diag.message != null ? diag.message.toLowerCase() : "";
+            if (msg.contains("cannot find symbol")) {
+                hasSupportedPatterns = true;
+            }
+            
+            if (msg.contains("not a statement") || msg.contains("illegal start of") ||
+                msg.contains("';' expected") || msg.contains("class, interface, or enum expected")) {
+                hasSyntaxErrors = true;
+            }
+        }
+        
+        if (hasSyntaxErrors) {
+            return "only syntax errors (not fixable by stubbing)";
+        }
+        if (!hasSourcePositions) {
+            return "diagnostics had no source positions";
+        }
+        if (!hasSupportedPatterns) {
+            return "no supported diagnostic patterns matched";
+        }
+        return "unknown reason";
+    }
+    
+    /**
+     * Classify failure category from diagnostics.
+     */
+    private static String classifyFailure(List<CompilerInvoker.DiagnosticInfo> diagnostics) {
+        if (diagnostics == null || diagnostics.isEmpty()) {
+            return "NO_DIAGNOSTICS";
+        }
+        
+        boolean hasSyntaxError = false;
+        boolean hasClasspathIssue = false;
+        boolean hasMissingSymbol = false;
+        
+        for (CompilerInvoker.DiagnosticInfo diag : diagnostics) {
+            String msg = diag.message != null ? diag.message.toLowerCase() : "";
+            String code = diag.code != null ? diag.code.toLowerCase() : "";
+            
+            // Syntax errors
+            if (msg.contains("not a statement") || msg.contains("illegal start of") ||
+                msg.contains("';' expected") || msg.contains("class, interface, or enum expected") ||
+                msg.contains("unexpected token") || msg.contains("expected")) {
+                hasSyntaxError = true;
+            }
+            
+            // Classpath issues
+            if (msg.contains("package") && msg.contains("does not exist") ||
+                msg.contains("cannot access") || msg.contains("bad class file") ||
+                msg.contains("class file has wrong version") || msg.contains("wrong version")) {
+                hasClasspathIssue = true;
+            }
+            
+            // Missing symbols
+            if (msg.contains("cannot find symbol") || code.contains("compiler.err.cant.resolve")) {
+                hasMissingSymbol = true;
+            }
+        }
+        
+        if (hasSyntaxError) return "SYNTAX_ERROR";
+        if (hasClasspathIssue) return "CLASSPATH_GAP";
+        if (hasMissingSymbol) return "MISSING_SYMBOL";
+        return "OTHER_COMPILER_ERROR";
+    }
 
     public SpoonStubbingRunner(JessConfiguration cfg) {
         this.cfg = cfg;
@@ -65,10 +200,49 @@ public final class SpoonStubbingRunner implements Stubber {
     public int run(Path slicedSrcDir, List<Path> classpathJars, SliceDescriptor descriptor) throws Exception {
         System.out.println("\n>> Using stubber: Spoon Based Stubber" );
         
+        ExperimentState state = new ExperimentState();
+        state.sliceDir = slicedSrcDir;
+        state.targetJavaVersion = cfg.getTargetVersion() != null ? cfg.getTargetVersion() : "default";
+        
+        // Track classpath info
+        if (classpathJars == null || classpathJars.isEmpty()) {
+            state.spoonClasspathMode = "NONE";
+            state.spoonClasspathJars = 0;
+            state.javacClasspathMode = "NONE";
+            state.javacClasspathJars = 0;
+        } else {
+            state.spoonClasspathMode = "JARS";
+            state.spoonClasspathJars = classpathJars.size();
+            state.javacClasspathMode = "JARS";
+            state.javacClasspathJars = classpathJars.size();
+        }
+        
         // Build model from slice directory only (gen/ is canonical)
         System.out.println("[SpoonStubbingRunner] Building model from slice directory only...");
-        StubbingResult result = tryStubbingWithSliceOnly(slicedSrcDir, classpathJars, descriptor);
+        StubbingResult result = tryStubbingWithSliceOnly(slicedSrcDir, classpathJars, descriptor, state);
         
+        // If compilation failed, try diagnostics-driven fallback (max 2 attempts total)
+        if (!result.compilationSuccess && result.diagnostics != null && !result.diagnostics.isEmpty()) {
+            System.out.println("[SpoonStubbingRunner] Compilation failed, attempting diagnostics-driven fallback...");
+            StubbingResult fallbackResult = tryDiagnosticsFallback(slicedSrcDir, classpathJars, descriptor, result.diagnostics, result.factory, state);
+            if (fallbackResult.compilationSuccess) {
+                System.out.println("[SpoonStubbingRunner] Diagnostics fallback succeeded!");
+                state.finalResult = "SUCCESS";
+                state.printSummary();
+                return fallbackResult.stubsCreated;
+            } else {
+                System.out.println("[SpoonStubbingRunner] Diagnostics fallback also failed");
+                state.finalResult = "FAIL";
+                state.failureCategory = classifyFailure(fallbackResult.diagnostics);
+            }
+        } else if (result.compilationSuccess) {
+            state.finalResult = "SUCCESS";
+        } else {
+            state.finalResult = "FAIL";
+            state.failureCategory = classifyFailure(result.diagnostics);
+        }
+        
+        state.printSummary();
         return result.stubsCreated;
     }
     
@@ -78,10 +252,18 @@ public final class SpoonStubbingRunner implements Stubber {
     private static class StubbingResult {
         final int stubsCreated;
         final boolean compilationSuccess;
+        final List<CompilerInvoker.DiagnosticInfo> diagnostics;
+        final Factory factory; // For diagnostics fallback
         
         StubbingResult(int stubsCreated, boolean compilationSuccess) {
+            this(stubsCreated, compilationSuccess, null, null);
+        }
+        
+        StubbingResult(int stubsCreated, boolean compilationSuccess, List<CompilerInvoker.DiagnosticInfo> diagnostics, Factory factory) {
             this.stubsCreated = stubsCreated;
             this.compilationSuccess = compilationSuccess;
+            this.diagnostics = diagnostics;
+            this.factory = factory;
         }
     }
     
@@ -92,7 +274,7 @@ public final class SpoonStubbingRunner implements Stubber {
      * @param descriptor SliceDescriptor (optional metadata)
      * @return StubbingResult with number of stubs created and compilation success status
      */
-    private StubbingResult tryStubbingWithSliceOnly(Path slicedSrcDir, List<Path> classpathJars, SliceDescriptor descriptor) throws Exception {
+    private StubbingResult tryStubbingWithSliceOnly(Path slicedSrcDir, List<Path> classpathJars, SliceDescriptor descriptor, ExperimentState state) throws Exception {
         // 1) Configure Spoon for Java 11
         Launcher launcher = new Launcher();
         var env = launcher.getEnvironment();
@@ -102,9 +284,27 @@ public final class SpoonStubbingRunner implements Stubber {
 
         if (classpathJars == null || classpathJars.isEmpty()) {
             env.setNoClasspath(true);
+            // P2: Log classpath for experiment observability
+            System.out.println("[EXPERIMENT] Spoon classpath: NONE (no-classpath mode)");
+            System.out.println("[EXPERIMENT] javac classpath: NONE (no-classpath mode)");
         } else {
             env.setNoClasspath(false);
-            env.setSourceClasspath(classpathJars.stream().map(Path::toString).toArray(String[]::new));
+            String[] spoonClasspath = classpathJars.stream().map(Path::toString).toArray(String[]::new);
+            env.setSourceClasspath(spoonClasspath);
+            
+            // P2: Log classpath for experiment observability
+            System.out.println("[EXPERIMENT] Spoon classpath: " + spoonClasspath.length + " jar(s)");
+            if (spoonClasspath.length > 0) {
+                int showCount = Math.min(3, spoonClasspath.length);
+                for (int i = 0; i < showCount; i++) {
+                    String jarName = Paths.get(spoonClasspath[i]).getFileName().toString();
+                    System.out.println("[EXPERIMENT]   - " + jarName);
+                }
+                if (spoonClasspath.length > showCount) {
+                    System.out.println("[EXPERIMENT]   - ... and " + (spoonClasspath.length - showCount) + " more");
+                }
+            }
+            System.out.println("[EXPERIMENT] javac classpath: " + classpathJars.size() + " jar(s) (same as Spoon)");
         }
 
         // 2) Compute FQNs from slice directory first (to filter duplicates)
@@ -113,9 +313,11 @@ public final class SpoonStubbingRunner implements Stubber {
         
         // 3) DO NOT add source roots - use only slice directory for this attempt
         // (This is the key: ignore source roots even if available)
+        // INVARIANT: Spoon model built from gen/ only
         System.out.println("[SpoonStubbingRunner] Using only slice directory (source roots ignored for this attempt)");
 
         // 4) Add the sliced directory
+        // INVARIANT VERIFICATION: Only slicedSrcDir is added, no source roots
         launcher.addInputResource(slicedSrcDir.toString());
         System.out.println("[SpoonStubbingRunner] Added slice directory: " + slicedSrcDir);
 
@@ -230,7 +432,7 @@ public final class SpoonStubbingRunner implements Stubber {
         // 6) Collect unresolved elements and generate stubs, then compile
         // Preserve existing JavaParser slice files (don't overwrite)
         // Pass slicedSrcDir so collector/stubber can use path-based slice detection
-        return performStubbing(model, f, slicedSrcDir, launcher, classpathJars, descriptor);
+        return performStubbing(model, f, slicedSrcDir, launcher, classpathJars, descriptor, state);
     }
     
     /**
@@ -238,7 +440,7 @@ public final class SpoonStubbingRunner implements Stubber {
      * 
      * Preserves existing JavaParser slice files (don't overwrite).
      */
-    private StubbingResult performStubbing(CtModel model, Factory f, Path slicedSrcDir, Launcher launcher, List<Path> classpathJars, SliceDescriptor descriptor) throws Exception {
+    private StubbingResult performStubbing(CtModel model, Factory f, Path slicedSrcDir, Launcher launcher, List<Path> classpathJars, SliceDescriptor descriptor, ExperimentState state) throws Exception {
         // Get slice type FQNs from descriptor (if available and non-empty) or treat all model types as slice types
         Set<String> sliceTypeFqns;
         boolean hasDescriptorSlice =
@@ -259,6 +461,11 @@ public final class SpoonStubbingRunner implements Stubber {
                 sliceTypeFqns.size() + " model types as slice types");
         }
         
+        // Track state
+        state.sliceTypeCount = sliceTypeFqns.size();
+        Collection<CtType<?>> allModelTypes = safeGetAllTypes(model);
+        state.modelTypeCount = allModelTypes != null ? allModelTypes.size() : 0;
+        
         // Build ContextIndex from source roots if available (lightweight, for tie-breaking only)
         ContextIndex contextIndex = null;
         if (!sourceRoots.isEmpty()) {
@@ -267,14 +474,18 @@ public final class SpoonStubbingRunner implements Stubber {
             try {
                 contextIndex = new SourceRootsContextIndex(sourceRoots);
                 System.out.println("[SpoonStubbingRunner] ✓ ContextIndex built successfully - will be used for tie-breaking");
+                state.contextIndexStatus = "CREATED";
             } catch (Throwable e) {
                 System.err.println("[SpoonStubbingRunner] ✗ Warning: Failed to build ContextIndex: " + e.getMessage());
                 System.err.println("[SpoonStubbingRunner] Continuing without ContextIndex (best-effort)");
-                // Continue without ContextIndex (best-effort)
+                state.contextIndexStatus = "NOT_CREATED";
+                state.contextIndexReason = "build failed: " + e.getMessage();
             }
         } else {
             System.out.println("[SpoonStubbingRunner] No source roots available - ContextIndex will NOT be created");
             System.out.println("[SpoonStubbingRunner] Stubbing will proceed without context-based tie-breaking");
+            state.contextIndexStatus = "NOT_CREATED";
+            state.contextIndexReason = "no source roots";
         }
         
         // Create collector with descriptor AND slicedSrcDir for path-based slice detection
@@ -287,6 +498,28 @@ public final class SpoonStubbingRunner implements Stubber {
         SpoonCollector collector = new SpoonCollector(f, cfg, descriptor, slicedSrcDir, contextIndex);
         CollectResult plans = collector.collect(model);
 
+        // Track plan counts in state
+        state.typePlans = plans.typePlans.size();
+        state.methodPlans = plans.methodPlans.size();
+        state.fieldPlans = plans.fieldPlans.size();
+        state.ctorPlans = plans.ctorPlans.size();
+        
+        // Track model and slice type counts
+        try {
+            Collection<CtType<?>> allTypes = safeGetAllTypes(model);
+            state.modelTypeCount = allTypes != null ? allTypes.size() : 0;
+        } catch (Throwable e) {
+            state.modelTypeCount = 0;
+        }
+        state.sliceTypeCount = sliceTypeFqns.size();
+        
+        // P2: Log plan counts for experiment observability
+        System.out.println("\n[EXPERIMENT] Plan counts:");
+        System.out.println("  - Type plans: " + plans.typePlans.size());
+        System.out.println("  - Method plans: " + plans.methodPlans.size());
+        System.out.println("  - Field plans: " + plans.fieldPlans.size());
+        System.out.println("  - Constructor plans: " + plans.ctorPlans.size());
+        
         // Print collection results (what was detected as missing)
         System.out.println("\n==================================================================================");
         System.out.println("COLLECTION RESULTS - What Was Detected as Missing (Before Stubbing)");
@@ -394,9 +627,30 @@ public final class SpoonStubbingRunner implements Stubber {
         stubTypeFqns.removeAll(sliceTypeFqns); // Remove slice types (already written)
         prettyPrintStubTypes(f, stubTypeFqns, slicedSrcDir);
         
+        // Track stub output counts
+        state.newStubTypesPrinted = stubTypeFqns.size();
+        state.modifiedSliceTypesPrinted = modifiedSliceTypes.size();
+        
+        // P2: Log printed counts for experiment observability
+        System.out.println("[EXPERIMENT] Printed counts:");
+        System.out.println("  - New stub types: " + stubTypeFqns.size());
+        System.out.println("  - Modified slice types: " + modifiedSliceTypes.size());
+        
         // 10) Compile the generated stubs
+        state.compileAttempts++;
+        System.out.println("[EXPERIMENT] COMPILE attempt=" + state.compileAttempts + " sources=" + slicedSrcDir + " classpath_jars=" + (classpathJars != null ? classpathJars.size() : 0) + " out=" + Jess.CLASS_OUTPUT);
         System.out.println("[SpoonStubbingRunner] Compiling generated stubs...");
-        boolean compilationSuccess = compileStubs(slicedSrcDir, classpathJars);
+        CompilationResult compilationResult = compileStubsWithDiagnostics(slicedSrcDir, classpathJars);
+        boolean compilationSuccess = compilationResult.success;
+        List<CompilerInvoker.DiagnosticInfo> diagnostics = compilationResult.diagnostics;
+        
+        // Track compile attempt in state
+        if (compilationSuccess) {
+            state.compileAttemptDetails.add("attempt=" + state.compileAttempts + " SUCCESS");
+        } else {
+            String category = classifyFailure(diagnostics);
+            state.compileAttemptDetails.add("attempt=" + state.compileAttempts + " FAIL (" + category + ")");
+        }
         
         // Summary: ContextIndex usage
         System.out.println("\n==================================================================================");
@@ -418,7 +672,7 @@ public final class SpoonStubbingRunner implements Stubber {
             System.out.println("[SpoonStubbingRunner] Compilation failed");
         }
         
-        return new StubbingResult(created, compilationSuccess);
+        return new StubbingResult(created, compilationSuccess, diagnostics, f);
     }
     
     /**
@@ -428,28 +682,186 @@ public final class SpoonStubbingRunner implements Stubber {
      * @return true if compilation succeeded, false otherwise
      */
     private boolean compileStubs(Path slicedSrcDir, List<Path> classpathJars) {
+        CompilationResult result = compileStubsWithDiagnostics(slicedSrcDir, classpathJars);
+        return result.success;
+    }
+    
+    /**
+     * Compile the stubbed code and return diagnostics.
+     * @param slicedSrcDir The directory containing source files to compile
+     * @param classpathJars JAR files for classpath
+     * @return CompilationResult with success status and diagnostics
+     */
+    private static class CompilationResult {
+        final boolean success;
+        final List<CompilerInvoker.DiagnosticInfo> diagnostics;
+        
+        CompilationResult(boolean success, List<CompilerInvoker.DiagnosticInfo> diagnostics) {
+            this.success = success;
+            this.diagnostics = diagnostics != null ? diagnostics : new ArrayList<>();
+        }
+    }
+    
+    private CompilationResult compileStubsWithDiagnostics(Path slicedSrcDir, List<Path> classpathJars) {
         try {
             String classOutput = Jess.CLASS_OUTPUT; // "output"
             String targetVersion = cfg.getTargetVersion();
             
             CompilerInvoker compiler = new CompilerInvoker(targetVersion, true); // silent compilation
+            // P0 FIX: Pass classpathJars to CompilerInvoker
             CompilerInvoker.CompilationResult result = compiler.compileFile(
                 java.util.List.of(slicedSrcDir.toString()), 
-                classOutput
+                classOutput,
+                classpathJars  // Pass explicit classpath
             );
             
-            if (!result.success && result.errorMessages != null && !result.errorMessages.isEmpty()) {
-                // Print errors for debugging
-                System.err.println("[SpoonStubbingRunner] Compilation errors:");
-                System.err.println(result.errorMessages);
+            if (!result.success) {
+                // Print structured diagnostics summary
+                if (result.diagnostics != null && !result.diagnostics.isEmpty()) {
+                    int showCount = Math.min(10, result.diagnostics.size());
+                    System.err.println("[EXPERIMENT] COMPILE diagnostics (showing " + showCount + " of " + result.diagnostics.size() + "):");
+                    for (int i = 0; i < showCount; i++) {
+                        CompilerInvoker.DiagnosticInfo diag = result.diagnostics.get(i);
+                        String source = diag.sourcePath != null ? diag.sourcePath : "unknown";
+                        System.err.println("  " + source + ":" + diag.line + ":" + diag.column + ": " + diag.message);
+                    }
+                    if (result.diagnostics.size() > showCount) {
+                        System.err.println("  ... and " + (result.diagnostics.size() - showCount) + " more");
+                    }
+                } else if (result.errorMessages != null && !result.errorMessages.isEmpty()) {
+                    // Fallback to error messages string
+                    String[] errorLines = result.errorMessages.split("; ");
+                    int showCount = Math.min(10, errorLines.length);
+                    System.err.println("[EXPERIMENT] COMPILE errors (showing " + showCount + " of " + errorLines.length + "):");
+                    for (int i = 0; i < showCount; i++) {
+                        System.err.println("  " + errorLines[i]);
+                    }
+                    if (errorLines.length > showCount) {
+                        System.err.println("  ... and " + (errorLines.length - showCount) + " more");
+                    }
+                }
             }
             
-            return result.success;
+            return new CompilationResult(result.success, result.diagnostics);
         } catch (Exception e) {
             System.err.println("[SpoonStubbingRunner] Error during compilation: " + e.getMessage());
             e.printStackTrace();
-            return false;
+            return new CompilationResult(false, new ArrayList<>());
         }
+    }
+    
+    /**
+     * Diagnostics-driven fallback: extract plans from compilation diagnostics and apply them.
+     * @param slicedSrcDir The slice directory (gen/)
+     * @param classpathJars Classpath JARs
+     * @param descriptor SliceDescriptor
+     * @param diagnostics Diagnostics from failed compilation
+     * @param factory Factory from previous attempt
+     * @return StubbingResult with compilation success status
+     */
+    private StubbingResult tryDiagnosticsFallback(Path slicedSrcDir, List<Path> classpathJars, 
+                                                   SliceDescriptor descriptor,
+                                                   List<CompilerInvoker.DiagnosticInfo> diagnostics,
+                                                   Factory factory, ExperimentState state) throws Exception {
+        System.out.println("[EXPERIMENT] DIAGNOSTICS_FALLBACK start");
+        
+        if (factory == null) {
+            System.err.println("[SpoonStubbingRunner] Cannot perform diagnostics fallback: factory is null");
+            return new StubbingResult(0, false);
+        }
+        
+        // Build ContextIndex if source roots are available (same as in tryStubbingWithSliceOnly)
+        // Note: We don't have direct access to source roots here, so we'll create ContextIndex without them
+        // This is acceptable since diagnostics fallback doesn't strictly require ContextIndex
+        ContextIndex contextIndex = null;
+        
+        // Create DiagnosticsPlanExtractor
+        SpoonCollector collector = new SpoonCollector(factory, cfg, descriptor, slicedSrcDir, contextIndex);
+        DiagnosticsPlanExtractor extractor = new DiagnosticsPlanExtractor(factory, contextIndex, collector);
+        
+        // Extract plans from diagnostics
+        CollectResult diagnosticPlans = extractor.extractPlans(diagnostics);
+        
+        if (diagnosticPlans.typePlans.isEmpty() && 
+            diagnosticPlans.fieldPlans.isEmpty() && 
+            diagnosticPlans.methodPlans.isEmpty() &&
+            diagnosticPlans.ctorPlans.isEmpty()) {
+            // Classify why no plans were extracted
+            String reason = classifyDiagnosticsExtractionFailure(diagnostics);
+            System.out.println("[SpoonStubbingRunner] Diagnostics fallback produced 0 new plans, stopping");
+            System.out.println("[EXPERIMENT] DIAGNOSTICS_FALLBACK reason: " + reason);
+            return new StubbingResult(0, false);
+        }
+        
+        System.out.println("[EXPERIMENT] DIAGNOSTICS_FALLBACK extracted: types=" + diagnosticPlans.typePlans.size() + 
+            " fields=" + diagnosticPlans.fieldPlans.size() + " methods=" + diagnosticPlans.methodPlans.size() + 
+            " ctors=" + diagnosticPlans.ctorPlans.size());
+        
+        // Show first few planned symbols
+        int showCount = 3;
+        if (!diagnosticPlans.typePlans.isEmpty()) {
+            System.out.println("[EXPERIMENT] DIAGNOSTICS_FALLBACK sample types: " + 
+                diagnosticPlans.typePlans.stream().limit(showCount).map(tp -> tp.qualifiedName).collect(Collectors.joining(", ")) +
+                (diagnosticPlans.typePlans.size() > showCount ? " ..." : ""));
+        }
+        if (!diagnosticPlans.fieldPlans.isEmpty()) {
+            System.out.println("[EXPERIMENT] DIAGNOSTICS_FALLBACK sample fields: " + 
+                diagnosticPlans.fieldPlans.stream().limit(showCount)
+                    .map(fp -> (fp.ownerType != null ? fp.ownerType.getSimpleName() : "?") + "." + fp.fieldName)
+                    .collect(Collectors.joining(", ")) +
+                (diagnosticPlans.fieldPlans.size() > showCount ? " ..." : ""));
+        }
+        if (!diagnosticPlans.methodPlans.isEmpty()) {
+            System.out.println("[EXPERIMENT] DIAGNOSTICS_FALLBACK sample methods: " + 
+                diagnosticPlans.methodPlans.stream().limit(showCount)
+                    .map(mp -> (mp.ownerType != null ? mp.ownerType.getSimpleName() : "?") + "." + mp.name)
+                    .collect(Collectors.joining(", ")) +
+                (diagnosticPlans.methodPlans.size() > showCount ? " ..." : ""));
+        }
+        
+        // Apply diagnostic plans via SpoonStubber (must NOT overwrite slice files)
+        SpoonStubber stubber = new SpoonStubber(factory, cfg, descriptor, diagnosticPlans.annotationAttributes, slicedSrcDir);
+        int created = 0;
+        created += stubber.applyTypePlans(diagnosticPlans.typePlans);
+        created += stubber.applyFieldPlans(diagnosticPlans.fieldPlans);
+        created += stubber.applyConstructorPlans(diagnosticPlans.ctorPlans);
+        created += stubber.applyMethodPlans(diagnosticPlans.methodPlans);
+        
+        // P1: Verify diagnostics fallback persists slice edits
+        // Write new stub types (not slice types)
+        Set<String> newStubTypeFqns = stubber.getCreatedTypes();
+        prettyPrintStubTypes(factory, newStubTypeFqns, slicedSrcDir);
+        
+        // P1: Also print modified slice types (if diagnostics added members to existing slice types)
+        // This ensures slice edits are persisted before fallback compilation
+        Set<String> modifiedSliceTypes = stubber.getModifiedSliceTypeFqns();
+        if (!modifiedSliceTypes.isEmpty()) {
+            System.out.println("[SpoonStubbingRunner] Printing " + modifiedSliceTypes.size() + " modified slice type(s) after diagnostics fallback");
+            prettyPrintSliceTypesOnly(factory, modifiedSliceTypes, slicedSrcDir, modifiedSliceTypes);
+        }
+        
+        // Track stub output from diagnostics fallback
+        state.newStubTypesPrinted += newStubTypeFqns.size();
+        state.modifiedSliceTypesPrinted += modifiedSliceTypes.size();
+        
+        // P2: Log printed counts for experiment observability (diagnostics fallback)
+        System.out.println("[EXPERIMENT] DIAGNOSTICS_FALLBACK applied: new_stubs=" + newStubTypeFqns.size() + " modified_slice=" + modifiedSliceTypes.size());
+        
+        // Compile again
+        state.compileAttempts++;
+        System.out.println("[EXPERIMENT] COMPILE attempt=" + state.compileAttempts + " sources=" + slicedSrcDir + " classpath_jars=" + (classpathJars != null ? classpathJars.size() : 0) + " out=" + Jess.CLASS_OUTPUT);
+        System.out.println("[SpoonStubbingRunner] Compiling after diagnostics fallback...");
+        CompilationResult compilationResult = compileStubsWithDiagnostics(slicedSrcDir, classpathJars);
+        
+        // Track compile attempt
+        if (compilationResult.success) {
+            state.compileAttemptDetails.add("attempt=" + state.compileAttempts + " SUCCESS (after diagnostics)");
+        } else {
+            String category = classifyFailure(compilationResult.diagnostics);
+            state.compileAttemptDetails.add("attempt=" + state.compileAttempts + " FAIL (" + category + ") after diagnostics");
+        }
+        
+        return new StubbingResult(created, compilationResult.success, compilationResult.diagnostics, factory);
     }
     
     /**
@@ -620,23 +1032,38 @@ public final class SpoonStubbingRunner implements Stubber {
     /**
      * Pretty-print stub types (types created by stubber but not slice types) to the sliced directory.
      * Nested types are handled automatically by Spoon - they're included in the outer class's compilation unit.
+     * 
+     * CRITICAL FIX: Groups nested types (with $) by their top-level outer FQN to ensure they're written
+     * inside the outer class file, not as separate package-level files.
      */
     private void prettyPrintStubTypes(Factory f, Set<String> stubTypeFqns, Path slicedSrcDir) {
         if (stubTypeFqns == null || stubTypeFqns.isEmpty()) {
             return; // No stub types to print
         }
         
-        // Filter out nested types (they'll be included in their outer class's file)
-        Set<String> topLevelStubTypes = new LinkedHashSet<>();
+        // Group all stub types by their top-level outer FQN (strip everything after first '$')
+        // This ensures nested types like Outer$Inner$Deeper are grouped with Outer
+        Map<String, Set<String>> typesByOuter = new LinkedHashMap<>();
         for (String stubFqn : stubTypeFqns) {
-            if (!stubFqn.contains("$")) {
-                topLevelStubTypes.add(stubFqn);
+            String topLevelFqn;
+            if (stubFqn.contains("$")) {
+                // Extract top-level outer: everything before the first '$'
+                int firstDollar = stubFqn.indexOf('$');
+                topLevelFqn = stubFqn.substring(0, firstDollar);
+            } else {
+                topLevelFqn = stubFqn;
             }
+            typesByOuter.computeIfAbsent(topLevelFqn, k -> new LinkedHashSet<>()).add(stubFqn);
         }
         
         int printed = 0;
         
-        for (String stubFqn : topLevelStubTypes) {
+        // Process each top-level type (which includes its nested types)
+        for (String topLevelFqn : typesByOuter.keySet()) {
+            Set<String> nestedFqns = typesByOuter.get(topLevelFqn);
+            
+            // Get the top-level type (must exist - SpoonStubber ensures it)
+            String stubFqn = topLevelFqn;
             try {
                 CtType<?> type = f.Type().get(stubFqn);
                 if (type == null) {
@@ -689,12 +1116,38 @@ public final class SpoonStubbingRunner implements Stubber {
                 // Determine output path based on package and type name
                 String pkg = type.getPackage() != null ? type.getPackage().getQualifiedName() : "";
                 String simpleName = type.getSimpleName();
-                String relativePath;
                 
+                // SAFETY GUARD: Never generate "package X.Y.Outer" where Outer is a TYPE
+                // If the last segment of the package starts with uppercase and exists as a type, it's a nested type
+                // This prevents creating gen/com/google/protobuf/GeneratedMessage/Builder.java
+                if (!pkg.isEmpty()) {
+                    String[] pkgParts = pkg.split("\\.");
+                    if (pkgParts.length > 0) {
+                        String lastSegment = pkgParts[pkgParts.length - 1];
+                        // Check if last segment starts with uppercase (likely a type name)
+                        if (lastSegment.length() > 0 && Character.isUpperCase(lastSegment.charAt(0))) {
+                            String potentialTypeFqn = pkg;
+                            try {
+                                CtType<?> existingType = f.Type().get(potentialTypeFqn);
+                                if (existingType != null) {
+                                    // This is a nested type being written as a package - ERROR!
+                                    System.err.println("[SpoonStubbingRunner] ERROR: Attempted to write nested type " + stubFqn + 
+                                        " as package " + pkg + " but " + potentialTypeFqn + " exists as a TYPE. " +
+                                        "This indicates a bug in nested type canonicalization.");
+                                    continue; // Skip this type
+                                }
+                            } catch (Throwable ignored) {
+                                // Type doesn't exist, safe to proceed
+                            }
+                        }
+                    }
+                }
+                
+                String relativePath;
                 // Top-level type
                 if (pkg.isEmpty()) {
                     relativePath = simpleName + ".java";
-                    } else {
+                } else {
                     relativePath = pkg.replace(".", "/") + "/" + simpleName + ".java";
                 }
                 
@@ -707,6 +1160,9 @@ public final class SpoonStubbingRunner implements Stubber {
                 // DEBUG: Show what's being written for stub types
                 System.out.println("\n==================================================================================");
                 System.out.println("STUB TYPE BEING WRITTEN: " + stubFqn);
+                if (nestedFqns.size() > 1) {
+                    System.out.println("Nested types in this file: " + nestedFqns);
+                }
                 System.out.println("==================================================================================");
                 System.out.println("File: " + outputPath);
                 System.out.println("Type: " + (type instanceof CtClass ? "CLASS" : type instanceof CtInterface ? "INTERFACE" : type instanceof CtAnnotationType ? "ANNOTATION" : "UNKNOWN"));

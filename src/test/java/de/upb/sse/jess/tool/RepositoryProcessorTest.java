@@ -39,8 +39,8 @@ public class RepositoryProcessorTest {
     // ============================================================================
 
     /** Project directory path (REQUIRED) */
-    //private static final String PROJECT_DIR = "/Users/mitul/Documents/study/Thesis/partial compilation/JessTesting/src/test/resources/projects/im-server";
-  private static final String PROJECT_DIR = "/Users/mitul/Documents/study/Thesis/partial compilation/jess/src/test/resources/project/lwjgl3";
+   //  private static final String PROJECT_DIR = "/Users/mitul/Documents/study/Thesis/partial compilation/jess/src/test/resources/project/im-server";
+       private static final String PROJECT_DIR = "/Users/mitul/Documents/study/Thesis/partial compilation/jess/src/test/resources/project/server";
 
     /**
      * Source root directories (OPTIONAL - leave null to auto-detect like experiment script)
@@ -98,7 +98,7 @@ public class RepositoryProcessorTest {
      *   - Consistent testing (same methods processed in same order every time)
      *   - Easier to track progress (methods 1, 2, 3, ... instead of random selection)
      */
-    private static final RepositoryProcessor.SelectionMode SELECTION_MODE = RepositoryProcessor.SelectionMode.SEQUENTIAL;
+    private static final RepositoryProcessor.SelectionMode SELECTION_MODE = RepositoryProcessor.SelectionMode.RANDOM;
     // Alternative: RepositoryProcessor.SelectionMode.RANDOM
 
     // ============================================================================

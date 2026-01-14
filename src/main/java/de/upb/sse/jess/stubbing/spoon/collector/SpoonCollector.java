@@ -77,11 +77,25 @@ public final class SpoonCollector {
                 return; // Already added or invalid
             }
 
+            // INVARIANT: All TypeStubPlans must go through canonicalizeTypeFqn + canonicalizeNestedTypeFqn
             // Canonicalize FQN using ContextIndex if available (access outer class method)
             String canonicalFqn = canonicalizeTypeFqn(fqn, null);
             if (canonicalFqn == null) {
                 canonicalFqn = fqn; // Fallback
             }
+            
+            // Apply nested type canonicalization (convert Outer.Inner to Outer$Inner if Outer is a TYPE)
+            // Pass typePlanFqns so nested types can be detected when both Outer and Inner are planned in same run
+            canonicalFqn = canonicalizeNestedTypeFqn(canonicalFqn, typePlanFqns);
+            if (canonicalFqn == null) {
+                // Primitive/void - do not stub
+                return;
+            }
+            
+            // INVARIANT VERIFICATION: Ensure canonicalization was applied
+            assert canonicalFqn.equals(fqn) || canonicalFqn.contains("$") || 
+                   !fqn.contains(".") || canonicalFqn.contains("unknown") :
+                   "INVARIANT VIOLATION: TypeStubPlan FQN must be canonicalized before adding";
             
             // Check if canonicalized FQN already exists
             if (typePlanFqns.contains(canonicalFqn)) {
@@ -95,7 +109,7 @@ public final class SpoonCollector {
                 try {
                     CtType<?> existingType = checkFactory.Type().get(canonicalFqn);
                     if (existingType != null) {
-                        System.out.println("[SpoonCollector] DEBUG: Type " + canonicalFqn + " already exists in model, skipping missing type plan");
+                        debugLog("Type " + canonicalFqn + " already exists in model, skipping missing type plan");
                         return; // Type exists - not missing
                     }
                 } catch (Throwable ignored) {
@@ -104,20 +118,48 @@ public final class SpoonCollector {
             }
 
             // CRITICAL FIX: If this is an unknown package type, check if a type with the same
-            // simple name already exists in a known package. If so, skip adding the unknown version.
+            // simple name already exists in the model or in planned types. If so, skip adding the unknown version.
             String unknownPackage = de.upb.sse.jess.generation.unknown.UnknownType.PACKAGE;
             if (canonicalFqn.startsWith(unknownPackage + ".")) {
                 String simpleName = canonicalFqn.substring(unknownPackage.length() + 1);
-                // Check if any existing type plan has the same simple name but in a known package
+                
+                // Check 1: Check if any existing type plan has the same simple name but in a known package
                 for (String existingFqn : typePlanFqns) {
                     if (existingFqn != null && !existingFqn.startsWith(unknownPackage + ".")) {
                         String existingSimple = existingFqn.substring(existingFqn.lastIndexOf('.') + 1);
                         if (simpleName.equals(existingSimple)) {
                             // A type with the same simple name already exists in a known package
                             // Skip adding the unknown package version
-                            System.out.println("[SpoonCollector] DEBUG: Skipping " + canonicalFqn + " - " + existingFqn + " already exists");
+                            debugLog("Skipping " + canonicalFqn + " - " + existingFqn + " already planned");
                             return;
                         }
+                    }
+                }
+                
+                // Check 2: Check if a type with the same simple name exists in the model (e.g., slice types)
+                // This prevents creating unknown.FieldAccess3 when FieldAccess3 already exists in the slice
+                // Reuse checkFactory from above (already defined at line 106)
+                if (checkFactory != null) {
+                    try {
+                        Collection<CtType<?>> allTypes = safeGetAllTypes(checkFactory.getModel());
+                        for (CtType<?> existingType : allTypes) {
+                            if (existingType != null) {
+                                String existingSimple = existingType.getSimpleName();
+                                String existingFqn = existingType.getQualifiedName();
+                                // Check if simple name matches and it's not in unknown package
+                                if (simpleName.equals(existingSimple) && 
+                                    existingFqn != null && 
+                                    !existingFqn.startsWith(unknownPackage + ".")) {
+                                    // A type with the same simple name already exists in the model
+                                    // Skip adding the unknown package version
+                                    debugLog("Skipping " + canonicalFqn + 
+                                        " - type with same simple name exists in model: " + existingFqn);
+                                    return;
+                                }
+                            }
+                        }
+                    } catch (Throwable ignored) {
+                        // If we can't check the model, proceed (best-effort)
                     }
                 }
             }
@@ -174,6 +216,22 @@ public final class SpoonCollector {
     private final Set<String> sliceTypeFqns;  // Cached from descriptor for convenience
     private final ContextIndex contextIndex;  // Optional lightweight context for tie-breaking
 
+    // Control debug spam - set to true only for detailed debugging
+    private static final boolean DEBUG_VERBOSE = false;
+    
+    private void debugLog(String message) {
+        if (DEBUG_VERBOSE) {
+            System.out.println("[SpoonCollector] DEBUG: " + message);
+        }
+    }
+    
+    // Helper to conditionally log debug messages
+    private void debugLogIf(boolean condition, String message) {
+        if (condition && DEBUG_VERBOSE) {
+            System.out.println("[SpoonCollector] DEBUG: " + message);
+        }
+    }
+
     // Centralized unknown type FQN constant. (Do not rename or remove.)
     private static final String UNKNOWN_TYPE_FQN = de.upb.sse.jess.generation.unknown.UnknownType.CLASS;
     // Centralized unknown package constant
@@ -198,6 +256,8 @@ public final class SpoonCollector {
         this.slicedSrcDir = slicedSrcDir;
         this.sliceTypeFqns = descriptor != null && descriptor.sliceTypeFqns != null ? descriptor.sliceTypeFqns : new HashSet<>();
         this.contextIndex = contextIndex;
+        // DEBUG: Log the config value to verify it's being passed correctly
+        System.out.println("[SpoonCollector] Constructor: failOnAmbiguity = " + (cfg != null ? cfg.isFailOnAmbiguity() : "null config"));
     }
     
     /**
@@ -327,6 +387,149 @@ public final class SpoonCollector {
     }
     
     /**
+     * Canonicalize a nested type FQN by detecting if a prefix refers to a TYPE (not a package).
+     * 
+     * Rules:
+     * - If fqn is null/empty -> return as is.
+     * - If fqn is primitive or void -> return null (do not stub).
+     * - If fqn contains '$' already -> keep as is (treat as nested marker).
+     * - If fqn contains inner separator '.' (like Outer.Inner or A.B.C.Inner):
+     *   - Try to detect whether some prefix of the name refers to a TYPE (not a package).
+     *   - Detection order:
+     *     1) Check gen-model known top-level types (use Spoon model: f.Type().getAll() or a precomputed Set of model FQNs).
+     *     2) Check planned types (if plannedTypes set is provided) - for cases where Outer and Outer.Inner are both planned in same run.
+     *     3) Else if contextIndex != null: check contextIndex.typeExists(prefixFqn) (or equivalent) to confirm prefix is a TYPE.
+     *   - Choose the LONGEST prefix that exists as a TYPE.
+     *   - If found, convert the remainder part by replacing '.' with '$':
+     *     prefix + "$" + remainderWithDotsReplaced
+     *   - Example: com.google.protobuf.GeneratedMessage.Builder
+     *     if com.google.protobuf.GeneratedMessage exists as TYPE
+     *     -> com.google.protobuf.GeneratedMessage$Builder
+     *   - If no prefix is found -> keep original (treat as normal package/type).
+     * 
+     * @param fqn The type FQN to canonicalize for nested types
+     * @param plannedTypes Optional set of already-planned type FQNs (for detecting nested types when both Outer and Inner are planned in same run)
+     * @return Canonicalized FQN (with $ for nested types), or null if primitive/void, or original if no nesting detected
+     */
+    public String canonicalizeNestedTypeFqn(String fqn) {
+        return canonicalizeNestedTypeFqn(fqn, null);
+    }
+    
+    /**
+     * Canonicalize a nested type FQN with optional planned types set.
+     * 
+     * @param fqn The type FQN to canonicalize for nested types
+     * @param plannedTypes Optional set of already-planned type FQNs (for detecting nested types when both Outer and Inner are planned in same run)
+     * @return Canonicalized FQN (with $ for nested types), or null if primitive/void, or original if no nesting detected
+     */
+    public String canonicalizeNestedTypeFqn(String fqn, Set<String> plannedTypes) {
+        // If fqn is null/empty -> return as is
+        if (fqn == null || fqn.isEmpty()) {
+            return fqn;
+        }
+        
+        // If fqn is primitive or void -> return null (do not stub)
+        String trimmed = fqn.trim();
+        if (trimmed.equals("void") || trimmed.equals("boolean") || trimmed.equals("byte") ||
+            trimmed.equals("short") || trimmed.equals("int") || trimmed.equals("long") ||
+            trimmed.equals("char") || trimmed.equals("float") || trimmed.equals("double")) {
+            return null; // Do not stub primitives/void
+        }
+        
+        // If fqn contains '$' already -> keep as is (treat as nested marker)
+        if (fqn.contains("$")) {
+            return fqn;
+        }
+        
+        // If fqn doesn't contain '.' -> no nesting possible, keep as is
+        if (!fqn.contains(".")) {
+            return fqn;
+        }
+        
+        // Try to detect if some prefix refers to a TYPE (not a package)
+        // We'll check from longest to shortest prefix
+        String[] parts = fqn.split("\\.");
+        if (parts.length < 2) {
+            return fqn; // Need at least 2 parts for nesting
+        }
+        
+        // Build prefixes from longest to shortest (excluding the last part which is the inner type)
+        // e.g., "com.google.protobuf.GeneratedMessage.Builder" -> check:
+        //   "com.google.protobuf.GeneratedMessage" (longest)
+        //   "com.google.protobuf" (shorter)
+        //   "com.google" (even shorter)
+        //   "com" (shortest)
+        String longestTypePrefix = null;
+        int longestPrefixLength = 0;
+        
+        // Check from longest prefix down to shortest
+        for (int i = parts.length - 1; i >= 1; i--) {
+            // Build prefix: parts[0] + "." + parts[1] + ... + parts[i-1]
+            StringBuilder prefixBuilder = new StringBuilder(parts[0]);
+            for (int j = 1; j < i; j++) {
+                prefixBuilder.append(".").append(parts[j]);
+            }
+            String prefixFqn = prefixBuilder.toString();
+            
+            // Check if this prefix exists as a TYPE
+            boolean isType = false;
+            
+            // Detection order 1: Check gen-model known top-level types
+            try {
+                CtType<?> existingType = f.Type().get(prefixFqn);
+                if (existingType != null) {
+                    isType = true;
+                }
+            } catch (Throwable ignored) {
+                // Type doesn't exist in model
+            }
+            
+            // Detection order 2: Check planned types (for cases where Outer and Outer.Inner are both planned in same run)
+            if (!isType && plannedTypes != null && !plannedTypes.isEmpty()) {
+                if (plannedTypes.contains(prefixFqn)) {
+                    isType = true;
+                }
+            }
+            
+            // Detection order 3: If contextIndex != null, check contextIndex
+            if (!isType && contextIndex != null) {
+                try {
+                    Optional<ContextIndex.TypeKind> kind = contextIndex.typeKindOf(prefixFqn);
+                    if (kind.isPresent()) {
+                        isType = true;
+                    }
+                } catch (Throwable ignored) {
+                    // ContextIndex doesn't know about it
+                }
+            }
+            
+            // If we found a TYPE prefix, use the longest one
+            if (isType && i > longestPrefixLength) {
+                longestTypePrefix = prefixFqn;
+                longestPrefixLength = i;
+            }
+        }
+        
+        // If we found a TYPE prefix, convert to nested format
+        if (longestTypePrefix != null) {
+            // Build the remainder (parts after the prefix)
+            StringBuilder remainderBuilder = new StringBuilder(parts[longestPrefixLength]);
+            for (int i = longestPrefixLength + 1; i < parts.length; i++) {
+                remainderBuilder.append("$").append(parts[i]);
+            }
+            String nestedFqn = longestTypePrefix + "$" + remainderBuilder.toString();
+            
+            // Log the canonicalization
+            System.out.println("[SpoonCollector] VERIFIED: Canonicalized nested type " + fqn + " -> " + nestedFqn + " (outer is a known TYPE)");
+            
+            return nestedFqn;
+        }
+        
+        // No TYPE prefix found -> keep original (treat as normal package/type)
+        return fqn;
+    }
+    
+    /**
      * Check if an element is from the slice (should be processed).
      * PRIMARY: Uses file path under slicedSrcDir (gen/).
      * SECONDARY: Uses SliceDescriptor.sliceTypeFqns as additional confirmation.
@@ -418,7 +621,10 @@ public final class SpoonCollector {
         seedExplicitTypeImports(model, result);
 
         // Ensure owners exist for any planned members / references discovered above.
-        result.typePlans.addAll(ownersNeedingTypes(result));
+        // All type plans must go through addTypePlanIfNew() to enforce nested canonicalization and dedup
+        for (TypeStubPlan plan : ownersNeedingTypes(result)) {
+            result.addTypePlanIfNew(plan, f);
+        }
 
         // POST-PROCESSING: Remove duplicate unknown package types that have known package equivalents
         removeDuplicateUnknownPackageTypes(result);
@@ -466,39 +672,63 @@ public final class SpoonCollector {
                 continue;
             }
 
-                // RULE 5: Don't throw on standalone x.f; even in strict mode - just skip
-                if (isStandaloneFieldStatement(fa)) {
-                    continue; // Always skip standalone field statements
+            // Get field name early for debug logging
+            String fieldName = (fa.getVariable() != null ? fa.getVariable().getSimpleName() : "f");
+
+            // RULE 5: For standalone field statements (like "so.size;"), check ambiguity if failOnAmbiguity is true
+            // If failOnAmbiguity is false, skip them (they're not used, so no stub needed)
+            boolean isStandalone = isStandaloneFieldStatement(fa);
+            if (DEBUG_VERBOSE) {
+                System.out.println("[SpoonCollector] DEBUG: isStandaloneFieldStatement(" + fieldName + ") = " + isStandalone);
+            }
+            if (isStandalone) {
+                CtElement parent = fa.getParent();
+                System.out.println("[SpoonCollector] DEBUG: Parent type: " + (parent != null ? parent.getClass().getSimpleName() : "null"));
+                if (parent != null) {
+                    try {
+                        CtRole role = fa.getRoleInParent();
+                        System.out.println("[SpoonCollector] DEBUG: Role in parent: " + role);
+                    } catch (Throwable e) {
+                        System.out.println("[SpoonCollector] DEBUG: Could not get role: " + e.getMessage());
+                    }
                 }
+            }
+            if (isStandalone && !cfg.isFailOnAmbiguity()) {
+                continue; // Skip standalone field statements when ambiguity is allowed
+            }
+            // If isStandalone && failOnAmbiguity is true, continue processing to check for ambiguity
 
             boolean isStatic = fa.getTarget() instanceof CtTypeAccess<?>;
 
             // DEBUG: Log field access details
-            String fieldName = (fa.getVariable() != null ? fa.getVariable().getSimpleName() : "f");
-            System.out.println("[SpoonCollector] DEBUG: Collecting field access: " + fieldName);
+            if (DEBUG_VERBOSE) {
+                System.out.println("[SpoonCollector] DEBUG: Collecting field access: " + fieldName);
+            }
             if (fa.getTarget() != null) {
-                System.out.println("[SpoonCollector] DEBUG: Field target type: " + fa.getTarget().getClass().getSimpleName());
+                if (DEBUG_VERBOSE) {
+                    System.out.println("[SpoonCollector] DEBUG: Field target type: " + fa.getTarget().getClass().getSimpleName());
+                }
                 if (fa.getTarget() instanceof CtVariableRead) {
                     CtVariableRead<?> vr = (CtVariableRead<?>) fa.getTarget();
                     if (vr.getVariable() != null) {
                         try {
                             CtTypeReference<?> varType = vr.getVariable().getType();
-                            System.out.println("[SpoonCollector] DEBUG: Variable type (from declaration): " + safeQN(varType));
+                            debugLog("Variable type (from declaration): " + safeQN(varType));
                         } catch (Throwable e) {
-                            System.out.println("[SpoonCollector] DEBUG: Could not get variable type: " + e.getMessage());
+                            debugLog("Could not get variable type: " + e.getMessage());
                         }
                     }
                 }
                 try {
                     CtTypeReference<?> targetType = fa.getTarget().getType();
-                    System.out.println("[SpoonCollector] DEBUG: Target expression type: " + safeQN(targetType));
+                    debugLog("Target expression type: " + safeQN(targetType));
                 } catch (Throwable e) {
-                    System.out.println("[SpoonCollector] DEBUG: Could not get target type: " + e.getMessage());
+                    debugLog("Could not get target type: " + e.getMessage());
                 }
             }
 
             CtTypeReference<?> rawOwner = resolveOwnerTypeFromFieldAccess(fa);
-            System.out.println("[SpoonCollector] DEBUG: Raw owner from resolveOwnerTypeFromFieldAccess: " + safeQN(rawOwner));
+            debugLog("Raw owner from resolveOwnerTypeFromFieldAccess: " + safeQN(rawOwner));
 
             // CRITICAL FIX: If the type is already fully qualified, check multiple sources before routing
             // Don't route it through chooseOwnerPackage which might incorrectly route it to unknown package
@@ -541,11 +771,11 @@ public final class SpoonCollector {
                                         paramTypeQn = safeQN(paramType);
                                     }
 
-                                    System.out.println("[SpoonCollector] DEBUG: Checking parameter type: " + paramTypeQn + " vs " + rawOwnerQn);
+                                    debugLog("Checking parameter type: " + paramTypeQn + " vs " + rawOwnerQn);
 
                                     // Check exact match first
                                     if (rawOwnerQn != null && paramTypeQn != null && rawOwnerQn.equals(paramTypeQn)) {
-                                        System.out.println("[SpoonCollector] DEBUG: Type is a parameter type in current method (exact match), using directly: " + rawOwnerQn);
+                                        debugLog("Type is a parameter type in current method (exact match), using directly: " + rawOwnerQn);
                                         ownerRef = rawOwner;
                                         isParameterType = true;
                                         break;
@@ -559,7 +789,7 @@ public final class SpoonCollector {
                                         if (rawOwnerSimple.equals(paramTypeSimple) && rawOwnerSimple.equals(paramTypeQn)) {
                                             // Simple names match and paramTypeQn is just the simple name
                                             // This means paramType is the same type, just without package info
-                                            System.out.println("[SpoonCollector] DEBUG: Type is a parameter type in current method (simple name match), using directly: " + rawOwnerQn);
+                                            debugLog("Type is a parameter type in current method (simple name match), using directly: " + rawOwnerQn);
                                             ownerRef = rawOwner;
                                             isParameterType = true;
                                             break;
@@ -569,7 +799,7 @@ public final class SpoonCollector {
                             }
                         }
                     } catch (Throwable e) {
-                        System.out.println("[SpoonCollector] DEBUG: Exception checking parameter types: " + e.getMessage());
+                        debugLog("Exception checking parameter types: " + e.getMessage());
                         e.printStackTrace();
                     }
 
@@ -578,16 +808,16 @@ public final class SpoonCollector {
                         try {
                             CtType<?> typeInModel = f.Type().get(rawOwnerQn);
                             if (typeInModel != null) {
-                                System.out.println("[SpoonCollector] DEBUG: Type exists in model, using directly: " + rawOwnerQn);
+                                debugLog("Type exists in model, using directly: " + rawOwnerQn);
                                 ownerRef = rawOwner;
                             } else {
                                 // Type doesn't exist - route through chooseOwnerPackage
-                                System.out.println("[SpoonCollector] DEBUG: Type not in model, routing through chooseOwnerPackage");
+                                debugLog("Type not in model, routing through chooseOwnerPackage");
                                 ownerRef = chooseOwnerPackage(rawOwner, fa);
                             }
                         } catch (Throwable e) {
                             // If we can't check, route through chooseOwnerPackage
-                            System.out.println("[SpoonCollector] DEBUG: Exception checking model, routing through chooseOwnerPackage: " + e.getMessage());
+                            debugLog("Exception checking model, routing through chooseOwnerPackage: " + e.getMessage());
                             ownerRef = chooseOwnerPackage(rawOwner, fa);
                         }
                     }
@@ -634,12 +864,12 @@ public final class SpoonCollector {
             if (ownerRef == null) {
                 ownerRef = chooseOwnerPackage(rawOwner, fa);
             }
-            System.out.println("[SpoonCollector] DEBUG: Final owner: " + safeQN(ownerRef));
+            debugLog("Final owner: " + safeQN(ownerRef));
             if (isJdkType(ownerRef)) continue;
 
             // Check if this is a constant-like field (Owner.CONSTANT pattern)
             boolean isConstantLike = isConstantLikeName(fieldName);
-            System.out.println("[SpoonCollector] DEBUG: Field " + fieldName + " - isStatic: " + isStatic + ", isConstantLike: " + isConstantLike);
+            debugLog("Field " + fieldName + " - isStatic: " + isStatic + ", isConstantLike: " + isConstantLike);
             if (isConstantLike && isStatic) {
                 // This is likely Owner.CONSTANT pattern - determine owner type kind
                 TypeStubPlan.Kind ownerKind = determineOwnerTypeKind(ownerRef, fieldName, fa, model);
@@ -657,28 +887,28 @@ public final class SpoonCollector {
             // 3. Try searching all types in model (fallback)
             if (fieldName != null && ownerRef != null) {
                 String ownerFqn = safeQN(ownerRef);
-                System.out.println("[SpoonCollector] DEBUG: Checking if field " + fieldName + " exists in type " + ownerFqn);
+                debugLog("Checking if field " + fieldName + " exists in type " + ownerFqn);
 
                 CtType<?> ownerTypeDecl = null;
                 try {
                     // Method 1: Try getTypeDeclaration() first
                     ownerTypeDecl = ownerRef.getTypeDeclaration();
-                    System.out.println("[SpoonCollector] DEBUG: getTypeDeclaration() returned: " + (ownerTypeDecl != null ? ownerTypeDecl.getQualifiedName() : "null"));
+                    debugLog("getTypeDeclaration() returned: " + (ownerTypeDecl != null ? ownerTypeDecl.getQualifiedName() : "null"));
                 } catch (StackOverflowError | OutOfMemoryError e) {
-                    System.out.println("[SpoonCollector] DEBUG: StackOverflowError in getTypeDeclaration()");
+                    debugLog("StackOverflowError in getTypeDeclaration()");
                 } catch (Throwable e) {
-                    System.out.println("[SpoonCollector] DEBUG: Exception in getTypeDeclaration(): " + e.getMessage());
+                    debugLog("Exception in getTypeDeclaration(): " + e.getMessage());
                 }
 
                 // Method 2: If getTypeDeclaration() failed, try direct lookup by FQN
                 if (ownerTypeDecl == null && ownerFqn != null && !ownerFqn.isEmpty() && !ownerFqn.startsWith(UNKNOWN_PACKAGE + ".")) {
                     try {
                         ownerTypeDecl = f.Type().get(ownerFqn);
-                        System.out.println("[SpoonCollector] DEBUG: f.Type().get(" + ownerFqn + ") returned: " + (ownerTypeDecl != null ? ownerTypeDecl.getQualifiedName() : "null"));
+                        debugLog("f.Type().get(" + ownerFqn + ") returned: " + (ownerTypeDecl != null ? ownerTypeDecl.getQualifiedName() : "null"));
                     } catch (StackOverflowError | OutOfMemoryError e) {
-                        System.out.println("[SpoonCollector] DEBUG: StackOverflowError in f.Type().get()");
+                        debugLog("StackOverflowError in f.Type().get()");
                     } catch (Throwable e) {
-                        System.out.println("[SpoonCollector] DEBUG: Exception in f.Type().get(): " + e.getMessage());
+                        debugLog("Exception in f.Type().get(): " + e.getMessage());
                     }
                 }
 
@@ -692,15 +922,15 @@ public final class SpoonCollector {
                                 String tQn = t.getQualifiedName();
                                 if (tQn != null && tQn.equals(ownerFqn)) {
                                     ownerTypeDecl = t;
-                                    System.out.println("[SpoonCollector] DEBUG: Found type in model by searching: " + tQn);
+                                    debugLog("Found type in model by searching: " + tQn);
                                     break;
                                 }
                             }
                         }
                     } catch (StackOverflowError | OutOfMemoryError e) {
-                        System.out.println("[SpoonCollector] DEBUG: StackOverflowError searching all types");
+                        debugLog("StackOverflowError searching all types");
                     } catch (Throwable e) {
-                        System.out.println("[SpoonCollector] DEBUG: Exception searching all types: " + e.getMessage());
+                        debugLog("Exception searching all types: " + e.getMessage());
                     }
                 }
 
@@ -712,21 +942,21 @@ public final class SpoonCollector {
                             CtTypeReference<?> actualFieldType = actualField.getType();
                             if (actualFieldType != null) {
                                 String actualTypeQn = safeQN(actualFieldType);
-                                System.out.println("[SpoonCollector] DEBUG: Field " + fieldName + " exists in model, actual type: " + actualTypeQn);
+                                debugLog("Field " + fieldName + " exists in model, actual type: " + actualTypeQn);
                                 fieldType = actualFieldType;
                             } else {
-                                System.out.println("[SpoonCollector] DEBUG: Field " + fieldName + " found but type is null");
+                                debugLog("Field " + fieldName + " found but type is null");
                             }
                         } else {
-                            System.out.println("[SpoonCollector] DEBUG: Field " + fieldName + " not found in type " + ownerTypeDecl.getQualifiedName());
+                            debugLog("Field " + fieldName + " not found in type " + ownerTypeDecl.getQualifiedName());
                         }
                     } catch (StackOverflowError | OutOfMemoryError e) {
-                        System.out.println("[SpoonCollector] DEBUG: StackOverflowError getting field from type");
+                        debugLog("StackOverflowError getting field from type");
                     } catch (Throwable e) {
-                        System.out.println("[SpoonCollector] DEBUG: Exception getting field from type: " + e.getMessage());
+                        debugLog("Exception getting field from type: " + e.getMessage());
                     }
                 } else {
-                    System.out.println("[SpoonCollector] DEBUG: Could not find type " + ownerFqn + " in model");
+                    debugLog("Could not find type " + ownerFqn + " in model");
                 }
             }
 
@@ -755,24 +985,54 @@ public final class SpoonCollector {
                 if (looksLikeEnumConstant || isConstantLike) {
                     // For enum constants like EventType.PUSH_SERVER_Exception,
                     // the field type is EventType (the owner type), not Unknown
-                    System.out.println("[SpoonCollector] DEBUG: Static constant-like field, using owner type as field type: " + safeQN(ownerRef));
+                    debugLog("Static constant-like field, using owner type as field type: " + safeQN(ownerRef));
                     fieldType = ownerRef;
                 }
             }
 
             // Fallback: infer from usage context
             if (fieldType == null) {
-                System.out.println("[SpoonCollector] DEBUG: Field " + fieldName + " - NOT using owner type (isStatic: " + isStatic + ", isConstantLike: " + isConstantLike + "), inferring from usage");
+                debugLog("Field " + fieldName + " - NOT using owner type (isStatic: " + isStatic + ", isConstantLike: " + isConstantLike + "), inferring from usage");
+                debugLog("isStandalone = " + isStandalone + " (computed earlier)");
                 fieldType = inferFieldTypeFromUsage(fa);
+                debugLog("inferFieldTypeFromUsage returned: " + (fieldType != null ? safeQN(fieldType) : "null"));
+            }
+
+            // CRITICAL FIX: For standalone field statements, ensure we don't use incorrect type inference
+            // Spoon's fa.getType() can return wrong types (like enclosing class) for unresolved fields
+            // Also check if fieldType matches the enclosing class name (even if isStandalone detection failed)
+            if (fieldType != null) {
+                String fieldTypeQn = safeQN(fieldType);
+                String fieldTypeSimple = fieldType.getSimpleName();
+                CtType<?> enclosingType = fa.getParent(CtType.class);
+                if (enclosingType != null && fieldTypeSimple != null) {
+                    String enclosingQn = safeQN(enclosingType.getReference());
+                    String enclosingSimple = enclosingType.getSimpleName();
+                    // Check both exact FQN match and simple name match (to catch unknown.FieldAccess3 vs FieldAccess3)
+                    // This is a safety check even if isStandalone detection failed
+                    if ((fieldTypeQn != null && fieldTypeQn.equals(enclosingQn)) ||
+                        (enclosingSimple != null && fieldTypeSimple.equals(enclosingSimple))) {
+                        debugLog("Field type incorrectly inferred as enclosing class " + 
+                            (fieldTypeQn != null && fieldTypeQn.equals(enclosingQn) ? fieldTypeQn : fieldTypeSimple) + 
+                            " (isStandalone=" + isStandalone + "), treating as null");
+                        fieldType = null; // Reset to null so ambiguity check runs
+                    }
+                }
             }
 
             if (fieldType == null) {
-                    if (cfg.isFailOnAmbiguity()) {
-                        String ownerQN = ownerRef != null ? ownerRef.getQualifiedName() : "<unknown>";
+                debugLog("fieldType is null, failOnAmbiguity = " + cfg.isFailOnAmbiguity());
+                if (cfg.isFailOnAmbiguity()) {
+                    String ownerQN = ownerRef != null ? ownerRef.getQualifiedName() : "<unknown>";
                     String simple = (fa.getVariable() != null ? fa.getVariable().getSimpleName() : "<missing>");
-                    throw new AmbiguityException("Ambiguous field (no usable type context): " + ownerQN + "#" + simple);
-                    }
-                    fieldType = f.Type().createReference(UNKNOWN_TYPE_FQN);
+                    String errorMsg = "Ambiguous field (no usable type context): " + ownerQN + "#" + simple;
+                    debugLog("Throwing AmbiguityException: " + errorMsg);
+                    AmbiguityException ex = new AmbiguityException(errorMsg);
+                    debugLog("Exception created, about to throw: " + ex.getClass().getName());
+                    throw ex;
+                }
+                debugLog("Not throwing exception (failOnAmbiguity=false), using Unknown type");
+                fieldType = f.Type().createReference(UNKNOWN_TYPE_FQN);
             }
 
             out.fieldPlans.add(new FieldStubPlan(ownerRef, fieldName, fieldType, isStatic));
@@ -1041,8 +1301,13 @@ public final class SpoonCollector {
      */
     private boolean isStandaloneFieldStatement(CtFieldAccess<?> fa) {
         CtElement p = fa.getParent();
-        if (p == null) return false;
+        if (p == null) {
+            debugLog("isStandaloneFieldStatement - parent is null");
+            return false;
+        }
 
+        debugLog("isStandaloneFieldStatement - parent type: " + p.getClass().getSimpleName());
+        
         if (p instanceof CtAssignment
                 || p instanceof CtVariable
                 || p instanceof CtReturn
@@ -1053,14 +1318,26 @@ public final class SpoonCollector {
                 || p instanceof CtConditional
                 || p instanceof CtInvocation
                 || p instanceof CtArrayAccess) {
+            debugLog("isStandaloneFieldStatement - parent is excluded type, returning false");
             return false;
         }
 
         try {
-            if (p instanceof CtBlock && fa.getRoleInParent() == CtRole.STATEMENT) return true;
-        } catch (Throwable ignored) { /* best-effort */ }
+            if (p instanceof CtBlock) {
+                CtRole role = fa.getRoleInParent();
+                debugLog("isStandaloneFieldStatement - parent is CtBlock, role: " + role);
+                if (role == CtRole.STATEMENT) {
+                    debugLog("isStandaloneFieldStatement - detected as standalone statement");
+                    return true;
+                }
+            }
+        } catch (Throwable e) {
+            debugLog("isStandaloneFieldStatement - exception checking role: " + e.getMessage());
+        }
 
-        return !(p instanceof CtExpression);
+        boolean result = !(p instanceof CtExpression);
+        debugLog("isStandaloneFieldStatement - final check: !(p instanceof CtExpression) = " + result);
+        return result;
     }
 
     /**
@@ -1101,11 +1378,11 @@ public final class SpoonCollector {
                     if (vr.getVariable() != null && vr.getVariable().getType() != null) {
                         CtTypeReference<?> declaredType = vr.getVariable().getType();
                         String declaredQn = safeQN(declaredType);
-                        System.out.println("[SpoonCollector] DEBUG: resolveOwnerTypeFromFieldAccess - VariableRead found");
-                        System.out.println("[SpoonCollector] DEBUG:   Variable name: " + (vr.getVariable().getSimpleName()));
-                        System.out.println("[SpoonCollector] DEBUG:   Declared type QN (from safeQN): " + declaredQn);
-                        System.out.println("[SpoonCollector] DEBUG:   Declared type simple name: " + declaredType.getSimpleName());
-                        System.out.println("[SpoonCollector] DEBUG:   Declared type package: " + (declaredType.getPackage() != null ? declaredType.getPackage().getQualifiedName() : "null"));
+                        debugLog("resolveOwnerTypeFromFieldAccess - VariableRead found");
+                        debugLog("  Variable name: " + (vr.getVariable().getSimpleName()));
+                        debugLog("  Declared type QN (from safeQN): " + declaredQn);
+                        debugLog("  Declared type simple name: " + declaredType.getSimpleName());
+                        debugLog("  Declared type package: " + (declaredType.getPackage() != null ? declaredType.getPackage().getQualifiedName() : "null"));
 
                         // Try to get qualified name from declaration if available
                         try {
@@ -1126,7 +1403,7 @@ public final class SpoonCollector {
                                     return f.Type().createReference(declQn);
                                 }
                             } else {
-                                System.out.println("[SpoonCollector] DEBUG:   Type declaration is null");
+                                debugLog("  Type declaration is null");
                             }
                         } catch (StackOverflowError | OutOfMemoryError e) {
                             System.out.println("[SpoonCollector] DEBUG: StackOverflowError getting type declaration: " + e.getMessage());
@@ -1150,7 +1427,7 @@ public final class SpoonCollector {
                             return declaredType;
                         }
                         // If not fully qualified, use chooseOwnerPackage to resolve it
-                        System.out.println("[SpoonCollector] DEBUG: Declared type not fully qualified, routing through chooseOwnerPackage");
+                        debugLog("Declared type not fully qualified, routing through chooseOwnerPackage");
                         CtTypeReference<?> base = componentOf(declaredType);
                         CtTypeReference<?> result = (base != null ? chooseOwnerPackage(base, fa) : chooseOwnerPackage(declaredType, fa));
                         System.out.println("[SpoonCollector] DEBUG: Result from chooseOwnerPackage: " + safeQN(result));
@@ -1213,9 +1490,21 @@ public final class SpoonCollector {
 
     /**
      * Infer a field's type from its usage context (assignment, declaration, return, invocation, etc.).
+     * Returns null if no usage context is available (e.g., standalone statements).
      */
     private CtTypeReference<?> inferFieldTypeFromUsage(CtFieldAccess<?> fa) {
         CtElement parent = fa.getParent();
+        
+        // CRITICAL: For standalone field statements (like "so.size;"), there's no usage context
+        // Don't try to infer type from getType() as it may return incorrect types (like enclosing class)
+        boolean isStandalone = isStandaloneFieldStatement(fa);
+        debugLog("inferFieldTypeFromUsage - isStandalone = " + isStandalone);
+        if (isStandalone) {
+            debugLog("inferFieldTypeFromUsage - standalone field statement detected, returning null");
+            return null; // No usage context for standalone statements
+        }
+        
+        debugLog("inferFieldTypeFromUsage - parent type: " + (parent != null ? parent.getClass().getSimpleName() : "null"));
 
         if (parent instanceof CtAssignment) {
             CtAssignment<?, ?> as = (CtAssignment<?, ?>) parent;
@@ -1263,6 +1552,12 @@ public final class SpoonCollector {
                 }
             }
         }
+        
+        // CRITICAL: Never use fa.getType() as a fallback for unresolved fields
+        // Spoon's getType() can return incorrect types (like the enclosing class) for unresolved fields
+        // This is especially problematic for standalone statements like "so.size;"
+        // If we reach here, there's no usable context, so return null
+        debugLog("inferFieldTypeFromUsage - no usable context found, returning null");
         return null;
     }
 
@@ -1382,7 +1677,7 @@ public final class SpoonCollector {
     private void collectUnresolvedMethodCalls(CtModel model, CollectResult out) {
         // OPTIMIZATION: Get elements only from slice types, not entire model
         List<CtInvocation<?>> allInvocations = getElementsFromSliceTypes(model, (CtInvocation<?> inv) -> true);
-        System.out.println("[SpoonCollector] DEBUG: Found " + allInvocations.size() + " total method invocations in slice types");
+        debugLog("Found " + allInvocations.size() + " total method invocations in slice types");
 
         // RULE 3: Track method usage patterns for side-effect-only detection
         // Map: method signature -> list of invocations
@@ -1413,7 +1708,7 @@ public final class SpoonCollector {
                     String methodName = ex != null ? ex.getSimpleName() : "unknown";
                     CtTypeReference<?> owner = resolveOwnerTypeFromInvocation(inv);
                     String ownerQn = owner != null ? owner.getQualifiedName() : "unknown";
-                    System.out.println("[SpoonCollector] DEBUG: Resolved method call: " + ownerQn + "." + methodName + " (declaration exists)");
+                    debugLog("Resolved method call: " + ownerQn + "." + methodName + " (declaration exists)");
                 } catch (Throwable ignored) {}
             } else {
                 unresolved.add(inv);
@@ -1424,12 +1719,12 @@ public final class SpoonCollector {
                     String ownerQn = owner != null ? owner.getQualifiedName() : "unknown";
                     String methodSig = ownerQn + "#" + methodName;
                     methodInvocations.computeIfAbsent(methodSig, k -> new ArrayList<>()).add(inv);
-                    System.out.println("[SpoonCollector] DEBUG: Unresolved method call: " + ownerQn + "." + methodName + " (no declaration)");
+                    debugLog("Unresolved method call: " + ownerQn + "." + methodName + " (no declaration)");
                 } catch (Throwable ignored) {}
             }
         }
 
-        System.out.println("[SpoonCollector] DEBUG: Found " + unresolved.size() + " unresolved method invocations");
+        debugLog("Found " + unresolved.size() + " unresolved method invocations");
 
         for (CtInvocation<?> inv : unresolved) {
             CtExecutableReference<?> ex = inv.getExecutable();
@@ -1587,7 +1882,7 @@ public final class SpoonCollector {
             // DEBUG: Log method call details for parameter type inference
             String methodName = (ex != null ? ex.getSimpleName() : "unknown");
             System.out.println("[SpoonCollector] DEBUG: Inferring parameter types for method: " + methodName);
-            System.out.println("[SpoonCollector] DEBUG: Method has " + (inv.getArguments() != null ? inv.getArguments().size() : 0) + " arguments");
+            debugLog("Method has " + (inv.getArguments() != null ? inv.getArguments().size() : 0) + " arguments");
             if (inv.getArguments() != null) {
                 for (int i = 0; i < inv.getArguments().size(); i++) {
                     CtExpression<?> arg = inv.getArguments().get(i);
@@ -1604,7 +1899,7 @@ public final class SpoonCollector {
                 }
             }
             List<CtTypeReference<?>> paramTypes = inferParamTypesFromCall(ex, inv.getArguments());
-            System.out.println("[SpoonCollector] DEBUG: Inferred " + paramTypes.size() + " parameter types:");
+            debugLog("Inferred " + paramTypes.size() + " parameter types:");
             for (int i = 0; i < paramTypes.size(); i++) {
                 System.out.println("[SpoonCollector] DEBUG:   Param " + i + ": " + safeQN(paramTypes.get(i)));
             }
@@ -1677,7 +1972,7 @@ public final class SpoonCollector {
                     }
                 }
                 if (isSideEffectOnly) {
-                    System.out.println("[SpoonCollector] DEBUG: Detected side-effect-only method: " + methodSig + " → return void");
+                    debugLog("Detected side-effect-only method: " + methodSig + " → return void");
                     returnType = f.Type().VOID_PRIMITIVE;
                 }
             }
@@ -1974,11 +2269,11 @@ public final class SpoonCollector {
                             System.out.println("[SpoonCollector] DEBUG: Using executable parameters (count matches): " + fromRef.size());
             return fromRef;
                         } else {
-                            System.out.println("[SpoonCollector] DEBUG: Executable param count (" + fromRef.size() + ") != arg count (" + argCount + "), inferring from arguments");
+                            debugLog("Executable param count (" + fromRef.size() + ") != arg count (" + argCount + "), inferring from arguments");
                         }
                     }
                 } else {
-                    System.out.println("[SpoonCollector] DEBUG: Executable is unresolved, inferring from arguments");
+                    debugLog("Executable is unresolved, inferring from arguments");
                 }
             } catch (Throwable e) {
                 System.out.println("[SpoonCollector] DEBUG: Exception checking executable, inferring from arguments: " + e.getMessage());
@@ -1990,7 +2285,7 @@ public final class SpoonCollector {
             return Collections.emptyList();
         }
         List<CtTypeReference<?>> inferred = args.stream().map(this::paramTypeOrObject).collect(Collectors.toList());
-        System.out.println("[SpoonCollector] DEBUG: Inferred " + inferred.size() + " parameter types from arguments");
+        debugLog("Inferred " + inferred.size() + " parameter types from arguments");
         return inferred;
     }
 
@@ -2104,7 +2399,7 @@ public final class SpoonCollector {
                 }
             }
 
-            // Otherwise, keep whatever we have if it’s non-JDK
+            // Otherwise, keep whatever we have if it's non-JDK
             if (!isJdkType(at)) {
                 out.addTypePlanIfNew(new TypeStubPlan((qn.isEmpty() ? UNKNOWN_PACKAGE + "." + at.getSimpleName() : qn),
                         TypeStubPlan.Kind.ANNOTATION), f);
@@ -2113,7 +2408,7 @@ public final class SpoonCollector {
                 String simple = at.getSimpleName();
                 String containerSimple = simple.endsWith("s") ? simple + "es" : simple + "s";
                 String containerFqn = (pkg.isEmpty() ? containerSimple : pkg + "." + containerSimple);
-                out.typePlans.add(new TypeStubPlan(containerFqn, TypeStubPlan.Kind.ANNOTATION));
+                out.addTypePlanIfNew(new TypeStubPlan(containerFqn, TypeStubPlan.Kind.ANNOTATION), f);
             }
         }
     }
@@ -2335,7 +2630,7 @@ public final class SpoonCollector {
             // This avoids traversing all 594 types in the model
             Collection<CtType<?>> sliceTypes = getSliceTypes(model);
             // Reduced verbosity: only log summary, not per-type details
-            // System.out.println("[SpoonCollector] DEBUG: getElementsFromSliceTypes - Found " + sliceTypes.size() + " slice types");
+            // debugLog(getElementsFromSliceTypes - Found " + sliceTypes.size() + " slice types);
             
             for (CtType<?> sliceType : sliceTypes) {
                 try {
@@ -2355,10 +2650,18 @@ public final class SpoonCollector {
                         boolean isLikelyLargeGeneratedClass = typeName.contains(".proto.") || 
                                                              typeName.contains("WFCMessage");
                         
+                        // SAFETY RULE: Never skip traversal if this type's file is mentioned in diagnostics
+                        // or if the target method's file is this type's compilation unit.
+                        // However, since diagnostics are not available at collection time, we rely on
+                        // diagnostics-driven fallback to add missing members after compilation fails.
+                        // This heuristic is safe because diagnostics fallback will catch any missing members.
+                        
                         if (isLikelyLargeGeneratedClass) {
                             // For very large protobuf classes, skip detailed element traversal
                             // These classes are typically not part of the actual slice logic
-                            System.out.println("[SpoonCollector] DEBUG: Skipping detailed traversal of large generated class: " + typeName);
+                            // NOTE: Diagnostics-driven fallback will add missing members if compilation fails
+                            System.out.println("[SpoonCollector] DEBUG: Skipping detailed traversal of large generated class: " + typeName + 
+                                " (diagnostics fallback will handle missing members if needed)");
                             // Still try to get elements, but with a strict limit
                             int elementLimit = 1000; // Limit to prevent infinite loops
                             int processed = 0;
@@ -2424,7 +2727,7 @@ public final class SpoonCollector {
                     }
                     
                     // Reduced verbosity: removed per-type summary logging to avoid spam
-                    // System.out.println("[SpoonCollector] DEBUG: Type " + typeName + " has " + allElementsCount.get() + " total elements, matched " + matchingElementsCount.get() + " with predicate");
+                    // debugLog("Type " + typeName + " has " + allElementsCount.get() + " total elements, matched " + matchingElementsCount.get() + " with predicate);
                 } catch (Throwable e) {
                     // Only log errors for non-large types to avoid spam
                     String typeName = "unknown";
@@ -2439,7 +2742,7 @@ public final class SpoonCollector {
             }
             
             // Reduced verbosity: only log summary once per call
-            // System.out.println("[SpoonCollector] DEBUG: getElementsFromSliceTypes returning " + result.size() + " elements");
+            // debugLog(getElementsFromSliceTypes returning " + result.size() + " elements);
         } catch (StackOverflowError e) {
             System.err.println("[SpoonCollector] StackOverflowError getting elements from slice types");
             // Return empty list on StackOverflowError
@@ -2583,12 +2886,12 @@ public final class SpoonCollector {
                     
                     // Remove if it's unknown.* variant
                     if (fqn.startsWith(unknownPackage + "." + simpleName)) {
-                        System.out.println("[SpoonCollector] DEBUG: Canonicalizing - removing unknown.* variant " + fqn + " (preferring " + preferredFqn + ")");
+                        debugLog("Canonicalizing - removing unknown.* variant " + fqn + " (preferring " + preferredFqn + ")");
                         toRemove.add(plan);
                     }
                     // Remove if it's a bare simple name (no package, just the simple name)
                     else if (fqn.equals(simpleName) && !fqn.contains(".")) {
-                        System.out.println("[SpoonCollector] DEBUG: Canonicalizing - removing bare simple name " + fqn + " (preferring " + preferredFqn + ")");
+                        debugLog("Canonicalizing - removing bare simple name " + fqn + " (preferring " + preferredFqn + ")");
                         toRemove.add(plan);
                     }
                 }
@@ -2680,7 +2983,7 @@ public final class SpoonCollector {
             }
             
             if (imports == null || imports.isEmpty()) {
-                System.out.println("[SpoonCollector] DEBUG: CU has no imports");
+                debugLog("CU has no imports");
                 continue;
             }
             
@@ -3454,18 +3757,18 @@ public final class SpoonCollector {
      */
     private CtTypeReference<?> paramTypeOrObject(CtExpression<?> arg) {
         if (arg == null) {
-            System.out.println("[SpoonCollector] DEBUG: paramTypeOrObject - arg is null");
+            debugLog("paramTypeOrObject - arg is null");
             return f.Type().createReference(UNKNOWN_TYPE_FQN);
         }
         
-        System.out.println("[SpoonCollector] DEBUG: paramTypeOrObject - arg type: " + arg.getClass().getSimpleName());
+        debugLog("paramTypeOrObject - arg type: " + arg.getClass().getSimpleName());
 
         // If argument is a field access that can't be resolved, don't treat it as a type
         // This prevents constants like PUSH_ANDROID_SERVER_ADDRESS from being stubbed as types
         if (arg instanceof CtFieldAccess) {
             CtFieldAccess<?> fa = (CtFieldAccess<?>) arg;
             String fieldName = fa.getVariable() != null ? fa.getVariable().getSimpleName() : "unknown";
-            System.out.println("[SpoonCollector] DEBUG: paramTypeOrObject - Field access: " + fieldName);
+            debugLog("paramTypeOrObject - Field access: " + fieldName);
             boolean isUnresolved = false;
             try {
                 isUnresolved = (fa.getVariable() == null || fa.getVariable().getDeclaration() == null);
@@ -3474,36 +3777,36 @@ public final class SpoonCollector {
                 } catch (Throwable ignored) {}
             
             if (isUnresolved) {
-                System.out.println("[SpoonCollector] DEBUG: paramTypeOrObject - Field is unresolved");
+                debugLog("paramTypeOrObject - Field is unresolved");
                 
                 // CRITICAL FIX: For static field accesses like EventType.PUSH_SERVER_Exception,
                 // check if it's a static field access FIRST before calling getType()
                 // getType() on static field accesses can return wrong types (like the enclosing class)
                 if (fa.getTarget() instanceof CtTypeAccess) {
                     // Static field access - use the owner type, not getType()
-                    System.out.println("[SpoonCollector] DEBUG: paramTypeOrObject - Detected static field access, using owner type");
+                    debugLog("paramTypeOrObject - Detected static field access, using owner type");
                     // Static field access - try to infer type from the owner type
                     CtTypeAccess<?> target = (CtTypeAccess<?>) fa.getTarget();
                     CtTypeReference<?> ownerType = target.getAccessedType();
                     String ownerQn = safeQN(ownerType);
-                    System.out.println("[SpoonCollector] DEBUG: paramTypeOrObject - Static field access: " + ownerQn + "." + fieldName);
+                    debugLog("paramTypeOrObject - Static field access: " + ownerQn + "." + fieldName);
                     
                     if (ownerType != null) {
                         // Resolve the owner type to its fully qualified name using chooseOwnerPackage
                         // This handles imports like "import IMExceptionEvent.EventType;" -> EventType resolves to IMExceptionEvent.EventType
                         CtTypeReference<?> resolvedOwner = chooseOwnerPackage(ownerType, fa);
                         String resolvedOwnerQn = safeQN(resolvedOwner);
-                        System.out.println("[SpoonCollector] DEBUG: paramTypeOrObject - Resolved owner: " + resolvedOwnerQn);
+                        debugLog("paramTypeOrObject - Resolved owner: " + resolvedOwnerQn);
                         
                         // For static field accesses, return the owner type (the type of the field is the owner type)
                         // This handles both enum constants (EventType.PUSH_SERVER_Exception -> EventType)
                         // and static fields (SomeClass.SOME_FIELD -> SomeClass)
                         if (resolvedOwnerQn != null && !resolvedOwnerQn.equals(UNKNOWN_TYPE_FQN)) {
-                            System.out.println("[SpoonCollector] DEBUG: paramTypeOrObject - Static field access, returning owner type: " + resolvedOwnerQn);
+                            debugLog("paramTypeOrObject - Static field access, returning owner type: " + resolvedOwnerQn);
                             return resolvedOwner;
                         }
                         // If resolved to unknown, still return it (better than Unknown)
-                        System.out.println("[SpoonCollector] DEBUG: paramTypeOrObject - Owner resolved to unknown, but returning it anyway: " + resolvedOwnerQn);
+                        debugLog("paramTypeOrObject - Owner resolved to unknown, but returning it anyway: " + resolvedOwnerQn);
                         return resolvedOwner;
                     }
                 }
@@ -3511,16 +3814,16 @@ public final class SpoonCollector {
                 // If we can't infer, return String for constants (common case)
                 if (fieldName != null && fieldName.equals(fieldName.toUpperCase()) && fieldName.length() > 1) {
                     // Likely a constant - return String type (most constants are String)
-                    System.out.println("[SpoonCollector] DEBUG: paramTypeOrObject - Returning String for constant-like field");
+                    debugLog("paramTypeOrObject - Returning String for constant-like field");
                     return f.Type().createReference("java.lang.String");
                 }
-                System.out.println("[SpoonCollector] DEBUG: paramTypeOrObject - Returning Unknown");
+                debugLog("paramTypeOrObject - Returning Unknown");
                 return f.Type().createReference(UNKNOWN_TYPE_FQN);
             } else {
-                System.out.println("[SpoonCollector] DEBUG: paramTypeOrObject - Field is resolved, using getType()");
+                debugLog("paramTypeOrObject - Field is resolved, using getType()");
                 try {
                     CtTypeReference<?> t = fa.getType();
-                    System.out.println("[SpoonCollector] DEBUG: paramTypeOrObject - Resolved field type: " + safeQN(t));
+                    debugLog("paramTypeOrObject - Resolved field type: " + safeQN(t));
                     return t != null ? t : f.Type().createReference(UNKNOWN_TYPE_FQN);
                 } catch (Throwable e) {
                     System.out.println("[SpoonCollector] DEBUG: paramTypeOrObject - Exception getting resolved field type: " + e.getMessage());

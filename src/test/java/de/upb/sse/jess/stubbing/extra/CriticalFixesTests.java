@@ -63,5 +63,11 @@ public class CriticalFixesTests {
     void type_conversion_binary_ops() {
         assertEquals(0, jess.parse("src/test/resources/stubbing/extra/critical_fixes/TypeConversionTest.java"));
     }
+    
+    @Test
+    @DisplayName("Nested type canonicalization: Outer.Inner -> Outer$Inner (prevents package/type clash)")
+    void nested_type_canonicalization() {
+        assertEquals(0, jess.parse("src/test/resources/stubbing/extra/critical_fixes/NestedTypeCanonicalizationTest.java"));
+    }
 }
 

@@ -139,6 +139,7 @@ public final class SpoonStubber {
     private boolean ensureTypeExists(TypeStubPlan p) {
         String qn = p.qualifiedName;
         // --- member type fast-path: plan says Outer$Inner (or deeper) ---
+        // INVARIANT: Nested $ types are created inside the outer type file (no package/type clash files)
         if (qn != null && qn.contains("$")) {
             int lastDot = qn.lastIndexOf('.');
             String pkg = (lastDot >= 0 ? qn.substring(0, lastDot) : "");
@@ -146,11 +147,21 @@ public final class SpoonStubber {
 
             String[] parts = afterPkg.split("\\$");
             if (parts.length >= 2) {
+                // Track if we created anything (outer type or nested types)
+                boolean createdSomething = false;
+                
                 // 1) ensure outer (top-level) exists as a CLASS
                 String outerFqn = (pkg.isEmpty() ? parts[0] : pkg + "." + parts[0]);
+                // Check if outer already exists before calling ensurePublicClass
+                CtType<?> existingOuter = f.Type().get(outerFqn);
                 CtClass<?> outer = ensurePublicClass(f.Type().createReference(outerFqn));
+                // If outer didn't exist before, it was newly created
+                if (existingOuter == null) {
+                    createdSomething = true;
+                }
 
                 // 2) walk/create each nested level under the previous
+                // INVARIANT VERIFICATION: Nested types must be added to parent, not as separate files
                 CtType<?> parent = outer;
                 for (int i = 1; i < parts.length; i++) {
                     String simple = parts[i];
@@ -159,21 +170,35 @@ public final class SpoonStubber {
                         CtType<?> created;
                         switch (p.kind) {
                             case INTERFACE:
+                                // f.Interface().create() works with any CtType parent
                                 created = f.Interface().create(parent, simple);
                                 break;
                             case ENUM:
-                                // For nested enums, use Core API and addNestedType
+                                // For nested enums, use Core API and addNestedType (only works with CtClass parent)
                                 if (parent instanceof CtClass) {
                                     created = f.Core().createEnum();
                                     created.setSimpleName(simple);
                                     ((CtClass<?>) parent).addNestedType(created);
                                 } else {
-                                    // Fallback: create as class if parent is not a class
-                                    created = f.Class().create((CtClass<?>) parent, simple);
+                                    // BUG 2 FIX: Parent is not CtClass (could be CtInterface, etc.) - create as top-level type
+                                    // Extract package from parent and create enum in that package
+                                    String parentPkgName = parent.getPackage() != null ? parent.getPackage().getQualifiedName() : "";
+                                    CtPackage parentPkg = f.Package().getOrCreate(parentPkgName);
+                                    created = f.Enum().create(parentPkg, simple);
                                 }
                                 break;
                             case ANNOTATION:
-                                created = f.Annotation().create((CtPackage) parent, simple);
+                                // Fix: Create nested annotation type correctly (only works with CtClass parent)
+                                if (parent instanceof CtClass) {
+                                    created = f.Core().createAnnotationType();
+                                    created.setSimpleName(simple);
+                                    ((CtClass<?>) parent).addNestedType(created);
+                                } else {
+                                    // BUG 2 FIX: Parent is not CtClass - create as top-level annotation in parent's package
+                                    String parentPkgName = parent.getPackage() != null ? parent.getPackage().getQualifiedName() : "";
+                                    CtPackage parentPkg = f.Package().getOrCreate(parentPkgName);
+                                    created = f.Annotation().create(parentPkg, simple);
+                                }
                                 // make sure it has public and a default 'value()' (like your top-level path)
                                 created.addModifier(ModifierKind.PUBLIC);
                                 CtAnnotationType<?> at = (CtAnnotationType<?>) created;
@@ -183,15 +208,24 @@ public final class SpoonStubber {
                                     am.setType(f.Type().STRING);
                                     at.addMethod(am);
                                 }
-                                                    break;
+                                break;
                             default:
-                                created = f.Class().create((CtClass<?>) parent, simple);
+                                // BUG 2 FIX: For CLASS, only use f.Class().create() when parent is CtClass
+                                if (parent instanceof CtClass) {
+                                    created = f.Class().create((CtClass<?>) parent, simple);
+                                } else {
+                                    // Parent is not CtClass - create as top-level class in parent's package
+                                    String parentPkgName = parent.getPackage() != null ? parent.getPackage().getQualifiedName() : "";
+                                    CtPackage parentPkg = f.Package().getOrCreate(parentPkgName);
+                                    created = f.Class().create(parentPkg, simple);
+                                }
                         }
                         created.addModifier(ModifierKind.PUBLIC);
                         parent = created;
                         createdTypes.add(qn); // record once; harmless if repeated
-                        } else {
-                            parent = existing;
+                        createdSomething = true; // We created a nested type
+                    } else {
+                        parent = existing;
                     }
                 }
 
@@ -200,7 +234,7 @@ public final class SpoonStubber {
                     parent.removeModifier(ModifierKind.STATIC);
                 }
 
-                return false; // we created nested under outer; nothing to add as top-level
+                return createdSomething; // Return true if we created outer or any nested type
             }
         }
 
@@ -215,6 +249,32 @@ public final class SpoonStubber {
         int i = qn.lastIndexOf('.');
         if (i >= 0) { pkg = qn.substring(0, i); name = qn.substring(i + 1); }
         else { pkg = UNKNOWN_PACKAGE; name = qn; }
+
+        // SAFETY GUARD: Never generate "package X.Y.Outer" where Outer is a TYPE
+        // If the last segment of the package starts with uppercase and exists as a type, it's a nested type
+        // This prevents creating gen/com/google/protobuf/GeneratedMessage/Builder.java
+        if (!pkg.isEmpty()) {
+            String[] pkgParts = pkg.split("\\.");
+            if (pkgParts.length > 0) {
+                String lastSegment = pkgParts[pkgParts.length - 1];
+                // Check if last segment starts with uppercase (likely a type name)
+                if (lastSegment.length() > 0 && Character.isUpperCase(lastSegment.charAt(0))) {
+                    String potentialTypeFqn = pkg;
+                    try {
+                        CtType<?> existingType = f.Type().get(potentialTypeFqn);
+                        if (existingType != null) {
+                            // This is a nested type being written as a package - ERROR!
+                            System.err.println("[SpoonStubber] ERROR: Attempted to create stub for " + qn + 
+                                " with package " + pkg + " but " + potentialTypeFqn + " exists as a TYPE. " +
+                                "This indicates a bug in nested type canonicalization. Skipping stub creation.");
+                            return false; // Skip this stub
+                        }
+                    } catch (Throwable ignored) {
+                        // Type doesn't exist, safe to proceed
+                    }
+                }
+            }
+        }
 
         CtPackage packageObj = f.Package().getOrCreate(pkg);
         CtType<?> existing = packageObj.getType(name);

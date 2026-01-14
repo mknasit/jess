@@ -31,8 +31,10 @@ public class TargetMethodTest {
     @DisplayName("Run target method")
     void testWFCMessageGetDeviceTokenBytes() throws IOException {
         // File path
-        String classPath = "/Users/mitul/Documents/study/Thesis/partial compilation/jess/src/test/resources/project/server/broker/src/main/java/win/liyufan/im/HttpUtils.java";
-        String methodSignature = "httpJsonPost(String, String, HttpPostType)";
+        String classPath = "/Users/mitul/Documents/study/Thesis/partial compilation/jess/src/test/resources/project/im-server/broker/src/main/java/io/moquette/imhandler/ChannelListenMember.java";
+
+        String methodSignature = "action(ByteBuf, String, String, ProtoConstants.RequestSourceType, WFCMessage.ListenChannel, Qos1PublishHandler.IMCallback)";
+
 
 
         System.out.println("\n==================================================================================");
