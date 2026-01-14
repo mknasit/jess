@@ -25,6 +25,13 @@ public class JessConfiguration {
 
     private String targetVersion = null;
     
+    // Java version for Spoon and javac (11 default, 17 optional)
+    // Note: Java 17 enables new syntax features (sealed classes, pattern matching, etc.)
+    private int targetJavaVersion = 11;
+    
+    // Enable preview features (Java 17+ only, default false)
+    private boolean enablePreview = false;
+    
     // Source roots for Spoon stubber (same as used for JavaParser's combinedTypeSolver)
     private List<Path> sourceRoots = new ArrayList<>();
 

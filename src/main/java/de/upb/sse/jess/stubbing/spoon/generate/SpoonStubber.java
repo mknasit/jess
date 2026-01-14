@@ -264,9 +264,12 @@ public final class SpoonStubber {
                         CtType<?> existingType = f.Type().get(potentialTypeFqn);
                         if (existingType != null) {
                             // This is a nested type being written as a package - ERROR!
-                            System.err.println("[SpoonStubber] ERROR: Attempted to create stub for " + qn + 
-                                " with package " + pkg + " but " + potentialTypeFqn + " exists as a TYPE. " +
-                                "This indicates a bug in nested type canonicalization. Skipping stub creation.");
+                            // This should have been canonicalized to Outer$Inner format
+                            System.err.println("[SpoonStubber] ERROR: Nested type canonicalization failed for " + qn);
+                            System.err.println("  Package " + pkg + " ends with type name " + potentialTypeFqn + " (which exists in model)");
+                            System.err.println("  Expected: " + qn.replace(".", "$") + " (nested type format)");
+                            System.err.println("  This may occur when Outer and Outer.Inner are both missing and planned in same run.");
+                            System.err.println("  Fix: Ensure canonicalizeNestedTypeFqn checks planned types (typePlanFqns).");
                             return false; // Skip this stub
                         }
                     } catch (Throwable ignored) {
@@ -559,6 +562,25 @@ public final class SpoonStubber {
             }
 
             CtMethod<?> m = f.Method().create(owner, mods, rt, p.name, params, thrown);
+            
+            // Try-with-resources support: if this is a close() method, ensure owner implements AutoCloseable
+            if ("close".equals(p.name) && params.isEmpty() && owner instanceof CtClass) {
+                CtTypeReference<?> autoCloseableRef = f.Type().createReference("java.lang.AutoCloseable");
+                boolean alreadyImplements = false;
+                try {
+                    for (CtTypeReference<?> si : owner.getSuperInterfaces()) {
+                        String siQn = safeQN(si);
+                        if ("java.lang.AutoCloseable".equals(siQn)) {
+                            alreadyImplements = true;
+                            break;
+                        }
+                    }
+                } catch (Throwable ignored) {}
+                if (!alreadyImplements) {
+                    owner.addSuperInterface(autoCloseableRef);
+                    ensureImport(owner, autoCloseableRef);
+                }
+            }
             
             boolean ownerIsInterface = owner instanceof CtInterface;
 

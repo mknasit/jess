@@ -18,15 +18,41 @@ import java.util.stream.Collectors;
 
 
 public class CompilerInvoker {
-    private String targetVersion;
+    private String targetVersion; // Legacy: kept for backward compatibility
+    private int targetJavaVersion; // New: Java version (11, 17, etc.)
+    private boolean enablePreview; // Enable preview features (Java 17+)
     private boolean silentCompilation;
     public static String output;
 
     public CompilerInvoker() { this(false); }
-    public CompilerInvoker(boolean silentCompilation) { this(null, silentCompilation); }
+    public CompilerInvoker(boolean silentCompilation) { this(11, false, silentCompilation); }
     public CompilerInvoker(String targetVersion, boolean silentCompilation) {
+        // Legacy constructor: parse string to int
         this.targetVersion = targetVersion;
+        if (targetVersion != null && !targetVersion.equals("unknown")) {
+            try {
+                this.targetJavaVersion = Integer.parseInt(targetVersion);
+            } catch (NumberFormatException e) {
+                this.targetJavaVersion = 11; // Default
+            }
+        } else {
+            this.targetJavaVersion = 11; // Default
+        }
+        this.enablePreview = false;
         this.silentCompilation = silentCompilation;
+    }
+    
+    /**
+     * New constructor with explicit Java version and preview flag.
+     * @param targetJavaVersion Java version (11, 17, etc.)
+     * @param enablePreview Enable preview features (Java 17+ only)
+     * @param silentCompilation Suppress compiler output
+     */
+    public CompilerInvoker(int targetJavaVersion, boolean enablePreview, boolean silentCompilation) {
+        this.targetJavaVersion = targetJavaVersion;
+        this.enablePreview = enablePreview;
+        this.silentCompilation = silentCompilation;
+        this.targetVersion = String.valueOf(targetJavaVersion); // For backward compatibility
     }
 
     public boolean compileFile(String fileString, String output) {
@@ -62,33 +88,46 @@ public class CompilerInvoker {
             filesToCompile.addAll(getFileNames(new ArrayList<>(), Path.of(fileString)));
         }
 
-        // P0: Build classpath from provided jars, or fallback to default
-        // CRITICAL: javac classpath must match Spoon classpath for experiment correctness
-        String classPath;
-        if (classpathJars != null && !classpathJars.isEmpty()) {
-            // Use provided classpath jars (EXACTLY as passed to Spoon)
-            classPath = "." + (FileUtil.isWindows() ? ";" : ":") +
-                    classpathJars.stream()
-                            .map(Path::toString)
-                            .collect(Collectors.joining(FileUtil.isWindows() ? ";" : ":"));
-        } else {
-            // Fallback to default (for backward compatibility with old callers)
-            classPath = "." + (FileUtil.isWindows() ? ";" : ":") +
-                    JarFinder.find(Jess.JAR_DIRECTORY).stream()
-                            .collect(Collectors.joining(FileUtil.isWindows() ? ";" : ":"));
-        }
-
         // Build compiler options (without file names)
+        // Use --release instead of -source/-target for better compatibility
         List<String> options = new ArrayList<>();
-        if (targetVersion != null && !targetVersion.equals("unknown")) {
+        if (targetJavaVersion > 0) {
+            options.add("--release");
+            options.add(String.valueOf(targetJavaVersion));
+            
+            // Enable preview features if requested (Java 17+ only)
+            if (enablePreview && targetJavaVersion >= 17) {
+                options.add("--enable-preview");
+            }
+        } else if (targetVersion != null && !targetVersion.equals("unknown")) {
+            // Legacy fallback: use -source/-target for backward compatibility
             options.add("-source");
             options.add(this.targetVersion);
             options.add("-target");
             options.add(this.targetVersion);
         }
         options.add("-Xlint:-options");
-        options.add("-cp");
-        options.add(classPath);
+        
+        // P0: Build classpath from provided jars, or use no-classpath mode if empty
+        // CRITICAL: javac classpath must match Spoon classpath for experiment correctness
+        if (classpathJars != null && !classpathJars.isEmpty()) {
+            // Use provided classpath jars (EXACTLY as passed to Spoon)
+            String classPath = "." + (FileUtil.isWindows() ? ";" : ":") +
+                    classpathJars.stream()
+                            .map(Path::toString)
+                            .collect(Collectors.joining(FileUtil.isWindows() ? ";" : ":"));
+            options.add("-cp");
+            options.add(classPath);
+        } else if (classpathJars == null) {
+            // Fallback to default (for backward compatibility with old callers)
+            String classPath = "." + (FileUtil.isWindows() ? ";" : ":") +
+                    JarFinder.find(Jess.JAR_DIRECTORY).stream()
+                            .collect(Collectors.joining(FileUtil.isWindows() ? ";" : ":"));
+            options.add("-cp");
+            options.add(classPath);
+        }
+        // If classpathJars is empty list, don't add -cp (no-classpath mode)
+        
         options.add("-d");
         options.add(output);
         

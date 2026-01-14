@@ -180,6 +180,39 @@ public final class SpoonStubbingRunner implements Stubber {
             ? cfg.getSourceRoots() 
             : java.util.Collections.emptyList();
     }
+    
+    /**
+     * Get current JDK version (major version number).
+     * Returns 8 for JDK 8, 11 for JDK 11, 17 for JDK 17, etc.
+     */
+    private static int getCurrentJdkVersion() {
+        String version = System.getProperty("java.version");
+        if (version == null) {
+            return 8; // Conservative default
+        }
+        // Handle versions like "1.8.0_xxx" (JDK 8) or "11.0.x" (JDK 11+) or "17" (JDK 17+)
+        if (version.startsWith("1.")) {
+            // JDK 8 or earlier: "1.8.0_xxx"
+            String[] parts = version.split("\\.");
+            if (parts.length > 1) {
+                try {
+                    int minor = Integer.parseInt(parts[1]);
+                    return minor; // 8 for "1.8"
+                } catch (NumberFormatException e) {
+                    return 8;
+                }
+            }
+            return 8;
+        } else {
+            // JDK 9+: "11.0.x" or "17"
+            String[] parts = version.split("\\.");
+            try {
+                return Integer.parseInt(parts[0]);
+            } catch (NumberFormatException e) {
+                return 8; // Conservative default
+            }
+        }
+    }
 
     @Override
     public int run(Path slicedSrcDir, List<Path> classpathJars) throws Exception {
@@ -200,9 +233,25 @@ public final class SpoonStubbingRunner implements Stubber {
     public int run(Path slicedSrcDir, List<Path> classpathJars, SliceDescriptor descriptor) throws Exception {
         System.out.println("\n>> Using stubber: Spoon Based Stubber" );
         
+        // Quick validation: ensure slice directory exists and is readable
+        if (slicedSrcDir == null || !Files.exists(slicedSrcDir)) {
+            throw new IllegalArgumentException("Slice directory does not exist: " + slicedSrcDir);
+        }
+        if (!Files.isDirectory(slicedSrcDir)) {
+            throw new IllegalArgumentException("Slice path is not a directory: " + slicedSrcDir);
+        }
+        
         ExperimentState state = new ExperimentState();
         state.sliceDir = slicedSrcDir;
-        state.targetJavaVersion = cfg.getTargetVersion() != null ? cfg.getTargetVersion() : "default";
+        int targetJavaVersion = cfg.getTargetJavaVersion();
+        boolean enablePreview = cfg.isEnablePreview();
+        state.targetJavaVersion = String.valueOf(targetJavaVersion) + (enablePreview ? " (preview)" : "");
+        
+        // Log Java version configuration (one-liner)
+        // Note: Spoon doesn't have explicit preview flag, but compliance level handles syntax
+        System.out.println(String.format("[EXPERIMENT] Java level: %d%s, Spoon compliance: %d, javac --release: %d%s",
+            targetJavaVersion, enablePreview ? " (preview)" : "", targetJavaVersion, targetJavaVersion,
+            enablePreview ? " --enable-preview" : ""));
         
         // Track classpath info
         if (classpathJars == null || classpathJars.isEmpty()) {
@@ -275,10 +324,20 @@ public final class SpoonStubbingRunner implements Stubber {
      * @return StubbingResult with number of stubs created and compilation success status
      */
     private StubbingResult tryStubbingWithSliceOnly(Path slicedSrcDir, List<Path> classpathJars, SliceDescriptor descriptor, ExperimentState state) throws Exception {
-        // 1) Configure Spoon for Java 11
+        // 1) Configure Spoon with configurable Java version (11 default, 17 optional)
+        // Safety check: ensure JDK version >= targetJavaVersion
+        int targetJavaVersion = cfg.getTargetJavaVersion();
+        int currentJdkVersion = getCurrentJdkVersion();
+        if (currentJdkVersion < targetJavaVersion) {
+            throw new RuntimeException(String.format(
+                "JDK version mismatch: targetJavaVersion=%d requires JDK>=%d, but current JDK is %d. " +
+                "Please use a JDK %d or higher, or set targetJavaVersion to %d or lower.",
+                targetJavaVersion, targetJavaVersion, currentJdkVersion, targetJavaVersion, currentJdkVersion));
+        }
+        
         Launcher launcher = new Launcher();
         var env = launcher.getEnvironment();
-        env.setComplianceLevel(11);
+        env.setComplianceLevel(targetJavaVersion);
         env.setAutoImports(true);
         env.setSourceOutputDirectory(slicedSrcDir.toFile());
 
@@ -705,9 +764,10 @@ public final class SpoonStubbingRunner implements Stubber {
     private CompilationResult compileStubsWithDiagnostics(Path slicedSrcDir, List<Path> classpathJars) {
         try {
             String classOutput = Jess.CLASS_OUTPUT; // "output"
-            String targetVersion = cfg.getTargetVersion();
+            int targetJavaVersion = cfg.getTargetJavaVersion();
+            boolean enablePreview = cfg.isEnablePreview();
             
-            CompilerInvoker compiler = new CompilerInvoker(targetVersion, true); // silent compilation
+            CompilerInvoker compiler = new CompilerInvoker(targetJavaVersion, enablePreview, true); // silent compilation
             // P0 FIX: Pass classpathJars to CompilerInvoker
             CompilerInvoker.CompilationResult result = compiler.compileFile(
                 java.util.List.of(slicedSrcDir.toString()), 

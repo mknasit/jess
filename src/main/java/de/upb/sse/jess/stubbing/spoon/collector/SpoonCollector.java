@@ -600,11 +600,17 @@ public final class SpoonCollector {
 
         // --- order matters only for readability; each pass is independent ---
         collectUnresolvedFields(model, result);
+        // NEW: collect field writes (x.f = 1;)
+        collectUnresolvedFieldWrites(model, result);
+        // NEW: collect method references (Type::method, Type::new)
+        collectMethodReferences(model, result);
         // NEW: collect bare unknown simple names (like 'g' in 'int a = util() + g;')
         collectBareUnknownSimpleNames(model, result);
         collectUnresolvedCtorCalls(model, result);
         collectUnresolvedMethodCalls(model, result);
         collectUnresolvedAnnotations(model, result);
+        // NEW: collect try-with-resources (ensure AutoCloseable + close())
+        collectTryWithResources(model, result);
 
         collectExceptionTypes(model, result);
         collectSupertypes(model, result);
@@ -1036,6 +1042,296 @@ public final class SpoonCollector {
             }
 
             out.fieldPlans.add(new FieldStubPlan(ownerRef, fieldName, fieldType, isStatic));
+        }
+    }
+
+    /**
+     * Collect field write stubs from unresolved field writes (x.f = 1; Type.F = ...).
+     * Handles assignments to unresolved fields.
+     */
+    private void collectUnresolvedFieldWrites(CtModel model, CollectResult out) {
+        // Get all CtFieldWrite elements from slice types
+        List<CtFieldWrite<?>> unresolved = getElementsFromSliceTypes(model, (CtFieldWrite<?> fw) -> {
+            var ref = fw.getVariable();
+            if (ref == null) return true;
+            // Check if unresolved, but catch StackOverflowError to avoid infinite loops
+            try {
+                return ref.getDeclaration() == null;
+            } catch (StackOverflowError | OutOfMemoryError e) {
+                return true; // Assume unresolved
+            } catch (Throwable ignored) {
+                return false; // Assume resolved
+            }
+        });
+
+        for (CtFieldWrite<?> fw : unresolved) {
+            String fieldName = (fw.getVariable() != null ? fw.getVariable().getSimpleName() : "f");
+            
+            // Determine owner and static status
+            CtTypeReference<?> ownerRef = null;
+            boolean isStatic = false;
+            
+            CtExpression<?> target = fw.getTarget();
+            if (target instanceof CtTypeAccess) {
+                // Static field write: Type.F = ...
+                CtTypeAccess<?> typeAccess = (CtTypeAccess<?>) target;
+                ownerRef = typeAccess.getAccessedType();
+                isStatic = true;
+            } else if (target != null) {
+                // Instance field write: x.f = ...
+                // Reuse owner resolution logic from field reads
+                ownerRef = resolveOwnerTypeFromFieldAccess(fw);
+                if (ownerRef == null) {
+                    // Fallback: try to infer from target type
+                    try {
+                        CtTypeReference<?> targetType = target.getType();
+                        if (targetType != null) {
+                            ownerRef = targetType;
+                        }
+                    } catch (Throwable ignored) {}
+                }
+                isStatic = false;
+            }
+            
+            if (ownerRef == null) {
+                continue; // Can't determine owner
+            }
+            
+            // Canonicalize owner FQN
+            String ownerFqn = safeQN(ownerRef);
+            if (ownerFqn == null) {
+                continue;
+            }
+            ownerFqn = canonicalizeNestedTypeFqn(ownerFqn, out.typePlanFqns);
+            if (ownerFqn == null) {
+                continue; // Primitive/void
+            }
+            ownerRef = f.Type().createReference(ownerFqn);
+            
+            // Infer field type from assignment value (lightweight)
+            // CtFieldWrite extends CtAssignment, cast to access getAssignment()
+            CtExpression<?> assignedValue = ((CtAssignment<?, ?>) fw).getAssignment();
+            CtTypeReference<?> fieldType = inferFieldTypeFromAssignmentValue(assignedValue);
+            
+            // Ensure owner type is planned
+            TypeStubPlan ownerPlan = new TypeStubPlan(ownerFqn, TypeStubPlan.Kind.CLASS);
+            out.addTypePlanIfNew(ownerPlan, f);
+            
+            // Create field plan
+            out.fieldPlans.add(new FieldStubPlan(ownerRef, fieldName, fieldType, isStatic));
+        }
+    }
+    
+    /**
+     * Infer field type from assignment value (lightweight inference).
+     * Returns Object/unknown if inference fails.
+     */
+    private CtTypeReference<?> inferFieldTypeFromAssignmentValue(CtExpression<?> value) {
+        if (value == null) {
+            return f.Type().createReference("java.lang.Object");
+        }
+        
+        // Integer literal -> int
+        if (value instanceof CtLiteral) {
+            CtLiteral<?> lit = (CtLiteral<?>) value;
+            Object val = lit.getValue();
+            if (val instanceof Integer || val instanceof Long || val instanceof Short || val instanceof Byte) {
+                return f.Type().createReference("int");
+            } else if (val instanceof String) {
+                return f.Type().createReference("java.lang.String");
+            } else if (val instanceof Boolean) {
+                return f.Type().createReference("boolean");
+            } else if (val instanceof Character) {
+                return f.Type().createReference("char");
+            } else if (val instanceof Float || val instanceof Double) {
+                return f.Type().createReference("double");
+            }
+        }
+        
+        // Class literal -> Class<?>
+        if (value instanceof CtTypeAccess) {
+            return f.Type().createReference("java.lang.Class");
+        }
+        
+        // Try to get type from expression
+        try {
+            CtTypeReference<?> exprType = value.getType();
+            if (exprType != null) {
+                return exprType;
+            }
+        } catch (Throwable ignored) {}
+        
+        // Fallback to Object
+        return f.Type().createReference("java.lang.Object");
+    }
+
+    /**
+     * Collect method reference stubs (Type::method, obj::method, Type::new).
+     * Handles method references like Type::m, obj::m, Type::new.
+     */
+    private void collectMethodReferences(CtModel model, CollectResult out) {
+        // Get all CtExecutableReferenceExpression elements from slice types
+        List<CtExecutableReferenceExpression<?, ?>> methodRefs = getElementsFromSliceTypes(model, 
+            (CtExecutableReferenceExpression<?, ?> mref) -> {
+                // Check if executable reference is unresolved
+                CtExecutableReference<?> execRef = mref.getExecutable();
+                if (execRef == null) return true;
+                try {
+                    return execRef.getDeclaration() == null;
+                } catch (StackOverflowError | OutOfMemoryError e) {
+                    return true; // Assume unresolved
+                } catch (Throwable ignored) {
+                    return false; // Assume resolved
+                }
+            });
+
+        for (CtExecutableReferenceExpression<?, ?> mref : methodRefs) {
+            CtExecutableReference<?> execRef = mref.getExecutable();
+            if (execRef == null) {
+                continue;
+            }
+            
+            // Determine owner
+            CtTypeReference<?> ownerRef = null;
+            boolean isStatic = false;
+            
+            CtExpression<?> receiver = mref.getTarget();
+            if (receiver instanceof CtTypeAccess) {
+                // Type::method or Type::new
+                CtTypeAccess<?> typeAccess = (CtTypeAccess<?>) receiver;
+                ownerRef = typeAccess.getAccessedType();
+                isStatic = true;
+            } else if (receiver != null) {
+                // obj::method
+                try {
+                    ownerRef = receiver.getType();
+                    isStatic = false;
+                } catch (Throwable ignored) {
+                    continue; // Can't determine owner
+                }
+            } else {
+                continue; // No receiver
+            }
+            
+            if (ownerRef == null) {
+                continue;
+            }
+            
+            // Canonicalize owner FQN
+            String ownerFqn = safeQN(ownerRef);
+            if (ownerFqn == null) {
+                continue;
+            }
+            ownerFqn = canonicalizeNestedTypeFqn(ownerFqn, out.typePlanFqns);
+            if (ownerFqn == null) {
+                continue; // Primitive/void
+            }
+            ownerRef = f.Type().createReference(ownerFqn);
+            
+            // Determine kind: constructor reference (Type::new) or method reference
+            String methodName = execRef.getSimpleName();
+            boolean isConstructor = "new".equals(methodName);
+            
+            // Ensure owner type is planned
+            TypeStubPlan ownerPlan = new TypeStubPlan(ownerFqn, TypeStubPlan.Kind.CLASS);
+            out.addTypePlanIfNew(ownerPlan, f);
+            
+            if (isConstructor) {
+                // Constructor reference: Type::new
+                out.ctorPlans.add(new ConstructorStubPlan(ownerRef, new ArrayList<>()));
+            } else {
+                // Method reference: Type::method or obj::method
+                // Use Object as return type (lightweight, no heavy inference)
+                CtTypeReference<?> returnType = f.Type().createReference("java.lang.Object");
+                // Empty param list (method references don't specify params)
+                List<CtTypeReference<?>> paramTypes = new ArrayList<>();
+                List<CtTypeReference<?>> thrownTypes = new ArrayList<>();
+                out.methodPlans.add(new MethodStubPlan(ownerRef, methodName, returnType, paramTypes, isStatic, 
+                    MethodStubPlan.Visibility.PUBLIC, thrownTypes));
+            }
+        }
+    }
+
+    /**
+     * Collect try-with-resources requirements (ensure AutoCloseable + close()).
+     * For each resource type R in try-with-resources, ensures R implements AutoCloseable and has close().
+     */
+    private void collectTryWithResources(CtModel model, CollectResult out) {
+        // Get all CtTry elements from slice types
+        List<CtTry> tryBlocks = getElementsFromSliceTypes(model, (CtTry t) -> true);
+        
+        for (CtTry tryBlock : tryBlocks) {
+            // Get resource variables from try-with-resources using getElements()
+            // Resources are stored as CtLocalVariable in the try block
+            List<CtLocalVariable<?>> resources = tryBlock.getElements(new TypeFilter<>(CtLocalVariable.class));
+            if (resources == null || resources.isEmpty()) {
+                continue; // Not a try-with-resources or no resources
+            }
+            
+            // Filter to only resource variables (those declared in try-with-resources)
+            // In Spoon, resource variables are direct children of CtTry
+            List<CtLocalVariable<?>> resourceVars = new ArrayList<>();
+            for (CtLocalVariable<?> var : resources) {
+                // Check if this variable is a resource (parent is CtTry)
+                if (var.getParent() instanceof CtTry) {
+                    resourceVars.add(var);
+                }
+            }
+            
+            if (resourceVars.isEmpty()) {
+                continue; // Not a try-with-resources
+            }
+            
+            for (CtLocalVariable<?> resource : resourceVars) {
+                CtTypeReference<?> resourceType = resource.getType();
+                if (resourceType == null) {
+                    continue;
+                }
+                
+                String resourceTypeFqn = safeQN(resourceType);
+                if (resourceTypeFqn == null) {
+                    continue;
+                }
+                
+                // Skip JDK types (they already implement AutoCloseable)
+                if (resourceTypeFqn.startsWith("java.") || resourceTypeFqn.startsWith("javax.")) {
+                    continue;
+                }
+                
+                // Canonicalize resource type FQN
+                String canonicalResourceTypeFqn = canonicalizeNestedTypeFqn(resourceTypeFqn, out.typePlanFqns);
+                if (canonicalResourceTypeFqn == null) {
+                    continue; // Primitive/void
+                }
+                
+                // Ensure resource type is planned
+                TypeStubPlan resourcePlan = new TypeStubPlan(canonicalResourceTypeFqn, TypeStubPlan.Kind.CLASS);
+                out.addTypePlanIfNew(resourcePlan, f);
+                
+                // Mark that this type needs AutoCloseable interface
+                // We'll handle this in the stub generator by ensuring the type implements AutoCloseable
+                // For now, just ensure the type exists and has close() method
+                
+                final String finalResourceTypeFqn = canonicalResourceTypeFqn; // Make final for lambda
+                CtTypeReference<?> ownerRef = f.Type().createReference(finalResourceTypeFqn);
+                
+                // Ensure close():void method exists (required by AutoCloseable)
+                // Check if close() method plan already exists
+                boolean hasCloseMethod = out.methodPlans.stream()
+                    .anyMatch(mp -> "close".equals(mp.name) && 
+                                   finalResourceTypeFqn.equals(safeQN(mp.ownerType)));
+                
+                if (!hasCloseMethod) {
+                    // Add close() method plan
+                    CtTypeReference<?> voidType = f.Type().createReference("void");
+                    List<CtTypeReference<?>> emptyParams = new ArrayList<>();
+                    List<CtTypeReference<?>> thrownTypes = new ArrayList<>();
+                    // close() may throw Exception (AutoCloseable contract) - add Exception to thrown types
+                    thrownTypes.add(f.Type().createReference("java.lang.Exception"));
+                    out.methodPlans.add(new MethodStubPlan(ownerRef, "close", voidType, emptyParams, false,
+                        MethodStubPlan.Visibility.PUBLIC, thrownTypes));
+                }
+            }
         }
     }
 
